@@ -84,6 +84,16 @@ def _compiler_environment(toolchain_root: Path, temporary_root: Path) -> dict[st
     }
 
 
+def _write_failure_log(step: str, **details: object) -> Path:
+    log_dir = Path(
+        os.environ.get("REPROBIT_NATIVE_LOG_DIR", os.fspath(SAMPLE_ROOT / ".failure-logs"))
+    )
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log = log_dir / f"sp3-{step}-failure.log"
+    log.write_text(json.dumps(details, indent=2, default=str))
+    return log
+
+
 def _build_reference(toolchain_root: Path) -> bytes:
     driver = toolchain_root / "bin" / "CL.EXE"
     linker = toolchain_root / "bin" / "LINK.EXE"
@@ -116,7 +126,14 @@ def _build_reference(toolchain_root: Path) -> bytes:
             timeout=120,
         )
         if compiled.returncode != 0:
-            raise RuntimeError("MSVC 5.0 SP3 compile failed:\n" + compiled.stdout + compiled.stderr)
+            log = _write_failure_log(
+                "compile",
+                returncode=compiled.returncode,
+                stdout=compiled.stdout,
+                stderr=compiled.stderr,
+                toolchain=str(toolchain_root),
+            )
+            raise RuntimeError("MSVC 5.0 SP3 compile failed; diagnostics: " + os.fspath(log))
         (temporary_root / "link" / "program.obj").write_bytes(
             (temporary_root / "compile" / "program.obj").read_bytes()
         )
@@ -138,7 +155,29 @@ def _build_reference(toolchain_root: Path) -> bytes:
             timeout=120,
         )
         if linked.returncode != 0:
-            raise RuntimeError("MSVC 5.0 SP3 linker failed:\n" + linked.stdout + linked.stderr)
+            probe = subprocess.run(
+                (os.fspath(linker), "/?"),
+                cwd=temporary_root / "link",
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            log = _write_failure_log(
+                "link",
+                returncode=linked.returncode,
+                stdout=linked.stdout,
+                stderr=linked.stderr,
+                probe_returncode=probe.returncode,
+                probe_stdout=probe.stdout,
+                probe_stderr=probe.stderr,
+                linker=str(linker),
+                linker_size=linker.stat().st_size,
+                toolchain=str(toolchain_root),
+                environment_path=environment["PATH"],
+            )
+            raise RuntimeError("MSVC 5.0 SP3 linker failed; diagnostics: " + os.fspath(log))
         raw = (temporary_root / "link" / "program.exe").read_bytes()
     image, _proof = apply_pe_metadata_candidate(raw, {"link_time": 0, "resource_time": 0})
     return image
