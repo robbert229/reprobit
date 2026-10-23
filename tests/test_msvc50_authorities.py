@@ -2,8 +2,13 @@
 
 Offline tests cross-check the authority tables against the toolchain profiles.
 A network-gated test re-audits the pinned upstream revisions; it is skipped
-unless REPROBIT_MSVC_5_0_UPSTREAM_ROOT names a directory holding the four pinned
-checkouts (see scripts/audit_msvc50_authorities.py for the fetch recipe).
+unless REPROBIT_MSVC_5_0_UPSTREAM_ROOT names a directory for the four
+checkouts, and it fetches any missing pinned revision itself.
+
+Audit record: audited 2026-10-22 against msvc500@8abf95ce,
+msvc500sp1@40117474, msvc500sp2@4ebf0202, and msvc500sp3@259a03f0; every
+profile-declared producer, runtime file, and input tree was present, with no
+pin corrections required.
 """
 
 from __future__ import annotations
@@ -15,8 +20,6 @@ import sys
 from pathlib import Path
 
 import pytest
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from reprobit.msvc50_authorities import (
     MSVC50_CMAKE_FRONTEND_AUTHORITIES,
@@ -100,10 +103,19 @@ def test_sp2_content_is_reviewed_equal_to_sp1() -> None:
     reason="set REPROBIT_MSVC_5_0_UPSTREAM_ROOT to re-audit pinned MSVC 5.0 upstreams",
 )
 def test_committed_authorities_match_pinned_upstreams() -> None:
-    root = os.environ["REPROBIT_MSVC_5_0_UPSTREAM_ROOT"]
+    # The byte-level staleness guard for this generated module: offline tests
+    # check membership only, so digest drift is caught only when a runner
+    # provides an upstream root and this check (fetch-inclusive) runs. A
+    # scheduled CI job for this gate is deferred to the 5.0 CI ticket.
     script = Path(__file__).resolve().parents[1] / "scripts" / "audit_msvc50_authorities.py"
     result = subprocess.run(
-        (sys.executable, str(script), "--checkouts-root", root),
+        (
+            sys.executable,
+            str(script),
+            "--checkouts-root",
+            os.environ["REPROBIT_MSVC_5_0_UPSTREAM_ROOT"],
+            "--fetch",
+        ),
         check=False,
         capture_output=True,
         text=True,

@@ -6,16 +6,11 @@ recomputed with the library's own authority code. The script writes
 ``src/reprobit/msvc50_authorities.py`` with ``--write`` and otherwise fails if
 the committed module differs from the audit.
 
-Example (fetch the four pinned revisions first)::
+With ``--fetch`` any missing checkout is created by fetching its pinned
+revision, so one command fetches and verifies. Without ``--fetch`` an
+existing exact checkout is required::
 
-    for name in msvc500 msvc500sp1 msvc500sp2 msvc500sp3; do
-      git -c init.defaultBranch=trunk init msvc50-upstream/$name
-      git -C msvc50-upstream/$name remote add origin \
-        https://github.com/archaic-msvc/$name.git
-      git -C msvc50-upstream/$name fetch --depth=1 origin <revision>
-      git -C msvc50-upstream/$name checkout --detach FETCH_HEAD
-    done
-    python scripts/audit_msvc50_authorities.py --checkouts-root msvc50-upstream --write
+    python scripts/audit_msvc50_authorities.py --checkouts-root msvc50-upstream --fetch
 """
 
 from __future__ import annotations
@@ -27,10 +22,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO_ROOT / "src"))
-
-from reprobit.toolchains import (  # noqa: E402
+from reprobit.toolchains import (
     MSVC_50_RTM,
     MSVC_50_SP1,
     MSVC_50_SP2,
@@ -39,6 +31,8 @@ from reprobit.toolchains import (  # noqa: E402
     portable_tree_receipt,
     profile,
 )
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 PROFILE_IDENTIFIERS = (MSVC_50_RTM, MSVC_50_SP1, MSVC_50_SP2, MSVC_50_SP3)
 CMAKE_FRONTEND_PATH = "bin/nmake.exe"
@@ -109,14 +103,47 @@ def _declared_trees(installation_profile: ToolchainProfile) -> tuple[str, ...]:
     return trees
 
 
+def _fetch_checkout(checkout: Path, repository: str, revision: str) -> None:
+    checkout.mkdir(parents=True)
+    for step in (
+        ("init", "--quiet"),
+        ("config", "core.autocrlf", "false"),
+        ("config", "advice.detachedHead", "false"),
+        ("remote", "add", "origin", repository),
+    ):
+        subprocess.run(("git", "-C", str(checkout), *step), check=True, capture_output=True)
+    subprocess.run(
+        ("git", "-C", str(checkout), "fetch", "--quiet", "--depth=1", "origin", revision),
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ("git", "-C", str(checkout), "checkout", "--quiet", "--detach", "FETCH_HEAD"),
+        check=True,
+        capture_output=True,
+    )
+    _verify_checkout(checkout, revision)
+
+
+def _ensure_checkout(checkout: Path, repository: str, revision: str, fetch: bool) -> None:
+    if checkout.is_dir():
+        _verify_checkout(checkout, revision)
+        return
+    if fetch:
+        _fetch_checkout(checkout, repository, revision)
+        return
+    raise AuditError(
+        f"no checkout for {repository} under the root; fetch the pinned revision "
+        f"{revision} or rerun with --fetch"
+    )
+
+
 def audit_profile(
-    checkouts_root: Path, installation_profile: ToolchainProfile
+    checkouts_root: Path, installation_profile: ToolchainProfile, *, fetch: bool = False
 ) -> dict[str, dict[str, object]]:
     source = installation_profile.sources[0]
     checkout = checkouts_root / _repository_name(source.repository)
-    if not checkout.is_dir():
-        raise AuditError(f"no checkout for {source.repository} under {checkouts_root}")
-    _verify_checkout(checkout, source.revision)
+    _ensure_checkout(checkout, source.repository, source.revision, fetch)
     return {
         "files": {
             relative: _file_authority(checkout, relative)
@@ -172,6 +199,17 @@ def _format_authorities(audited: dict[str, dict[str, dict[str, object]]]) -> str
         ("cmake_frontend", "MSVC50_CMAKE_FRONTEND_AUTHORITIES"),
     )
     for section, attribute in sections:
+        if attribute == "MSVC50_CMAKE_FRONTEND_AUTHORITIES":
+            lines.extend(
+                [
+                    "# bin/nmake.exe is not a profile-declared path: profile validation admits",
+                    "# producers, runtime files, and input trees only, and the MSVC 4.2",
+                    "# provisioner likewise supplies NMAKE outside profile sources. This table",
+                    "# therefore anchors to the provisioned-files convention; byte verification",
+                    "# belongs to the provisioner's verify path rather than to a profile",
+                    "# declaration. Revisit this anchor if 5.0 provisioning ever declares it.",
+                ]
+            )
         lines.append(f"{attribute} = {{")
         for identifier in PROFILE_IDENTIFIERS:
             result = audited[identifier]
@@ -245,6 +283,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkouts-root", type=Path, required=True)
     parser.add_argument(
+        "--fetch",
+        action="store_true",
+        help="create missing checkouts by fetching their pinned revisions",
+    )
+    parser.add_argument(
         "--write", action="store_true", help="write the regenerated module into src/reprobit/"
     )
     parser.add_argument("--output", type=Path, default=AUTHORITIES_MODULE)
@@ -252,7 +295,7 @@ def main(argv: list[str] | None = None) -> int:
 
     audited: dict[str, dict[str, dict[str, object]]] = {}
     for identifier in PROFILE_IDENTIFIERS:
-        result = audit_profile(args.checkouts_root, profile(identifier))
+        result = audit_profile(args.checkouts_root, profile(identifier), fetch=args.fetch)
         audited[identifier] = result
         print(
             f"{identifier}: audited {len(result['files'])} files and {len(result['trees'])} trees"

@@ -333,6 +333,12 @@ MSVC50_TREE_AUTHORITIES = {
     },
 }
 
+# bin/nmake.exe is not a profile-declared path: profile validation admits
+# producers, runtime files, and input trees only, and the MSVC 4.2
+# provisioner likewise supplies NMAKE outside profile sources. This table
+# therefore anchors to the provisioned-files convention; byte verification
+# belongs to the provisioner's verify path rather than to a profile
+# declaration. Revisit this anchor if 5.0 provisioning ever declares it.
 MSVC50_CMAKE_FRONTEND_AUTHORITIES = {
     "msvc_5_0_rtm": {
         "bin/nmake.exe": Msvc50FileAuthority(
