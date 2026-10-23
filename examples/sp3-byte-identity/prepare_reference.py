@@ -3,12 +3,13 @@
 
 The committed project oracle carries the byte pin this toolchain must
 reproduce.  With no options this script compiles and links the example with
-the MSVC 5.0 SP3 toolchain, normalizes the linker timestamps Rod way the
-project records, and verifies the result against that committed oracle.  When
-the reference bytes have never been produced or the toolchain changed them,
-`--calibrate` rebuilds and records the actual digest into the committed oracle
-so the project stays self-consistent; the printed digest is what a maintainer
-commits.  The normal native Windows job must pass without `--calibrate`.
+the MSVC 5.0 SP3 toolchain, normalizes the linker timestamps the same way the
+project records, and verifies the result against that committed oracle before
+touching any published reference.  When the reference bytes have never been
+produced or the toolchain changed them, `--calibrate` rebuilds and records the
+actual digest into the committed oracle so the project stays self-consistent;
+the printed digest is what a maintainer commits.  The normal native Windows
+job must pass without `--calibrate`.
 """
 
 from __future__ import annotations
@@ -16,7 +17,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -51,14 +51,11 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _compiler_environment(toolchain_root: Path, temporary_root: Path) -> dict[str, str]:
-    if os.name == "posix":
-        wine = shutil.which("wine")
-        if wine is None:
-            raise RuntimeError(
-                "building an MSVC 5.0 reference requires native Windows; the Wine "
-                "transport is not part of this fixture yet"
-            )
-        raise RuntimeError("MSVC 5.0 references are not built through Wine in this fixture")
+    if os.name != "nt":
+        raise RuntimeError(
+            "building an MSVC 5.0 reference requires native Windows; the Wine "
+            "transport for SP3 is not part of this fixture yet"
+        )
     system_root = os.environ.get("SYSTEMROOT")
     if system_root is None:
         raise RuntimeError("native Windows has no SYSTEMROOT environment")
@@ -171,23 +168,26 @@ def _prepare(args: argparse.Namespace) -> None:
     oracle = _committed_oracle()
     image = _build_reference(toolchain_root)
     digest = Digest.from_bytes(image)
-    _publish_reference(image)
+    size = len(image)
 
-    if len(image) == oracle.image_size and digest == oracle.image_digest:
+    if size == oracle.image_size and digest == oracle.image_digest:
+        _publish_reference(image)
         print(f"prepared reference/program.exe ({digest.value})")
         return
     if not args.calibrate:
         raise RuntimeError(
             "SP3 reference digest differs from the committed oracle: "
-            f"actual={digest.value} (size {len(image)}), "
+            f"actual={digest.value} (size {size}), "
             f"oracle={oracle.image_digest.value} (size {oracle.image_size}). "
-            "Re-run with --calibrate to record the produced bytes, then commit "
-            "the updated reprobit/oracles/program.json."
+            "Nothing was published. Re-run with --calibrate to record the "
+            "produced bytes, then commit the updated "
+            "reprobit/oracles/program.json."
         )
-    _write_calibrated_oracle(digest, len(image))
+    _write_calibrated_oracle(digest, size)
+    _publish_reference(image)
     print(
         "calibrated reprobit/oracles/program.json to "
-        f"{digest.value} ({len(image)} bytes); commit this change"
+        f"{digest.value} ({size} bytes); commit this change"
     )
 
 

@@ -285,7 +285,7 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: ${{ runner.temp }}/archaic-msvc500sp3
-          key: msvc50-v1-${{ runner.os }}-${{ hashFiles('src/reprobit/msvc50_provision.py', 'src/reprobit/msvc50_authorities.py', 'src/reprobit/toolchains.py') }}
+          key: msvc50-v1-${{ runner.os }}-${{ hashFiles('src/reprobit/msvc50_provision.py', 'src/reprobit/msvc42_provision.py', 'src/reprobit/msvc50_authorities.py', 'src/reprobit/toolchains.py') }}
       - name: Provision and authenticate the external compiler
         run: >-
           rbit toolchain provision
@@ -305,6 +305,12 @@ jobs:
           --profile msvc_5_0_sp3
           --toolchain-root "$env:REPROBIT_MSVC_5_0_SP3_ROOT"
           --execute-probe
+      # On the very first run of this fixture (and whenever a pinned revision
+      # changes the produced bytes) this step fails: prepare_reference.py
+      # reports the actual digest, leaving reference/ untouched. Record that
+      # pin with --calibrate and commit reprobit/oracles/program.json before
+      # the lane can pass; that committed pin is the cross-run byte identity
+      # proof every later run must reproduce.
       - name: Authenticate the reference against its committed oracles
         run: >-
           python examples/sp3-byte-identity/prepare_reference.py

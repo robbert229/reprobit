@@ -35,13 +35,15 @@ artifact as certification evidence.
 
 ## Rebuilding the reference
 
-`prepare_reference.py` compares the freshly linked normalized image with the
-committed oracle in `reprobit/oracles/program.json`. When the compiler
-reproduces the recorded bytes, it just publishes `reference/program.exe`. If
-the bytes differ — for example on the first run of a freshly added example, or
-when a pinned revision changes — it refuses to touch the existing reference
-and prints the actual digest. Re-run with `--calibrate` to record the produced
-digest into the oracle document, then commit both:
+`prepare_reference.py` builds the freshly linked normalized image and compares
+it with the committed oracle in `reprobit/oracles/program.json` *before*
+publishing anything under `reference/`. When the compiler reproduces the
+recorded bytes, it writes `reference/program.exe`. If the bytes differ — as on
+the first run of this example, whose committed oracle is a provisional pin
+until a native SP3 build records the real ones — it leaves `reference/`
+untouched and prints the actual digest. Re-run with `--calibrate` to record
+the produced digest into the oracle document and publish the reference, then
+commit both:
 
 ```console
 python prepare_reference.py --calibrate

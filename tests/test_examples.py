@@ -53,6 +53,7 @@ def test_example_helpers_have_working_help_and_review_only_output() -> None:
         EXAMPLES / "grind" / "prepare_reference.py",
         EXAMPLES / "grind-progress" / "prepare_reference.py",
         EXAMPLES / "repair" / "prepare_reference.py",
+        EXAMPLES / "sp3-byte-identity" / "prepare_reference.py",
     )
     for script in scripts:
         result = subprocess.run(
