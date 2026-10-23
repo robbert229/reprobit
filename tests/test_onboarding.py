@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,21 +8,29 @@ from types import SimpleNamespace
 import pytest
 
 import reprobit.onboarding as onboarding
+from reprobit import msvc50_provision
 from reprobit.backends import BackendDoctorReport, DoctorCheck
 from reprobit.cli import main
 from reprobit.cli_output import human_command
+from reprobit.msvc42_provision import FileAuthority, TreeAuthority
+from reprobit.msvc50_authorities import (
+    MSVC50_CMAKE_FRONTEND_AUTHORITIES,
+    MSVC50_FILE_AUTHORITIES,
+    MSVC50_TREE_AUTHORITIES,
+)
 from reprobit.project_loader import load_project
 from reprobit.toolchains import (
     MSVC_42,
     TOOLCHAIN_PROFILES,
     ClassicMSVCToolchain,
     ToolchainDoctorReport,
+    portable_tree_receipt,
 )
 from reprobit.user_config import resolve_toolchain_root
 
 
-def _fake_toolchain(root: Path) -> Path:
-    selected = TOOLCHAIN_PROFILES[MSVC_42]
+def _fake_toolchain(root: Path, profile: str = MSVC_42) -> Path:
+    selected = TOOLCHAIN_PROFILES[profile]
     for relative in (*selected.required_producers, *selected.required_runtime_files):
         path = root.joinpath(*relative.split("/"))
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -31,6 +40,37 @@ def _fake_toolchain(root: Path) -> Path:
         directory.mkdir(parents=True, exist_ok=True)
         (directory / "fixture.dat").write_text(relative, encoding="utf-8")
     return root
+
+
+def test_toolchain_provision_dispatches_to_the_msvc50_provisioner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    requests: list[tuple[str, Path]] = []
+    installed = _fake_toolchain(tmp_path / "installed", "msvc_5_0_sp3")
+
+    def fake_provision(destination: Path, profile: str, *, progress: object = None) -> Path:
+        requests.append((profile, destination))
+        return installed
+
+    monkeypatch.setattr(onboarding, "provision_msvc50", fake_provision)
+    destination = tmp_path / "chosen"
+
+    assert (
+        main(
+            [
+                "toolchain",
+                "provision",
+                "msvc_5_0_sp3",
+                "--destination",
+                str(destination),
+                "--no-save",
+            ]
+        )
+        == 0
+    )
+    assert requests == [("msvc_5_0_sp3", destination.resolve(strict=False))]
 
 
 def test_setup_creates_and_rechecks_the_project_toolchain_lock(
@@ -358,3 +398,87 @@ def test_toolchain_provision_has_a_short_human_command(
     rendered = capsys.readouterr().out
     assert f"Compiler ready at {destination}" in rendered
     assert "Next in a ReproBit project: rbit setup ." in rendered
+
+
+def _fabricate_msvc50_installation(root: Path, identifier: str) -> None:
+    """Write an invented 5.0 installation whose authorities can be patched in."""
+    for table in (MSVC50_FILE_AUTHORITIES, MSVC50_CMAKE_FRONTEND_AUTHORITIES):
+        for relative in table[identifier]:
+            path = root.joinpath(*relative.split("/"))
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(relative.encode("ascii"))
+    for relative in MSVC50_TREE_AUTHORITIES[identifier]:
+        tree = root / relative
+        tree.mkdir(parents=True, exist_ok=True)
+        (tree / "fixture.h").write_text(relative, encoding="utf-8")
+
+
+def _monkeypatch_msvc50_authorities(monkeypatch: pytest.MonkeyPatch, installed: Path) -> None:
+    def file_entry(relative: str) -> FileAuthority:
+        path = installed.joinpath(*relative.split("/"))
+        return FileAuthority(path.stat().st_size, hashlib.sha256(path.read_bytes()).hexdigest())
+
+    monkeypatch.setattr(
+        msvc50_provision,
+        "_file_authorities",
+        lambda identifier: {
+            relative: file_entry(relative) for relative in MSVC50_FILE_AUTHORITIES[identifier]
+        },
+    )
+    monkeypatch.setattr(
+        msvc50_provision,
+        "_cmake_frontend_authorities",
+        lambda identifier: {
+            relative: file_entry(relative)
+            for relative in MSVC50_CMAKE_FRONTEND_AUTHORITIES[identifier]
+        },
+    )
+
+    def tree_authorities(identifier: str) -> dict[str, TreeAuthority]:
+        authorities: dict[str, TreeAuthority] = {}
+        for relative in MSVC50_TREE_AUTHORITIES[identifier]:
+            receipt = portable_tree_receipt(installed / relative, relative)
+            authorities[relative] = TreeAuthority(
+                receipt.entry_count,
+                receipt.max_depth,
+                receipt.membership_sha256,
+                receipt.content_sha256,
+            )
+        return authorities
+
+    monkeypatch.setattr(msvc50_provision, "_tree_authorities", tree_authorities)
+
+
+def test_setup_provisions_and_verifies_an_msvc50_project_without_manual_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.delenv("REPROBIT_MSVC_5_0_SP3_ROOT", raising=False)
+    project = tmp_path / "sample"
+    installed = tmp_path / "provisioned"
+    _fabricate_msvc50_installation(installed, "msvc_5_0_sp3")
+    _monkeypatch_msvc50_authorities(monkeypatch, installed)
+    fetched: list[str] = []
+
+    def fake_provision(destination: Path, profile: str, *, progress: object = None) -> Path:
+        fetched.append(profile)
+        return installed
+
+    monkeypatch.setattr(onboarding, "provision_msvc50", fake_provision)
+    monkeypatch.setattr(
+        onboarding,
+        "selected_backend",
+        lambda _args: SimpleNamespace(
+            identifier="fixture",
+            doctor=lambda *, execute_probe: BackendDoctorReport("fixture", "fixture", ()),
+        ),
+    )
+    assert main(["init", str(project), "--profile", "msvc_5_0_sp3"]) == 0
+    capsys.readouterr()
+
+    assert main(["setup", str(project), "--no-save", "--skip-probe"]) == 0
+
+    assert fetched == ["msvc_5_0_sp3"]
+    assert "Environment ready" in capsys.readouterr().out
+    assert (project / "reprobit" / "toolchain.lock.json").is_file()
