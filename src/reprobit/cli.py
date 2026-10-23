@@ -620,7 +620,7 @@ def _parser() -> argparse.ArgumentParser:
     provision.add_argument(
         "profile",
         nargs="?",
-        choices=(MSVC_42,),
+        choices=tuple(TOOLCHAIN_PROFILES),
         default=MSVC_42,
         help="compiler profile (default: msvc_4_2)",
     )

@@ -6151,7 +6151,7 @@ def test_toolchain_provision_lists_only_profiles_it_can_install(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     with pytest.raises(SystemExit) as stopped:
-        main(["toolchain", "provision", "msvc_5_0_rtm"])
+        main(["toolchain", "provision", "msvc_6_0"])
 
     assert stopped.value.code == 2
     assert "invalid choice" in capsys.readouterr().err

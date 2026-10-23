@@ -19,6 +19,7 @@ from reprobit.cli_paths import (
     safe_project_path,
 )
 from reprobit.msvc42_provision import provision_msvc42, verify_msvc42
+from reprobit.msvc50_provision import MSVC_50_PROFILES, provision_msvc50, verify_msvc50
 from reprobit.project_loader import load_project
 from reprobit.project_readiness import inspect_project_readiness, render_project_readiness
 from reprobit.schema import SourceManifestDocument
@@ -26,6 +27,7 @@ from reprobit.schema import ToolchainLock as SchemaToolchainLock
 from reprobit.strict_json import canonical_json, strict_load
 from reprobit.toolchains import (
     MSVC_42,
+    TOOLCHAIN_PROFILES,
     ClassicMSVCToolchain,
     ToolchainDoctorReport,
     ToolchainError,
@@ -54,16 +56,20 @@ def _provision(
     destination: Path,
     output: CLIOutput,
 ) -> Path:
-    if profile != MSVC_42:
-        raise CLIError(
-            "automatic acquisition is currently available only for Microsoft Visual C++ 4.2; "
-            "provide an existing installation with --toolchain-root"
-        )
-    with output.activity(
-        "downloading and authenticating Microsoft Visual C++ 4.2",
-        phase="toolchain-provision",
-    ) as progress:
-        return provision_msvc42(destination, progress=progress)
+    if profile == MSVC_42:
+        with output.activity(
+            "downloading and authenticating Microsoft Visual C++ 4.2",
+            phase="toolchain-provision",
+        ) as progress:
+            return provision_msvc42(destination, progress=progress)
+    if profile in MSVC_50_PROFILES:
+        display_name = TOOLCHAIN_PROFILES[profile].display_name
+        with output.activity(
+            f"downloading and authenticating {display_name}",
+            phase="toolchain-provision",
+        ) as progress:
+            return provision_msvc50(destination, profile, progress=progress)
+    raise CLIError(f"automatic acquisition is not available for profile {profile}")
 
 
 def command_toolchain_provision(args: argparse.Namespace, output: CLIOutput) -> int:
@@ -391,6 +397,9 @@ def command_setup(args: argparse.Namespace, output: CLIOutput) -> int:
     if spec.toolchain.profile == MSVC_42:
         with output.activity("authenticating the compiler installation", phase="toolchain-check"):
             verify_msvc42(selected_root)
+    elif spec.toolchain.profile in MSVC_50_PROFILES:
+        with output.activity("authenticating the compiler installation", phase="toolchain-check"):
+            verify_msvc50(selected_root, spec.toolchain.profile)
     installation = ClassicMSVCToolchain(spec.toolchain.profile, selected_root)
     lock_path = safe_project_path(root, spec.toolchain.lock_file)
     if lock_path.is_symlink():

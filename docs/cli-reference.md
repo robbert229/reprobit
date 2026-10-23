@@ -100,12 +100,12 @@ rbit doctor [-h] [--backend {auto,posix_wine_v1,windows_native_v1}] [--wine PATH
 Download and authenticate a supported compiler.
 
 ```
-rbit toolchain provision [-h] [--destination DIRECTORY] [--no-save] [{msvc_4_2}]
+rbit toolchain provision [-h] [--destination DIRECTORY] [--no-save] [{msvc_4_2,msvc_5_0_rtm,msvc_5_0_sp1,msvc_5_0_sp2,msvc_5_0_sp3}]
 ```
 
 | Argument | Default | Description |
 |---|---|---|
-| `profile` `{msvc_4_2}` | `msvc_4_2` | compiler profile (default: msvc_4_2) |
+| `profile` `{msvc_4_2,msvc_5_0_rtm,msvc_5_0_sp1,msvc_5_0_sp2,msvc_5_0_sp3}` | `msvc_4_2` | compiler profile (default: msvc_4_2) |
 
 | Argument | Default | Description |
 |---|---|---|
