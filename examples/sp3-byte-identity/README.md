@@ -63,8 +63,10 @@ identity check: once committed, every later run must reproduce the same bytes.
 `program.c` defines one `transform` function that sums the first ten squares.
 The committed producer graph compiles it with `/O2 /Ob1` and links a
 `/nodefaultlib` console PE with entry point `transform`. The normalized
-reference PE's size and SHA-256 are recorded in `reprobit/oracles/program.json`
-(the single source of truth the reference script checks against).
+reference PE is 1,024 bytes with SHA-256
+`79b3416c27aa5ad062800ed09a5efb4534c6080bf5e45b99d21a3bdd207ddd2a`, recorded
+in `reprobit/oracles/program.json` (the single source of truth the reference
+script checks against).
 
 ### Reference provenance
 
