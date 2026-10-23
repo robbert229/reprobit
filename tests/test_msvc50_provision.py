@@ -28,9 +28,14 @@ SP3 = "msvc_5_0_sp3"
 NOT_ADMITTED = "bin/psapi_extra.dll"
 
 
+def _repo_path(installed: str) -> str:
+    """Fabricated upstream mirrors the real layout: runtimes live in redist/."""
+    return msvc50_provision._RUNTIME_PLACEMENT.get(installed, installed)
+
+
 def _fabricate_upstream(root: Path) -> None:
     for relative in MSVC50_FILE_AUTHORITIES[SP3]:
-        path = root.joinpath(*relative.split("/"))
+        path = root.joinpath(*_repo_path(relative).split("/"))
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"fabricated:" + relative.encode("ascii"))
     for relative in MSVC50_CMAKE_FRONTEND_AUTHORITIES[SP3]:
@@ -62,7 +67,7 @@ def _install_fake_checkout(
 
 def _install_fake_authorities(monkeypatch: pytest.MonkeyPatch, fabricated: Path) -> None:
     def file_table(relative: str) -> FileAuthority:
-        path = fabricated.joinpath(*relative.split("/"))
+        path = fabricated.joinpath(*_repo_path(relative).split("/"))
         return FileAuthority(path.stat().st_size, hashlib.sha256(path.read_bytes()).hexdigest())
 
     def file_authorities(identifier: str) -> dict[str, FileAuthority]:
@@ -188,6 +193,11 @@ def test_verify_rejects_tree_mutation(
     _install_fake_authorities(monkeypatch, fabricated)
     installed = tmp_path / "installed"
     shutil.copytree(fabricated, installed)
+    for installed_path, repo_path in msvc50_provision._RUNTIME_PLACEMENT.items():
+        source = installed.joinpath(*repo_path.split("/"))
+        destination = installed.joinpath(*installed_path.split("/"))
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        source.replace(destination)
     shutil.rmtree(installed / "atl/include")
 
     with pytest.raises(ProvisionError, match="absent or redirected"):
