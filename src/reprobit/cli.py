@@ -18,6 +18,7 @@ from reprobit.backends import (
 )
 from reprobit.cli_output import CLIOutput
 from reprobit.model import AuthenticityPolicy
+from reprobit.msvc50_provision import MSVC_50_PROFILES
 from reprobit.progress import bounded_exception_notes, exception_detail
 from reprobit.search_limits import (
     DEFAULT_DISCOVERY_CANDIDATES,
@@ -620,7 +621,7 @@ def _parser() -> argparse.ArgumentParser:
     provision.add_argument(
         "profile",
         nargs="?",
-        choices=tuple(TOOLCHAIN_PROFILES),
+        choices=(MSVC_42, *MSVC_50_PROFILES),
         default=MSVC_42,
         help="compiler profile (default: msvc_4_2)",
     )

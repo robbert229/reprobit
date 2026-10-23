@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,15 +8,23 @@ from types import SimpleNamespace
 import pytest
 
 import reprobit.onboarding as onboarding
+from reprobit import msvc50_provision
 from reprobit.backends import BackendDoctorReport, DoctorCheck
 from reprobit.cli import main
 from reprobit.cli_output import human_command
+from reprobit.msvc42_provision import FileAuthority, TreeAuthority
+from reprobit.msvc50_authorities import (
+    MSVC50_CMAKE_FRONTEND_AUTHORITIES,
+    MSVC50_FILE_AUTHORITIES,
+    MSVC50_TREE_AUTHORITIES,
+)
 from reprobit.project_loader import load_project
 from reprobit.toolchains import (
     MSVC_42,
     TOOLCHAIN_PROFILES,
     ClassicMSVCToolchain,
     ToolchainDoctorReport,
+    portable_tree_receipt,
 )
 from reprobit.user_config import resolve_toolchain_root
 
@@ -391,6 +400,55 @@ def test_toolchain_provision_has_a_short_human_command(
     assert "Next in a ReproBit project: rbit setup ." in rendered
 
 
+def _fabricate_msvc50_installation(root: Path, identifier: str) -> None:
+    """Write an invented 5.0 installation whose authorities can be patched in."""
+    for table in (MSVC50_FILE_AUTHORITIES, MSVC50_CMAKE_FRONTEND_AUTHORITIES):
+        for relative in table[identifier]:
+            path = root.joinpath(*relative.split("/"))
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(relative.encode("ascii"))
+    for relative in MSVC50_TREE_AUTHORITIES[identifier]:
+        tree = root / relative
+        tree.mkdir(parents=True, exist_ok=True)
+        (tree / "fixture.h").write_text(relative, encoding="utf-8")
+
+
+def _monkeypatch_msvc50_authorities(monkeypatch: pytest.MonkeyPatch, installed: Path) -> None:
+    def file_entry(relative: str) -> FileAuthority:
+        path = installed.joinpath(*relative.split("/"))
+        return FileAuthority(path.stat().st_size, hashlib.sha256(path.read_bytes()).hexdigest())
+
+    monkeypatch.setattr(
+        msvc50_provision,
+        "_file_authorities",
+        lambda identifier: {
+            relative: file_entry(relative) for relative in MSVC50_FILE_AUTHORITIES[identifier]
+        },
+    )
+    monkeypatch.setattr(
+        msvc50_provision,
+        "_cmake_frontend_authorities",
+        lambda identifier: {
+            relative: file_entry(relative)
+            for relative in MSVC50_CMAKE_FRONTEND_AUTHORITIES[identifier]
+        },
+    )
+
+    def tree_authorities(identifier: str) -> dict[str, TreeAuthority]:
+        authorities: dict[str, TreeAuthority] = {}
+        for relative in MSVC50_TREE_AUTHORITIES[identifier]:
+            receipt = portable_tree_receipt(installed / relative, relative)
+            authorities[relative] = TreeAuthority(
+                receipt.entry_count,
+                receipt.max_depth,
+                receipt.membership_sha256,
+                receipt.content_sha256,
+            )
+        return authorities
+
+    monkeypatch.setattr(msvc50_provision, "_tree_authorities", tree_authorities)
+
+
 def test_setup_provisions_and_verifies_an_msvc50_project_without_manual_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -398,7 +456,9 @@ def test_setup_provisions_and_verifies_an_msvc50_project_without_manual_root(
 ) -> None:
     monkeypatch.delenv("REPROBIT_MSVC_5_0_SP3_ROOT", raising=False)
     project = tmp_path / "sample"
-    installed = _fake_toolchain(tmp_path / "provisioned", "msvc_5_0_sp3")
+    installed = tmp_path / "provisioned"
+    _fabricate_msvc50_installation(installed, "msvc_5_0_sp3")
+    _monkeypatch_msvc50_authorities(monkeypatch, installed)
     fetched: list[str] = []
 
     def fake_provision(destination: Path, profile: str, *, progress: object = None) -> Path:
@@ -406,7 +466,6 @@ def test_setup_provisions_and_verifies_an_msvc50_project_without_manual_root(
         return installed
 
     monkeypatch.setattr(onboarding, "provision_msvc50", fake_provision)
-    monkeypatch.setattr(onboarding, "verify_msvc50", lambda _root, _profile: None)
     monkeypatch.setattr(
         onboarding,
         "selected_backend",

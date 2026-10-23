@@ -49,15 +49,15 @@ def _fabricate_upstream(root: Path) -> None:
 def _install_fake_checkout(
     monkeypatch: pytest.MonkeyPatch,
     fabricated: Path,
-) -> list[int]:
-    calls: list[int] = []
+) -> dict[str, int]:
+    state = {"fetches": 0}
 
     def checkout(repository: Path, _url: str, _revision: str, _paths: tuple[str, ...]) -> None:
-        calls.append(len(calls))
+        state["fetches"] += 1
         shutil.copytree(fabricated, repository)
 
     monkeypatch.setattr(msvc50_provision, "_checkout", checkout)
-    return calls
+    return state
 
 
 def _install_fake_authorities(monkeypatch: pytest.MonkeyPatch, fabricated: Path) -> None:
@@ -103,7 +103,7 @@ def test_provision_fetches_authenticates_and_publishes_exactly(
     fabricated: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls = _install_fake_checkout(monkeypatch, fabricated)
+    state = _install_fake_checkout(monkeypatch, fabricated)
     _install_fake_authorities(monkeypatch, fabricated)
     destination = tmp_path / "toolchain"
     messages: list[str] = []
@@ -111,7 +111,7 @@ def test_provision_fetches_authenticates_and_publishes_exactly(
     result = msvc50_provision.provision_msvc50(destination, SP3, progress=messages.append)
 
     assert result == destination
-    assert calls == [0]
+    assert state == {"fetches": 1}
     assert any(message.startswith("fetching msvc500sp3@") for message in messages)
     assert messages[-1].startswith("published exact toolchain at")
     msvc50_provision.verify_msvc50(destination, SP3)
@@ -125,7 +125,7 @@ def test_rerun_authenticates_without_another_fetch(
     fabricated: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls = _install_fake_checkout(monkeypatch, fabricated)
+    state = _install_fake_checkout(monkeypatch, fabricated)
     _install_fake_authorities(monkeypatch, fabricated)
     destination = tmp_path / "toolchain"
     msvc50_provision.provision_msvc50(destination, SP3)
@@ -134,7 +134,7 @@ def test_rerun_authenticates_without_another_fetch(
     result = msvc50_provision.provision_msvc50(destination, SP3, progress=messages.append)
 
     assert result == destination
-    assert calls == [0]
+    assert state == {"fetches": 1}
     assert messages == [
         f"verifying existing destination {destination}",
         "existing toolchain is exact; no download needed",
@@ -146,7 +146,7 @@ def test_existing_inexact_destination_never_downloads(
     fabricated: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls = _install_fake_checkout(monkeypatch, fabricated)
+    state = _install_fake_checkout(monkeypatch, fabricated)
     _install_fake_authorities(monkeypatch, fabricated)
     destination = tmp_path / "toolchain"
     msvc50_provision.provision_msvc50(destination, SP3)
@@ -155,7 +155,24 @@ def test_existing_inexact_destination_never_downloads(
 
     with pytest.raises(ProvisionError, match="file authority differs"):
         msvc50_provision.provision_msvc50(destination, SP3)
-    assert calls == [0]
+    assert state == {"fetches": 1}
+
+
+def test_rerun_refuses_a_polluted_destination_without_downloading(
+    tmp_path: Path,
+    fabricated: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _install_fake_checkout(monkeypatch, fabricated)
+    _install_fake_authorities(monkeypatch, fabricated)
+    destination = tmp_path / "toolchain"
+    msvc50_provision.provision_msvc50(destination, SP3)
+    (destination / NOT_ADMITTED).write_bytes(b"pollution that the fetch path would have stripped")
+
+    with pytest.raises(ProvisionError, match=r"not admitted by the profile: bin/psapi_extra\.dll"):
+        msvc50_provision.provision_msvc50(destination, SP3)
+    assert state == {"fetches": 1}
+    assert (destination / NOT_ADMITTED).is_file(), "the polluted file must not be touched"
 
 
 def test_verify_requires_every_declared_file(tmp_path: Path) -> None:

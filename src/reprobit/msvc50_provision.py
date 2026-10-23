@@ -15,35 +15,50 @@ from __future__ import annotations
 
 import shutil
 import tempfile
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from pathlib import Path
 
 from reprobit.msvc42_provision import (
     FileAuthority,
+    ProgressCallback,
     ProvisionError,
     TreeAuthority,
     _checkout,
     _copy_file,
     _copy_tree,
+    _emit,
     _require_file,
 )
 from reprobit.msvc50_authorities import (
     MSVC50_CMAKE_FRONTEND_AUTHORITIES,
     MSVC50_FILE_AUTHORITIES,
     MSVC50_TREE_AUTHORITIES,
+    Msvc50FileAuthority,
 )
-from reprobit.toolchains import ToolchainProfile, portable_tree_receipt, profile
+from reprobit.toolchains import (
+    MSVC_50_RTM,
+    MSVC_50_SP1,
+    MSVC_50_SP2,
+    MSVC_50_SP3,
+    ToolchainProfile,
+    portable_tree_receipt,
+    profile,
+)
 
-MSVC_50_PROFILES = ("msvc_5_0_rtm", "msvc_5_0_sp1", "msvc_5_0_sp2", "msvc_5_0_sp3")
+MSVC_50_PROFILES = (MSVC_50_RTM, MSVC_50_SP1, MSVC_50_SP2, MSVC_50_SP3)
 
-ProgressCallback = Callable[[str], None]
+
+def _file_table(
+    table: Mapping[str, Msvc50FileAuthority],
+) -> dict[str, FileAuthority]:
+    return {
+        relative: FileAuthority(authority.size, authority.sha256)
+        for relative, authority in table.items()
+    }
 
 
 def _file_authorities(identifier: str) -> Mapping[str, FileAuthority]:
-    return {
-        relative: FileAuthority(authority.size, authority.sha256)
-        for relative, authority in MSVC50_FILE_AUTHORITIES[identifier].items()
-    }
+    return _file_table(MSVC50_FILE_AUTHORITIES[identifier])
 
 
 def _tree_authorities(identifier: str) -> Mapping[str, TreeAuthority]:
@@ -59,10 +74,7 @@ def _tree_authorities(identifier: str) -> Mapping[str, TreeAuthority]:
 
 
 def _cmake_frontend_authorities(identifier: str) -> Mapping[str, FileAuthority]:
-    return {
-        relative: FileAuthority(authority.size, authority.sha256)
-        for relative, authority in MSVC50_CMAKE_FRONTEND_AUTHORITIES[identifier].items()
-    }
+    return _file_table(MSVC50_CMAKE_FRONTEND_AUTHORITIES[identifier])
 
 
 def verify_msvc50(root: Path, profile_identifier: str) -> None:
@@ -95,6 +107,31 @@ def verify_msvc50(root: Path, profile_identifier: str) -> None:
             )
 
 
+def _reject_unadmitted(root: Path, profile_identifier: str) -> None:
+    """Reject a destination that carries files the profile does not admit.
+
+    A published payload holds exactly the admitted files and trees, so calling
+    an existing destination "exact" is only honest when nothing else sits in
+    it.  Input trees need no scan because portable tree receipts already hash
+    their membership.
+    """
+    admitted = set(_file_authorities(profile_identifier))
+    admitted.update(_cmake_frontend_authorities(profile_identifier))
+    tree_roots = tuple(f"{relative}/" for relative in _tree_authorities(profile_identifier))
+    extras = []
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(root).as_posix()
+        if relative not in admitted and not relative.startswith(tree_roots):
+            extras.append(relative)
+    if extras:
+        shown = ", ".join(extras[:5])
+        if len(extras) > 5:
+            shown += f", and {len(extras) - 5} more"
+        raise ProvisionError(f"destination holds files not admitted by the profile: {shown}")
+
+
 def _cone_paths(installation_profile: ToolchainProfile) -> tuple[str, ...]:
     roots = {relative.split("/", 1)[0] for relative in installation_profile.sources[0].paths}
     return tuple(sorted(roots))
@@ -115,11 +152,10 @@ def provision_msvc50(
     if destination == Path(destination.anchor):
         raise ProvisionError("toolchain destination must not be a filesystem root")
     if destination.exists() or destination.is_symlink():
-        if progress is not None:
-            progress(f"verifying existing destination {destination}")
+        _emit(progress, f"verifying existing destination {destination}")
+        _reject_unadmitted(destination, profile_identifier)
         verify_msvc50(destination, profile_identifier)
-        if progress is not None:
-            progress("existing toolchain is exact; no download needed")
+        _emit(progress, "existing toolchain is exact; no download needed")
         return destination
 
     installation_profile = profile(profile_identifier)
@@ -133,8 +169,7 @@ def provision_msvc50(
         checkout = temporary / repository_name
         payload = temporary / "payload"
         payload.mkdir()
-        if progress is not None:
-            progress(f"fetching {repository_name}@{source.revision[:12]}")
+        _emit(progress, f"fetching {repository_name}@{source.revision[:12]}")
         _checkout(checkout, source.repository, source.revision, _cone_paths(installation_profile))
         for relative in _file_authorities(profile_identifier):
             _copy_file(checkout, payload, relative)
@@ -142,12 +177,10 @@ def provision_msvc50(
             _copy_file(checkout, payload, relative)
         for relative in _tree_authorities(profile_identifier):
             _copy_tree(checkout, payload, relative)
-        if progress is not None:
-            progress("authenticating files and portable input trees")
+        _emit(progress, "authenticating files and portable input trees")
         verify_msvc50(payload, profile_identifier)
         payload.replace(destination)
-        if progress is not None:
-            progress(f"published exact toolchain at {destination}")
+        _emit(progress, f"published exact toolchain at {destination}")
         return destination
     finally:
         shutil.rmtree(temporary, ignore_errors=True)
