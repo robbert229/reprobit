@@ -1,5 +1,6 @@
 /.reprobit-discovery/
 /.reprobit-state/
 /.reprobit-transactions/
+/.failure-logs/
 /build/
 /reference/

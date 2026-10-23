@@ -200,7 +200,7 @@ _MSVC50_RUNTIME = (
     # The MSVC 5.0 C and C++ runtimes every bin tool imports at startup are
     # not present in bin/ of the pinned releases; each release's redist/
     # directory carries them, and the provisioner places them into bin/
-    # exactly like the 4.2 profile places MSVCRT40.dll/msvcrt20.dll.
+    # (see msvc50_provision._RUNTIME_PLACEMENT).
     "bin/msvcrt.dll",
     "bin/msvcp50.dll",
     # RCDLL.DLL is the resource-compiler runtime that rc.exe imports; unlike

@@ -48,9 +48,8 @@ from reprobit.toolchains import (
 MSVC_50_PROFILES = (MSVC_50_RTM, MSVC_50_SP1, MSVC_50_SP2, MSVC_50_SP3)
 
 # Installed bin runtime DLLs whose bytes live under a different repo path.
-# Every released tree carries the runtimes in redist/ (as MSVC 4.2's profile
-# does for MSVCRT40.dll/msvcrt20.dll); the provisioner places them into bin/
-# so the tools can load them at startup on modern Windows.
+# Every released tree carries the runtimes in redist/; the provisioner places
+# them into bin/ so the tools can load them at startup on modern Windows.
 _RUNTIME_PLACEMENT = {
     "bin/msvcrt.dll": "redist/msvcrt.dll",
     "bin/msvcp50.dll": "redist/msvcp50.dll",

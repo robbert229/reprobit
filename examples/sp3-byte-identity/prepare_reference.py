@@ -155,23 +155,11 @@ def _build_reference(toolchain_root: Path) -> bytes:
             timeout=120,
         )
         if linked.returncode != 0:
-            probe = subprocess.run(
-                (os.fspath(linker), "/?"),
-                cwd=temporary_root / "link",
-                env=environment,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=60,
-            )
             log = _write_failure_log(
                 "link",
                 returncode=linked.returncode,
                 stdout=linked.stdout,
                 stderr=linked.stderr,
-                probe_returncode=probe.returncode,
-                probe_stdout=probe.stdout,
-                probe_stderr=probe.stderr,
                 linker=str(linker),
                 linker_size=linker.stat().st_size,
                 toolchain=str(toolchain_root),
