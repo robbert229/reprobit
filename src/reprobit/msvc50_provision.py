@@ -47,6 +47,14 @@ from reprobit.toolchains import (
 
 MSVC_50_PROFILES = (MSVC_50_RTM, MSVC_50_SP1, MSVC_50_SP2, MSVC_50_SP3)
 
+# Installed bin runtime DLLs whose bytes live under a different repo path.
+# Every released tree carries the runtimes in redist/; the provisioner places
+# them into bin/ so the tools can load them at startup on modern Windows.
+_RUNTIME_PLACEMENT = {
+    "bin/msvcrt.dll": "redist/msvcrt.dll",
+    "bin/msvcp50.dll": "redist/msvcp50.dll",
+}
+
 
 def _file_table(
     table: Mapping[str, Msvc50FileAuthority],
@@ -134,6 +142,7 @@ def _reject_unadmitted(root: Path, profile_identifier: str) -> None:
 
 def _cone_paths(installation_profile: ToolchainProfile) -> tuple[str, ...]:
     roots = {relative.split("/", 1)[0] for relative in installation_profile.sources[0].paths}
+    roots.update(repo_path.split("/", 1)[0] for repo_path in _RUNTIME_PLACEMENT.values())
     return tuple(sorted(roots))
 
 
@@ -172,11 +181,19 @@ def provision_msvc50(
         _emit(progress, f"fetching {repository_name}@{source.revision[:12]}")
         _checkout(checkout, source.repository, source.revision, _cone_paths(installation_profile))
         for relative in _file_authorities(profile_identifier):
+            if relative in _RUNTIME_PLACEMENT:
+                continue
             _copy_file(checkout, payload, relative)
         for relative in _cmake_frontend_authorities(profile_identifier):
             _copy_file(checkout, payload, relative)
         for relative in _tree_authorities(profile_identifier):
             _copy_tree(checkout, payload, relative)
+        for installed, repo_path in _RUNTIME_PLACEMENT.items():
+            _copy_file(checkout, payload, repo_path)
+            (payload / repo_path).replace(payload / installed)
+        redist = payload / "redist"
+        if redist.is_dir() and not any(redist.iterdir()):
+            redist.rmdir()
         _emit(progress, "authenticating files and portable input trees")
         verify_msvc50(payload, profile_identifier)
         payload.replace(destination)

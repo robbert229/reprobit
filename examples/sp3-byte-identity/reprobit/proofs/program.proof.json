@@ -1,0 +1,1 @@
+{"schema_version":3,"target_id":"program","translation_unit_id":null,"expected_observations":[{"kind":"expected_observations","id":"proof.project.metadata","intervention_id":"project.metadata","family":"image_metadata","expected_values":{},"redactions":[],"status":null,"authenticity":null}]}

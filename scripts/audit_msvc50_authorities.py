@@ -22,6 +22,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from reprobit.msvc50_provision import _RUNTIME_PLACEMENT
 from reprobit.toolchains import (
     MSVC_50_RTM,
     MSVC_50_SP1,
@@ -62,7 +63,15 @@ def _verify_checkout(checkout: Path, revision: str) -> None:
 
 
 def _file_authority(root: Path, relative: str) -> tuple[int, str]:
-    path = root.joinpath(*relative.split("/"))
+    """Hash one declared installed file, following placement to its repo path.
+
+    Runtime DLLs that must land in bin/ (the tool startup directory) are
+    recorded by their installed name but read from the pinned repo location
+    the provisioner copies them from (for example ``bin/msvcrt.dll`` is
+    read from ``redist/msvcrt.dll``).
+    """
+    source = _RUNTIME_PLACEMENT.get(relative, relative)
+    path = root.joinpath(*source.split("/"))
     if not path.is_file() or path.is_symlink():
         raise AuditError(f"{root.name}: declared file is absent or redirected: {relative}")
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
