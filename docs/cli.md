@@ -130,12 +130,16 @@ Download and authenticate a supported compiler outside any project:
 rbit toolchain provision msvc_4_2
 ```
 
-Automatic acquisition is currently available only for Microsoft Visual C++ 4.2.
-The installation goes to this platform's standard user location unless
-`--destination` says otherwise, and its path is remembered unless `--no-save`
-is given. `rbit setup` runs the same provisioning automatically when a project
-needs it, so this command is mainly for machines prepared before any project
-exists (the advanced declaration-discovery example uses it).
+Automatic acquisition is available for Microsoft Visual C++ 4.2 and the MSVC
+5.0 releases. The installation goes to this platform's standard user location
+unless `--destination` says otherwise, and its path is remembered unless
+`--no-save` is given. `rbit setup` runs the same provisioning automatically
+when a project needs it, so this command is mainly for machines prepared
+before any project exists (the advanced declaration-discovery example uses
+it). MSVC 5.0 provisioning also installs and authenticates the packaged
+cross-host Wine transport, so the same lock works on POSIX and native
+Windows; the finding behind Wine fidelity for the 5.0 toolchain is documented
+in `runtime/msvc50-wine/`.
 
 ## rbit toolchain lock
 
@@ -164,10 +168,12 @@ file and tree receipts. The authenticated provisioner and CI workflow establish
 acquisition; the lock receipts establish the installed content. Platform wrappers
 or support files that participate in execution must be named explicitly with
 repeatable `--runtime-file` arguments and remain outside `profile_sources`.
-The five paths above are the complete portable runtime set for MSVC 4.2 on
-POSIX. `wine/x86/msvcenv.sh` is used only while CMake configures an import or
-refresh tree; direct ReproBit builds do not execute it, so the provisioner
-authenticates it but the portable runtime lock does not include it.
+The five paths above are the complete portable runtime set for the classic
+MSVC profiles on POSIX (MSVC 4.2 and every MSVC 5.0 profile; 5.0 provisioning
+installs the same wrapper set with a 5.0 `msvcenv.sh`). `wine/x86/msvcenv.sh`
+is used only while CMake configures an import or refresh tree; direct ReproBit
+builds do not execute it, so the provisioner authenticates it but the portable
+runtime lock does not include it.
 Committed lock paths are relative to the supplied toolchain root; the physical
 root itself remains local configuration. `rbit validate` rejects a registered
 profile whose locked profile paths are missing, disagree with these reviewed

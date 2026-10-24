@@ -21,7 +21,9 @@ compiler process one Windows process namespace and the same fixed compiler-visib
 leave that producer's descendants running. The project locks the host launchers used for the
 compiler and resource compiler alongside the toolchain itself. The normal `rbit setup` flow
 remembers these launchers; explicit transport options in the [command-line workflow](cli.md) are
-advanced one-run overrides.
+advanced one-run overrides. How faithfully Wine reproduces each classic MSVC toolchain's output,
+and which DLL overrides the profiles require, is documented in
+[Wine fidelity for classic toolchains](wine.md).
 
 ## Native Windows
 
@@ -37,8 +39,12 @@ Public CI runs portable tests and package checks on Ubuntu, macOS, and Windows. 
 drive lifecycle, and compiles through the real CL -> C1XX -> C2 chain. Compiler bytes are never
 committed, cached, or uploaded.
 
+The MSVC 5.0 SP3 byte-identity fixture gives end-to-end project evidence on both host kinds. A
+native Windows lane provisions SP3, authenticates the committed oracle pin, and runs a cold
+`rbit verify` to a byte-identical verdict; a POSIX Wine lane provisions the same pinned tree
+(including the packaged cross-host transport), and certifies the identical `program.json` pin
+through Wine. The two lanes cross-check each other: neither may drift from the committed bytes.
+
 That gate proves the 4.2 host and compiler path, not a project's full byte-identity verdict from
 scratch. Project certification still needs the project's locked toolchain, reference data, and a
-fixture that builds from scratch on its intended host. ReproBit also recognizes MSVC 5.0 profiles,
-but they do not yet have
-equivalent end-to-end public evidence.
+fixture that builds from scratch on its intended host.

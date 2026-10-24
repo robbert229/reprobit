@@ -1,10 +1,10 @@
-"""Native Windows byte-identity fixture for the MSVC 5.0 SP3 profile.
+"""MSVC 5.0 SP3 byte-identity fixture for native Windows and Wine.
 
-The example project is committed with a provisional oracle pin; the native CI
-job's first run must pass `prepare_reference.py --calibrate` and commit the
-recorded digest so this test's cold verify proves byte identity against a real
-SP3 build.  The module marker keeps the test portable on other hosts: it skips
-cleanly unless REPROBIT_MSVC_5_0_SP3_ROOT points at an authenticated SP3 tree.
+The example project is committed with a calibrated oracle pin; the native CI
+job and the Wine job each run `prepare_reference.py` (without `--calibrate`) so
+this test's cold verify proves byte identity on both host kinds.  The module
+marker keeps the test portable on other hosts: it skips cleanly unless
+REPROBIT_MSVC_5_0_SP3_ROOT points at an authenticated SP3 tree.
 """
 
 from __future__ import annotations
@@ -116,8 +116,8 @@ def test_sp3_example_provisions_pins_verifies_byte_identical(
     )
     committed = Digest.from_path(reference)
     assert committed == pinned.image_digest, (
-        "reference did not reproduce the committed SP3 oracle pin; the native job "
-        "must run prepare_reference.py --calibrate and commit the recorded digest"
+        "reference did not reproduce the committed SP3 oracle pin; the fixture "
+        "job must run prepare_reference.py --calibrate and commit the recorded digest"
     )
     assert reference.stat().st_size == pinned.image_size
 

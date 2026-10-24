@@ -112,6 +112,8 @@ rebuilds and re-authenticates the toolchain, runs the private-drive and process-
 lifetime tests, and compiles through the real MSVC 4.2 child chain. It uploads
 only tests and diagnostic logs.
 
-This is end-to-end host evidence for MSVC 4.2. ReproBit recognizes MSVC 5.0 RTM
-and service-pack profiles, but those profiles do not yet have an equivalent
-public compiler-and-fixture gate.
+This is end-to-end host evidence for MSVC 4.2, and the SP3 byte-identity
+fixture adds the equivalent 5.0 gate on native Windows and through Wine: one
+committed oracle pin is reproduced byte-for-byte by both a native `windows-2022`
+lane and a POSIX Wine lane, so the 5.0 profile now has public compiler-and-
+fixture proof on two host kinds (see [platforms](platforms.md#what-public-ci-proves)).

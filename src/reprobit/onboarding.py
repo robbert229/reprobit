@@ -122,7 +122,7 @@ def _create_project_lock(
     lock_path: Path,
 ) -> SchemaToolchainLock:
     runtime_paths: tuple[str, ...] = ()
-    if profile == MSVC_42:
+    if profile in (MSVC_42, *MSVC_50_PROFILES):
         present = tuple(
             relative
             for relative in _CROSS_HOST_TRANSPORTS
@@ -131,7 +131,7 @@ def _create_project_lock(
         if present and present != _CROSS_HOST_TRANSPORTS:
             missing = sorted(set(_CROSS_HOST_TRANSPORTS) - set(present))
             raise CLIError(
-                "the MSVC 4.2 transport installation is incomplete; missing " + ", ".join(missing)
+                "the cross-host transport installation is incomplete; missing " + ", ".join(missing)
             )
         runtime_paths = present
     document = installation.create_lock(include_trees=True, runtime_paths=runtime_paths)
