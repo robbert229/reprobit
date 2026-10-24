@@ -18,10 +18,11 @@ The result is more than a matching checksum. ReproBit checks three separate clai
    original executable.
 
 ReproBit is pre-release software. It recognizes profiles for Microsoft Visual C++ 4.2 and the
-5.0 releases. Current end-to-end evidence with the real compiler and native Windows CI covers
-4.2; the 5.0 profiles are modeled, but do not yet carry equivalent end-to-end proof. The shared
-build, verification, reporting, and incremental pieces are designed to support more compiler
-families through reviewed library releases.
+5.0 releases. End-to-end evidence with the real compiler covers 4.2 on native Windows CI, and the
+5.0 SP3 release now carries the same byte-identity proof on both native Windows and the POSIX Wine
+transport; the other 5.0 releases remain modeled but unproven. The shared build, verification,
+reporting, and incremental pieces are designed to support more compiler families through reviewed
+library releases.
 
 ## Install
 
@@ -142,6 +143,7 @@ Detailed references:
 - [Interventions](docs/interventions.md)
 - [Cost model](docs/costs.md)
 - [Platforms and logical paths](docs/platforms.md)
+- [Wine fidelity for classic toolchains](docs/wine.md)
 - [Native Windows and external MSVC setup](docs/windows.md)
 - [CMake import and refresh](docs/cmake.md)
 - [Architecture](docs/architecture.md)

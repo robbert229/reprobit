@@ -8,8 +8,9 @@ project records, and verifies the result against that committed oracle before
 touching any published reference.  When the reference bytes have never been
 produced or the toolchain changed them, `--calibrate` rebuilds and records the
 actual digest into the committed oracle so the project stays self-consistent;
-the printed digest is what a maintainer commits.  The normal native Windows
-job must pass without `--calibrate`.
+the printed digest is what a maintainer commits.  The CI job must pass without
+`--calibrate` on both native Windows and the POSIX/Wine transport; the byte
+pin is the same on either host.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -51,37 +53,61 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _compiler_environment(toolchain_root: Path, temporary_root: Path) -> dict[str, str]:
-    if os.name != "nt":
-        raise RuntimeError(
-            "building an MSVC 5.0 reference requires native Windows; the Wine "
-            "transport for SP3 is not part of this fixture yet"
-        )
-    system_root = os.environ.get("SYSTEMROOT")
-    if system_root is None:
-        raise RuntimeError("native Windows has no SYSTEMROOT environment")
-    return {
-        "SYSTEMROOT": system_root,
-        "TEMP": os.fspath(temporary_root / "tmp"),
-        "TMP": os.fspath(temporary_root / "tmp"),
-        "PATH": os.pathsep.join(
-            (
-                os.fspath(toolchain_root / "bin"),
-                os.fspath(Path(system_root) / "System32"),
-            )
-        ),
-        "INCLUDE": os.pathsep.join(
-            (
-                os.fspath(toolchain_root / "include"),
-                os.fspath(toolchain_root / "mfc" / "include"),
-            )
-        ),
-        "LIB": os.pathsep.join(
-            (
-                os.fspath(toolchain_root / "lib"),
-                os.fspath(toolchain_root / "mfc" / "lib"),
-            )
-        ),
-    }
+    if os.name == "posix":
+        wine = shutil.which("wine")
+        wineserver = shutil.which("wineserver")
+        if wine is None or wineserver is None:
+            raise RuntimeError("Wine and wineserver must both be available on PATH")
+        return {
+            "HOME": os.fspath(temporary_root / "home"),
+            "USER": "reprobit",
+            "LOGNAME": "reprobit",
+            "TMPDIR": os.fspath(temporary_root / "tmp"),
+            "XDG_RUNTIME_DIR": os.fspath(temporary_root / "xdg-runtime"),
+            "WINEPREFIX": os.fspath(temporary_root / "wine-prefix"),
+            "PATH": os.pathsep.join(
+                dict.fromkeys(
+                    (
+                        os.fspath(Path(wine).resolve(strict=True).parent),
+                        "/usr/bin",
+                        "/bin",
+                        "/usr/sbin",
+                        "/sbin",
+                    )
+                )
+            ),
+            "LC_ALL": "C",
+            "LANG": "C",
+            "WINEDEBUG": "-all",
+        }
+    if os.name == "nt":
+        system_root = os.environ.get("SYSTEMROOT")
+        if system_root is None:
+            raise RuntimeError("native Windows has no SYSTEMROOT environment")
+        return {
+            "SYSTEMROOT": system_root,
+            "TEMP": os.fspath(temporary_root / "tmp"),
+            "TMP": os.fspath(temporary_root / "tmp"),
+            "PATH": os.pathsep.join(
+                (
+                    os.fspath(toolchain_root / "bin"),
+                    os.fspath(Path(system_root) / "System32"),
+                )
+            ),
+            "INCLUDE": os.pathsep.join(
+                (
+                    os.fspath(toolchain_root / "include"),
+                    os.fspath(toolchain_root / "mfc" / "include"),
+                )
+            ),
+            "LIB": os.pathsep.join(
+                (
+                    os.fspath(toolchain_root / "lib"),
+                    os.fspath(toolchain_root / "mfc" / "lib"),
+                )
+            ),
+        }
+    raise RuntimeError("this example supports POSIX/Wine and native Windows")
 
 
 def _write_failure_log(step: str, **details: object) -> Path:
@@ -95,14 +121,29 @@ def _write_failure_log(step: str, **details: object) -> Path:
 
 
 def _build_reference(toolchain_root: Path) -> bytes:
-    driver = toolchain_root / "bin" / "CL.EXE"
-    linker = toolchain_root / "bin" / "LINK.EXE"
+    driver = (
+        toolchain_root / "wine" / "x86" / "cl"
+        if os.name == "posix"
+        else toolchain_root / "bin" / "CL.EXE"
+    )
+    linker = (
+        toolchain_root / "wine" / "x86" / "link"
+        if os.name == "posix"
+        else toolchain_root / "bin" / "LINK.EXE"
+    )
     for executable in (driver, linker):
         if not executable.is_file():
             raise RuntimeError(f"MSVC 5.0 SP3 executable is missing: {executable}")
     with tempfile.TemporaryDirectory(prefix="reprobit-sp3-reference-") as raw_temporary:
         temporary_root = Path(raw_temporary)
-        for name in ("tmp", "compile", "link"):
+        for name in (
+            "home",
+            "tmp",
+            "xdg-runtime",
+            "wine-prefix",
+            "compile",
+            "link",
+        ):
             (temporary_root / name).mkdir(mode=0o700)
         environment = _compiler_environment(toolchain_root, temporary_root)
         compiled = subprocess.run(

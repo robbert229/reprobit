@@ -411,6 +411,9 @@ def _fabricate_msvc50_installation(root: Path, identifier: str) -> None:
         tree = root / relative
         tree.mkdir(parents=True, exist_ok=True)
         (tree / "fixture.h").write_text(relative, encoding="utf-8")
+    # Cross-host transports are part of a provisioned 5.0 installation; the
+    # setup path authenticates them like every other admitted file.
+    msvc50_provision._install_transport_assets(root)
 
 
 def _monkeypatch_msvc50_authorities(monkeypatch: pytest.MonkeyPatch, installed: Path) -> None:

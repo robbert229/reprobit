@@ -285,7 +285,7 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: ${{ runner.temp }}/archaic-msvc500sp3
-          key: msvc50-v1-${{ runner.os }}-${{ hashFiles('src/reprobit/msvc50_provision.py', 'src/reprobit/msvc42_provision.py', 'src/reprobit/msvc50_authorities.py', 'src/reprobit/toolchains.py') }}
+          key: msvc50-v1-${{ runner.os }}-${{ hashFiles('src/reprobit/msvc50_provision.py', 'src/reprobit/msvc42_provision.py', 'src/reprobit/msvc50_authorities.py', 'src/reprobit/toolchains.py', 'runtime/**') }}
       - name: Provision and authenticate the external compiler
         run: >-
           rbit toolchain provision
@@ -328,6 +328,84 @@ jobs:
           path: |
             ${{ runner.temp }}/native-runner.txt
             ${{ runner.temp }}/sp3-tests.xml
+            ${{ runner.temp }}/sp3-logs/*.log
+          if-no-files-found: warn
+          retention-days: 7
+
+  wine-sp3-byte-identity:
+    name: Wine / MSVC 5.0 SP3 byte identity
+    runs-on: ubuntu-latest
+    # The fixture certifies the same byte pin through the POSIX Wine transport
+    # as native Windows; a Wine lane proving byte identity makes the SP3 pin
+    # cross-host, so one committed toolchain lock works on both host kinds.
+    timeout-minutes: 45
+    env:
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install 32-bit Wine
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends wine wine32:i386
+          wine --version
+          command -v wineserver
+      - run: python -m pip install -e ".[test]"
+      # The authenticated MSVC 5.0 SP3 tree is cached between runs. The key
+      # covers every pin the provisioner authenticates against (the file and
+      # tree authorities, the recorded archaic-msvc revision, and the packaged
+      # cross-host transport assets under runtime/), so a changed pin never
+      # meets a stale tree; on a hit, `rbit toolchain provision`
+      # re-authenticates every admitted file before anything uses it. Bump the
+      # v1 prefix to discard a cache entry by hand.
+      - name: Restore the authenticated compiler
+        id: msvc50-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}/archaic-msvc500sp3
+          key: msvc50-wine-v1-${{ runner.os }}-${{ hashFiles('src/reprobit/msvc50_provision.py', 'src/reprobit/msvc42_provision.py', 'src/reprobit/msvc50_authorities.py', 'src/reprobit/toolchains.py', 'runtime/**') }}
+      - name: Provision and authenticate the external compiler
+        run: >-
+          rbit toolchain provision
+          msvc_5_0_sp3
+          --destination "$RUNNER_TEMP/archaic-msvc500sp3"
+          --no-save
+      - name: Save the authenticated compiler
+        if: steps.msvc50-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ runner.temp }}/archaic-msvc500sp3
+          key: ${{ steps.msvc50-cache.outputs.cache-primary-key }}
+      - name: Probe the Wine transport and toolchain
+        run: >-
+          rbit doctor
+          --profile msvc_5_0_sp3
+          --toolchain-root "$RUNNER_TEMP/archaic-msvc500sp3"
+          --execute-probe
+      # After calibration on the native Windows lane, and on any later run,
+      # this step must reproduce the committed byte pin through Wine. It fails
+      # otherwise, exactly like the native lane, so the pinned bytes cannot
+      # drift between the two host kinds.
+      - name: Authenticate the reference through Wine
+        run: >-
+          python examples/sp3-byte-identity/prepare_reference.py
+          --toolchain-root "$RUNNER_TEMP/archaic-msvc500sp3"
+      - name: Run the MSVC 5.0 SP3 byte-identity fixture under Wine
+        run: >-
+          python -m pytest -q
+          --junitxml="$RUNNER_TEMP/wine-sp3-tests.xml"
+          tests/test_msvc50_sp3_integration.py
+      - name: Upload Wine diagnostics only
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: wine-sp3-diagnostics
+          path: |
+            ${{ runner.temp }}/wine-sp3-tests.xml
             ${{ runner.temp }}/sp3-logs/*.log
           if-no-files-found: warn
           retention-days: 7
