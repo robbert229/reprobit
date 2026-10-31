@@ -33,16 +33,16 @@ def _repo_path(installed: str) -> str:
     return msvc50_provision._RUNTIME_PLACEMENT.get(installed, installed)
 
 
-def _fabricate_upstream(root: Path) -> None:
-    for relative in MSVC50_FILE_AUTHORITIES[SP3]:
+def _fabricate_upstream(root: Path, identifier: str = SP3) -> None:
+    for relative in MSVC50_FILE_AUTHORITIES[identifier]:
         path = root.joinpath(*_repo_path(relative).split("/"))
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"fabricated:" + relative.encode("ascii"))
-    for relative in MSVC50_CMAKE_FRONTEND_AUTHORITIES[SP3]:
+    for relative in MSVC50_CMAKE_FRONTEND_AUTHORITIES[identifier]:
         path = root.joinpath(*relative.split("/"))
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"fabricated:" + relative.encode("ascii"))
-    for relative in MSVC50_TREE_AUTHORITIES[SP3]:
+    for relative in MSVC50_TREE_AUTHORITIES[identifier]:
         tree = root / relative
         tree.mkdir(parents=True, exist_ok=True)
         (tree / "fixture.h").write_text(relative, encoding="utf-8")
@@ -120,6 +120,25 @@ def test_provision_fetches_authenticates_and_publishes_exactly(
     assert any(message.startswith("fetching msvc500sp3@") for message in messages)
     assert messages[-1].startswith("published exact toolchain at")
     msvc50_provision.verify_msvc50(destination, SP3)
+
+
+@pytest.mark.parametrize("identifier", ("msvc_5_0_rtm", "msvc_5_0_sp1", "msvc_5_0_sp2"))
+def test_remaining_releases_provision_exactly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    identifier: str,
+) -> None:
+    fabricated = tmp_path / "fabricated-upstream"
+    _fabricate_upstream(fabricated, identifier)
+    state = _install_fake_checkout(monkeypatch, fabricated)
+    _install_fake_authorities(monkeypatch, fabricated)
+    destination = tmp_path / identifier
+
+    result = msvc50_provision.provision_msvc50(destination, identifier)
+
+    assert result == destination
+    assert state == {"fetches": 1}
+    msvc50_provision.verify_msvc50(destination, identifier)
     assert not (destination / NOT_ADMITTED).exists(), "undeclared upstream file was admitted"
     for relative in MSVC50_FILE_AUTHORITIES[SP3]:
         assert destination.joinpath(*relative.split("/")).is_file()
