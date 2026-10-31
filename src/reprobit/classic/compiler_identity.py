@@ -3,7 +3,7 @@
 An ordinary toolchain lock proves that the files used by a run match the
 project's declarations.  A compiler-specific theorem needs the narrower fact
 that those declarations identify the reviewed compiler bytes.  This module is
-the sole owner of that conversion for the Visual C++ 4.20 Win32 compiler.
+the sole owner of that conversion for Visual C++ 4.20 and 5.0 SP3.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ from typing import Final
 from reprobit.model import Digest
 from reprobit.schema import MsvcRelease, ToolchainLock
 from reprobit.strict_json import canonical_json
+from reprobit.msvc50_authorities import MSVC50_FILE_AUTHORITIES
 
 MSVC420_WIN32_I386_TARGET: Final = "msvc-4.20-win32-i386"
 
@@ -23,6 +24,7 @@ _SOURCE_REPOSITORY: Final = "https://github.com/archaic-msvc/msvc420.git"
 _SOURCE_REVISION: Final = "b42c244f0a83ba15ba2ffb62b0dc240d7b2dea50"
 _RECEIPT_SCHEMA: Final = "reprobit.classic-compiler-identity.v1"
 _ISSUANCE_KEY: Final = object()
+MSVC500SP3_WIN32_I386_TARGET: Final = "msvc-5.00-sp3-win32-i386"
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,9 +202,58 @@ def issue_msvc420_compiler_identity(lock: ToolchainLock) -> Msvc420CompilerIdent
     )
 
 
+@dataclass(frozen=True, slots=True)
+class Msvc500Sp3CompilerIdentity:
+    """Reviewed MSVC 5.0 SP3 compiler identity receipt."""
+    toolchain_lock_digest: Digest
+    target: str = MSVC500SP3_WIN32_I386_TARGET
+
+    def proof_receipt(self) -> dict[str, object]:
+        authority = MSVC50_FILE_AUTHORITIES["msvc_5_0_sp3"]
+        tools = [
+            {"path": path, "size": authority[path].size,
+             "digest": Digest(value=authority[path].sha256).model_dump(mode="json"),
+             "roles": ["compiler"] if path == "bin/cl.exe" else ["runtime"]}
+            for path in ("bin/cl.exe", "bin/c1xx.dll", "bin/c2.exe")
+        ]
+        material = {
+            "schema": "reprobit.classic-compiler-identity.v1", "target": self.target,
+            "adapter": "classic-msvc", "profile": "msvc_5_0_sp3", "release": "5.0-sp3",
+            "architecture": "x86", "coff_machine": "i386",
+            "source": {"repository": "https://github.com/archaic-msvc/msvc500sp3.git",
+                       "revision": "259a03f0bc863de5baf657ec064cb60cb20a2cdc",
+                       "paths": [x["path"] for x in tools]},
+            "tools": tools, "toolchain_lock_digest": self.toolchain_lock_digest.model_dump(mode="json")}
+        return {**material, "receipt_digest": Digest.from_bytes(canonical_json(material)).model_dump(mode="json")}
+
+
+def issue_msvc500sp3_compiler_identity(lock: ToolchainLock) -> Msvc500Sp3CompilerIdentity | None:
+    """Issue canonical SP3 identity only from a lock naming every reviewed compiler byte."""
+    profile, repository = "msvc_5_0_sp3", "https://github.com/archaic-msvc/msvc500sp3.git"
+    revision = "259a03f0bc863de5baf657ec064cb60cb20a2cdc"
+    paths = ("bin/cl.exe", "bin/c1xx.dll", "bin/c2.exe")
+    if not isinstance(lock, ToolchainLock) or lock.adapter != "classic-msvc" or lock.profile != profile or lock.release is not MsvcRelease.V5_SP3:
+        return None
+    sources = [s for s in lock.profile_sources if s.repository == repository and s.revision == revision]
+    if len(sources) != 1 or any(p not in sources[0].paths for p in paths): return None
+    if any(sum(p.casefold() == expected for s in lock.profile_sources for p in s.paths) != 1 for expected in paths): return None
+    all_tools = (*lock.tools, *lock.runtime_files)
+    tools = {t.path.casefold(): t for t in all_tools}
+    if len(tools) != len(all_tools): return None
+    authority = MSVC50_FILE_AUTHORITIES[profile]
+    for path in paths:
+        tool = tools.get(path)
+        roles = ("compiler",) if path == "bin/cl.exe" else ("runtime",)
+        if tool is None or tool.path != path or tool.size != authority[path].size or tool.digest.value != authority[path].sha256 or tool.roles != roles: return None
+    return Msvc500Sp3CompilerIdentity(Digest.from_bytes(canonical_json(lock)))
+
+
 __all__ = [
     "MSVC420_WIN32_I386_TARGET",
     "CanonicalCompilerTool",
     "Msvc420CompilerIdentity",
     "issue_msvc420_compiler_identity",
+    "Msvc500Sp3CompilerIdentity",
+    "issue_msvc500sp3_compiler_identity",
+    "MSVC500SP3_WIN32_I386_TARGET",
 ]
