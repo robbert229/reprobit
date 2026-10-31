@@ -363,6 +363,7 @@ jobs:
         shell: pwsh
         run: |
           "REPROBIT_MSVC_5_0_${{ matrix.suffix }}_ROOT=$env:RUNNER_TEMP\archaic-${{ matrix.profile }}" >> $env:GITHUB_ENV
+          "REPROBIT_MSVC_5_0_ORACLE_OUTPUT=$env:RUNNER_TEMP\msvc50-${{ matrix.suffix }}-oracle.json" >> $env:GITHUB_ENV
       - run: python -m pip install -e ".[test]"
       - name: Provision and authenticate compiler
         run: >-
@@ -378,6 +379,12 @@ jobs:
       - name: Run release byte-stability fixture
         run: >-
           python -m pytest -q tests/test_msvc50_sp3_integration.py
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: msvc50-${{ matrix.suffix }}-native-oracle
+          path: ${{ runner.temp }}/msvc50-${{ matrix.suffix }}-oracle.json
+          if-no-files-found: warn
 
   wine-msvc50-remaining-releases:
     name: Wine / MSVC 5.0 ${{ matrix.release }} byte stability
@@ -412,7 +419,9 @@ jobs:
           sudo ln -sf "$server" /usr/local/bin/wineserver
       - run: python -m pip install -e ".[test]"
       - name: Configure release installation root
-        run: echo "REPROBIT_MSVC_5_0_${{ matrix.suffix }}_ROOT=$RUNNER_TEMP/archaic-${{ matrix.profile }}" >> "$GITHUB_ENV"
+        run: |
+          echo "REPROBIT_MSVC_5_0_${{ matrix.suffix }}_ROOT=$RUNNER_TEMP/archaic-${{ matrix.profile }}" >> "$GITHUB_ENV"
+          echo "REPROBIT_MSVC_5_0_ORACLE_OUTPUT=$RUNNER_TEMP/msvc50-${{ matrix.suffix }}-oracle.json" >> "$GITHUB_ENV"
       - name: Provision and authenticate compiler
         run: >-
           rbit toolchain provision ${{ matrix.profile }}
@@ -426,6 +435,12 @@ jobs:
       - name: Run release byte-stability fixture
         run: >-
           python -m pytest -q tests/test_msvc50_sp3_integration.py
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: msvc50-${{ matrix.suffix }}-wine-oracle
+          path: ${{ runner.temp }}/msvc50-${{ matrix.suffix }}-oracle.json
+          if-no-files-found: warn
 
   wine-sp3-byte-identity:
     name: Wine / MSVC 5.0 SP3 byte identity

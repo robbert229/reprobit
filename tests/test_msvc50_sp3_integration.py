@@ -27,6 +27,7 @@ from reprobit.schema import OracleDocument, ToolchainLock
 
 ROOT = Path(__file__).parents[1]
 SAMPLE = ROOT / "examples" / "sp3-byte-identity"
+RELEASE_ORACLES = SAMPLE / "release-oracles.json"
 RELEASES = (
     ("rtm", "msvc_5_0_rtm", "REPROBIT_MSVC_5_0_RTM_ROOT"),
     ("sp1", "msvc_5_0_sp1", "REPROBIT_MSVC_5_0_SP1_ROOT"),
@@ -135,17 +136,31 @@ def test_release_fixture_provisions_pins_verifies_byte_identical(
     graph = json.loads(graph_path.read_text())
     graph["toolchain_lock_digest"] = toolchain_document_digest(lock).model_dump(mode="json")
     graph_path.write_text(json.dumps(graph, separators=(",", ":")))
+    release_oracles = json.loads(RELEASE_ORACLES.read_text())
+    expected = release_oracles.get(profile)
+    if expected is not None:
+        oracle_path = project / "reprobit" / "oracles" / "program.json"
+        oracle = OracleDocument.model_validate_json(oracle_path.read_bytes())
+        oracle = oracle.model_copy(
+            update={
+                "image_digest": Digest(algorithm="sha256", value=expected["sha256"]),
+                "image_size": expected["size"],
+            }
+        )
+        oracle_path.write_text(json.dumps(oracle.model_dump(mode="json"), separators=(",", ":")))
 
+    prepare_argv = [
+        sys.executable,
+        project / "prepare_reference.py",
+        "--toolchain-root",
+        toolchain_root,
+        "--profile",
+        profile,
+    ]
+    if expected is None:
+        prepare_argv.append("--calibrate")
     prepared = _run(
-        (
-            sys.executable,
-            project / "prepare_reference.py",
-            "--toolchain-root",
-            toolchain_root,
-            "--profile",
-            profile,
-            "--calibrate",
-        ),
+        tuple(prepare_argv),
         cwd=project,
         environment=environment,
     )
@@ -155,6 +170,21 @@ def test_release_fixture_provisions_pins_verifies_byte_identical(
     pinned = OracleDocument.model_validate_json(
         (project / "reprobit" / "oracles" / "program.json").read_bytes()
     )
+    if expected is not None:
+        assert pinned.image_digest.value == expected["sha256"]
+        assert pinned.image_size == expected["size"]
+    artifact_path = os.environ.get("REPROBIT_MSVC_5_0_ORACLE_OUTPUT")
+    if artifact_path:
+        Path(artifact_path).write_text(
+            json.dumps(
+                {
+                    "profile": profile,
+                    "sha256": pinned.image_digest.value,
+                    "size": pinned.image_size,
+                },
+                sort_keys=True,
+            )
+        )
     committed = Digest.from_path(reference)
     assert committed == pinned.image_digest, (
         f"reference did not reproduce the calibrated {profile} oracle pin; the fixture "
