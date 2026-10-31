@@ -407,6 +407,9 @@ jobs:
           sudo dpkg --add-architecture i386
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends wine wine32:i386
+          server="$(find /usr -type f -name 'wineserver' -executable -print -quit)"
+          test -n "$server"
+          sudo ln -sf "$server" /usr/local/bin/wineserver
       - run: python -m pip install -e ".[test]"
       - name: Configure release installation root
         run: echo "REPROBIT_MSVC_5_0_${{ matrix.suffix }}_ROOT=$RUNNER_TEMP/archaic-${{ matrix.profile }}" >> "$GITHUB_ENV"

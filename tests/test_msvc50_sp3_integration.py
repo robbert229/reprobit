@@ -105,6 +105,10 @@ def test_release_fixture_provisions_pins_verifies_byte_identical(
         .replace("msvc_5_0_sp3", profile)
         .replace("sp3-byte-identity", f"{release}-byte-identity")
     )
+    build_plan = project / "reprobit" / "build-plan.json"
+    build_plan.write_text(
+        build_plan.read_text().replace("sp3-byte-identity", f"{release}-byte-identity")
+    )
     environment = os.environ.copy()
     environment[root_variable] = os.fspath(toolchain_root)
     environment["PYTHONUTF8"] = "1"
