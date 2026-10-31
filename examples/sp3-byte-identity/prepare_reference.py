@@ -27,15 +27,33 @@ from pathlib import Path
 from reprobit.classic.pe_metadata import apply_pe_metadata_candidate
 from reprobit.model import Digest
 from reprobit.schema import OracleDocument
-from reprobit.toolchains import MSVC_50_SP3, ClassicMSVCToolchain
+from reprobit.toolchains import (
+    MSVC_50_RTM,
+    MSVC_50_SP1,
+    MSVC_50_SP2,
+    MSVC_50_SP3,
+    ClassicMSVCToolchain,
+)
 from reprobit.user_config import resolve_toolchain_root
 
 SAMPLE_ROOT = Path(__file__).resolve().parent
 ORACLE_PATH = SAMPLE_ROOT / "reprobit" / "oracles" / "program.json"
+PROFILES = {
+    MSVC_50_RTM: MSVC_50_RTM,
+    MSVC_50_SP1: MSVC_50_SP1,
+    MSVC_50_SP2: MSVC_50_SP2,
+    MSVC_50_SP3: MSVC_50_SP3,
+}
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--profile",
+        choices=tuple(PROFILES),
+        default=MSVC_50_SP3,
+        help="MSVC 5.0 release profile to build (default: msvc_5_0_sp3)",
+    )
     parser.add_argument(
         "--toolchain-root",
         type=Path,
@@ -231,8 +249,9 @@ def _write_calibrated_oracle(digest: Digest, size: int) -> None:
 
 
 def _prepare(args: argparse.Namespace) -> None:
-    toolchain_root = resolve_toolchain_root(MSVC_50_SP3, args.toolchain_root)
-    ClassicMSVCToolchain(MSVC_50_SP3, toolchain_root).doctor().require_ok()
+    profile = PROFILES[args.profile]
+    toolchain_root = resolve_toolchain_root(profile, args.toolchain_root)
+    ClassicMSVCToolchain(profile, toolchain_root).doctor().require_ok()
     oracle = _committed_oracle()
     image = _build_reference(toolchain_root)
     digest = Digest.from_bytes(image)
@@ -244,7 +263,7 @@ def _prepare(args: argparse.Namespace) -> None:
         return
     if not args.calibrate:
         raise RuntimeError(
-            "SP3 reference digest differs from the committed oracle: "
+            f"{args.profile} reference digest differs from the committed oracle: "
             f"actual={digest.value} (size {size}), "
             f"oracle={oracle.image_digest.value} (size {oracle.image_size}). "
             "Nothing was published. Re-run with --calibrate to record the "

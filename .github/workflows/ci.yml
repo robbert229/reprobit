@@ -336,6 +336,94 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+  native-msvc50-remaining-releases:
+    name: Native Windows / MSVC 5.0 ${{ matrix.release }} byte stability
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - release: RTM
+            profile: msvc_5_0_rtm
+            suffix: RTM
+          - release: SP1
+            profile: msvc_5_0_sp1
+            suffix: SP1
+          - release: SP2
+            profile: msvc_5_0_sp2
+            suffix: SP2
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Configure release installation root
+        shell: pwsh
+        run: |
+          "REPROBIT_MSVC_5_0_${{ matrix.suffix }}_ROOT=$env:RUNNER_TEMP\archaic-${{ matrix.profile }}" >> $env:GITHUB_ENV
+      - run: python -m pip install -e ".[test]"
+      - name: Provision and authenticate compiler
+        run: >-
+          rbit toolchain provision ${{ matrix.profile }}
+          --destination "$env:RUNNER_TEMP/archaic-${{ matrix.profile }}"
+          --no-save
+      - name: Probe compiler and native isolation
+        run: >-
+          rbit doctor --backend windows_native_v1
+          --profile ${{ matrix.profile }}
+          --toolchain-root "$env:RUNNER_TEMP/archaic-${{ matrix.profile }}"
+          --execute-probe
+      - name: Run release byte-stability fixture
+        run: >-
+          python -m pytest -q tests/test_msvc50_sp3_integration.py
+
+  wine-msvc50-remaining-releases:
+    name: Wine / MSVC 5.0 ${{ matrix.release }} byte stability
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - release: RTM
+            profile: msvc_5_0_rtm
+            suffix: RTM
+          - release: SP1
+            profile: msvc_5_0_sp1
+            suffix: SP1
+          - release: SP2
+            profile: msvc_5_0_sp2
+            suffix: SP2
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install Wine
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends wine wine32:i386
+      - run: python -m pip install -e ".[test]"
+      - name: Configure release installation root
+        run: echo "REPROBIT_MSVC_5_0_${{ matrix.suffix }}_ROOT=$RUNNER_TEMP/archaic-${{ matrix.profile }}" >> "$GITHUB_ENV"
+      - name: Provision and authenticate compiler
+        run: >-
+          rbit toolchain provision ${{ matrix.profile }}
+          --destination "$RUNNER_TEMP/archaic-${{ matrix.profile }}"
+          --no-save
+      - name: Probe Wine transport and compiler
+        run: >-
+          rbit doctor --profile ${{ matrix.profile }}
+          --toolchain-root "$RUNNER_TEMP/archaic-${{ matrix.profile }}"
+          --execute-probe
+      - name: Run release byte-stability fixture
+        run: >-
+          python -m pytest -q tests/test_msvc50_sp3_integration.py
+
   wine-sp3-byte-identity:
     name: Wine / MSVC 5.0 SP3 byte identity
     runs-on: ubuntu-latest

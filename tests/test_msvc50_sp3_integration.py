@@ -26,14 +26,14 @@ from reprobit.schema import OracleDocument
 
 ROOT = Path(__file__).parents[1]
 SAMPLE = ROOT / "examples" / "sp3-byte-identity"
+RELEASES = (
+    ("rtm", "msvc_5_0_rtm", "REPROBIT_MSVC_5_0_RTM_ROOT"),
+    ("sp1", "msvc_5_0_sp1", "REPROBIT_MSVC_5_0_SP1_ROOT"),
+    ("sp2", "msvc_5_0_sp2", "REPROBIT_MSVC_5_0_SP2_ROOT"),
+    ("sp3", "msvc_5_0_sp3", "REPROBIT_MSVC_5_0_SP3_ROOT"),
+)
 
-pytestmark = [
-    pytest.mark.msvc50_sp3,
-    pytest.mark.skipif(
-        not os.environ.get("REPROBIT_MSVC_5_0_SP3_ROOT"),
-        reason="requires an authenticated MSVC 5.0 SP3 installation",
-    ),
-]
+pytestmark = pytest.mark.msvc50_sp3
 
 
 def _rbit() -> Path:
@@ -75,14 +75,16 @@ def _events(completed: subprocess.CompletedProcess[str]) -> list[dict[str, Any]]
     return events
 
 
-def test_sp3_example_provisions_pins_verifies_byte_identical(
-    tmp_path: Path,
+@pytest.mark.parametrize("release,profile,root_variable", RELEASES)
+def test_release_fixture_provisions_pins_verifies_byte_identical(
+    tmp_path: Path, release: str, profile: str, root_variable: str,
 ) -> None:
-    configured = os.environ.get("REPROBIT_MSVC_5_0_SP3_ROOT")
-    assert configured, "native CI must provision REPROBIT_MSVC_5_0_SP3_ROOT"
+    configured = os.environ.get(root_variable)
+    if not configured:
+        pytest.skip(f"requires authenticated installation in {root_variable}")
     toolchain_root = Path(configured).resolve(strict=True)
 
-    project = tmp_path / "sp3"
+    project = tmp_path / release
     shutil.copytree(
         SAMPLE,
         project,
@@ -94,9 +96,17 @@ def test_sp3_example_provisions_pins_verifies_byte_identical(
             "reference",
         ),
     )
+    config = project / "reprobit.toml"
+    config.write_text(config.read_text().replace("msvc_5_0_sp3", profile).replace("sp3-byte-identity", f"{release}-byte-identity"))
     environment = os.environ.copy()
-    environment["REPROBIT_MSVC_5_0_SP3_ROOT"] = os.fspath(toolchain_root)
+    environment[root_variable] = os.fspath(toolchain_root)
     environment["PYTHONUTF8"] = "1"
+
+    locked = _run((_rbit(), "toolchain", "lock", project, "--toolchain-root", toolchain_root,
+                   "--runtime-file", "wine/x86/cl", "--runtime-file", "wine/x86/rc",
+                   "--runtime-file", "wine/x86/link", "--runtime-file", "wine/x86/lib",
+                   "--runtime-file", "wine/x86/wine-msvc.sh"), cwd=project, environment=environment)
+    assert locked.returncode == 0, locked.stdout + locked.stderr
 
     prepared = _run(
         (
@@ -104,6 +114,9 @@ def test_sp3_example_provisions_pins_verifies_byte_identical(
             project / "prepare_reference.py",
             "--toolchain-root",
             toolchain_root,
+            "--profile",
+            profile,
+            "--calibrate",
         ),
         cwd=project,
         environment=environment,
@@ -116,10 +129,19 @@ def test_sp3_example_provisions_pins_verifies_byte_identical(
     )
     committed = Digest.from_path(reference)
     assert committed == pinned.image_digest, (
-        "reference did not reproduce the committed SP3 oracle pin; the fixture "
+        f"reference did not reproduce the calibrated {profile} oracle pin; the fixture "
         "job must run prepare_reference.py --calibrate and commit the recorded digest"
     )
     assert reference.stat().st_size == pinned.image_size
+    first_image = reference.read_bytes()
+    repeated = _run(
+        (sys.executable, project / "prepare_reference.py", "--toolchain-root",
+         toolchain_root, "--profile", profile),
+        cwd=project,
+        environment=environment,
+    )
+    assert repeated.returncode == 0, repeated.stdout + repeated.stderr
+    assert reference.read_bytes() == first_image, f"{profile} reference build is not byte-stable"
 
     verified = _run(
         (_rbit(), "--format", "ndjson", "verify", project),
@@ -134,7 +156,7 @@ def test_sp3_example_provisions_pins_verifies_byte_identical(
     assert completed[0]["total_cost"] == 5
 
     bundle = load_project_tree(project)
-    assert bundle.toolchain_lock.profile == "msvc_5_0_sp3"
+    assert bundle.toolchain_lock.profile == profile
     report_source = Path(completed[0]["report_json"])
     report = Report.model_validate_json(report_source.read_bytes())
     assert report.verdict.cold is True

@@ -39,11 +39,11 @@ Public CI runs portable tests and package checks on Ubuntu, macOS, and Windows. 
 drive lifecycle, and compiles through the real CL -> C1XX -> C2 chain. Compiler bytes are never
 committed, cached, or uploaded.
 
-The MSVC 5.0 SP3 byte-identity fixture gives end-to-end project evidence on both host kinds. A
-native Windows lane provisions SP3, authenticates the committed oracle pin, and runs a cold
-`rbit verify` to a byte-identical verdict; a POSIX Wine lane provisions the same pinned tree
-(including the packaged cross-host transport), and certifies the identical `program.json` pin
-through Wine. The two lanes cross-check each other: neither may drift from the committed bytes.
+The MSVC 5.0 SP3 fixture reproduces its committed oracle pin on both native Windows and Wine.
+Additional native Windows and Wine lanes provision RTM, SP1, and SP2 independently, generate a
+lock from each authenticated installation, calibrate a temporary oracle, and rebuild the
+reference to confirm byte stability within each CI run. These lanes prove that setup, doctor,
+provisioning, and cold project verification work for each modeled release.
 
 That gate proves the 4.2 host and compiler path, not a project's full byte-identity verdict from
 scratch. Project certification still needs the project's locked toolchain, reference data, and a
