@@ -77,7 +77,10 @@ def _events(completed: subprocess.CompletedProcess[str]) -> list[dict[str, Any]]
 
 @pytest.mark.parametrize("release,profile,root_variable", RELEASES)
 def test_release_fixture_provisions_pins_verifies_byte_identical(
-    tmp_path: Path, release: str, profile: str, root_variable: str,
+    tmp_path: Path,
+    release: str,
+    profile: str,
+    root_variable: str,
 ) -> None:
     configured = os.environ.get(root_variable)
     if not configured:
@@ -97,15 +100,37 @@ def test_release_fixture_provisions_pins_verifies_byte_identical(
         ),
     )
     config = project / "reprobit.toml"
-    config.write_text(config.read_text().replace("msvc_5_0_sp3", profile).replace("sp3-byte-identity", f"{release}-byte-identity"))
+    config.write_text(
+        config.read_text()
+        .replace("msvc_5_0_sp3", profile)
+        .replace("sp3-byte-identity", f"{release}-byte-identity")
+    )
     environment = os.environ.copy()
     environment[root_variable] = os.fspath(toolchain_root)
     environment["PYTHONUTF8"] = "1"
 
-    locked = _run((_rbit(), "toolchain", "lock", project, "--toolchain-root", toolchain_root,
-                   "--runtime-file", "wine/x86/cl", "--runtime-file", "wine/x86/rc",
-                   "--runtime-file", "wine/x86/link", "--runtime-file", "wine/x86/lib",
-                   "--runtime-file", "wine/x86/wine-msvc.sh"), cwd=project, environment=environment)
+    locked = _run(
+        (
+            _rbit(),
+            "toolchain",
+            "lock",
+            project,
+            "--toolchain-root",
+            toolchain_root,
+            "--runtime-file",
+            "wine/x86/cl",
+            "--runtime-file",
+            "wine/x86/rc",
+            "--runtime-file",
+            "wine/x86/link",
+            "--runtime-file",
+            "wine/x86/lib",
+            "--runtime-file",
+            "wine/x86/wine-msvc.sh",
+        ),
+        cwd=project,
+        environment=environment,
+    )
     assert locked.returncode == 0, locked.stdout + locked.stderr
 
     prepared = _run(
@@ -135,8 +160,14 @@ def test_release_fixture_provisions_pins_verifies_byte_identical(
     assert reference.stat().st_size == pinned.image_size
     first_image = reference.read_bytes()
     repeated = _run(
-        (sys.executable, project / "prepare_reference.py", "--toolchain-root",
-         toolchain_root, "--profile", profile),
+        (
+            sys.executable,
+            project / "prepare_reference.py",
+            "--toolchain-root",
+            toolchain_root,
+            "--profile",
+            profile,
+        ),
         cwd=project,
         environment=environment,
     )
