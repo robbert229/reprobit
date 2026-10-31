@@ -137,17 +137,17 @@ def test_release_fixture_provisions_pins_verifies_byte_identical(
     graph["toolchain_lock_digest"] = toolchain_document_digest(lock).model_dump(mode="json")
     graph_path.write_text(json.dumps(graph, separators=(",", ":")))
     release_oracles = json.loads(RELEASE_ORACLES.read_text())
-    expected = release_oracles.get(profile)
-    if expected is not None:
-        oracle_path = project / "reprobit" / "oracles" / "program.json"
-        oracle = OracleDocument.model_validate_json(oracle_path.read_bytes())
-        oracle = oracle.model_copy(
-            update={
-                "image_digest": Digest(algorithm="sha256", value=expected["sha256"]),
-                "image_size": expected["size"],
-            }
-        )
-        oracle_path.write_text(json.dumps(oracle.model_dump(mode="json"), separators=(",", ":")))
+    assert profile in release_oracles, f"missing committed {profile} reference pin"
+    expected = release_oracles[profile]
+    oracle_path = project / "reprobit" / "oracles" / "program.json"
+    oracle = OracleDocument.model_validate_json(oracle_path.read_bytes())
+    oracle = oracle.model_copy(
+        update={
+            "image_digest": Digest(algorithm="sha256", value=expected["sha256"]),
+            "image_size": expected["size"],
+        }
+    )
+    oracle_path.write_text(json.dumps(oracle.model_dump(mode="json"), separators=(",", ":")))
 
     prepare_argv = [
         sys.executable,
@@ -157,8 +157,6 @@ def test_release_fixture_provisions_pins_verifies_byte_identical(
         "--profile",
         profile,
     ]
-    if expected is None:
-        prepare_argv.append("--calibrate")
     prepared = _run(
         tuple(prepare_argv),
         cwd=project,

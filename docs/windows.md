@@ -112,9 +112,8 @@ rebuilds and re-authenticates the toolchain, runs the private-drive and process-
 lifetime tests, and compiles through the real MSVC 4.2 child chain. It uploads
 only tests and diagnostic logs.
 
-This is end-to-end host evidence for MSVC 4.2. The SP3 fixture reproduces a
-committed oracle pin on native Windows and Wine. RTM, SP1, and SP2 each have
-native Windows and Wine lanes that authenticate the release installation,
-generate its project lock, and check that a second reference build is byte
-identical to the first within that run (see
+This is end-to-end host evidence for MSVC 4.2. The MSVC 5.0 fixture carries
+committed RTM, SP1, SP2, and SP3 reference pins. Native Windows and Wine lanes
+authenticate each release installation, generate its project lock, and
+reproduce its committed pin (see
 [platforms](platforms.md#what-public-ci-proves)).
