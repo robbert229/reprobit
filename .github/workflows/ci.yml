@@ -252,6 +252,168 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+  native-sp3-byte-identity:
+    name: Native Windows / MSVC 5.0 SP3 byte identity
+    runs-on: windows-2022
+    # First run of a fresh example oracle is expected to stop here asking for
+    # --calibrate; commit the printed digest and rerun to prove byte identity.
+    timeout-minutes: 45
+    env:
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Configure native temporary paths
+        shell: pwsh
+        run: |
+          "REPROBIT_MSVC_5_0_SP3_ROOT=$env:RUNNER_TEMP\archaic-msvc500sp3" >> $env:GITHUB_ENV
+          "REPROBIT_NATIVE_LOG_DIR=$env:RUNNER_TEMP\sp3-logs" >> $env:GITHUB_ENV
+      - name: Record native runner identity
+        shell: pwsh
+        run: |
+          "ImageOS=$env:ImageOS" | Tee-Object -FilePath "$env:RUNNER_TEMP\native-runner.txt"
+          "ImageVersion=$env:ImageVersion" | Tee-Object -Append "$env:RUNNER_TEMP\native-runner.txt"
+          "Windows=$([Environment]::OSVersion.VersionString)" | Tee-Object -Append "$env:RUNNER_TEMP\native-runner.txt"
+      - run: python -m pip install -e ".[test]"
+      # The authenticated MSVC 5.0 SP3 tree is cached between runs. The key
+      # covers every pin the provisioner authenticates against (the file and
+      # tree authorities and the recorded archaic-msvc revision), so a changed
+      # pin never meets a stale tree; on a hit, `rbit toolchain provision`
+      # re-authenticates every admitted file before anything uses it. Bump the
+      # v1 prefix to discard a cache entry by hand.
+      - name: Restore the authenticated compiler
+        id: msvc50-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}/archaic-msvc500sp3
+          key: msvc50-v1-${{ runner.os }}-${{ hashFiles('src/reprobit/msvc50_provision.py', 'src/reprobit/msvc42_provision.py', 'src/reprobit/msvc50_authorities.py', 'src/reprobit/toolchains.py', 'runtime/**') }}
+      - name: Provision and authenticate the external compiler
+        run: >-
+          rbit toolchain provision
+          msvc_5_0_sp3
+          --destination "$env:REPROBIT_MSVC_5_0_SP3_ROOT"
+          --no-save
+      - name: Save the authenticated compiler
+        if: steps.msvc50-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ runner.temp }}/archaic-msvc500sp3
+          key: ${{ steps.msvc50-cache.outputs.cache-primary-key }}
+      - name: Probe native isolation and toolchain
+        run: >-
+          rbit doctor
+          --backend windows_native_v1
+          --profile msvc_5_0_sp3
+          --toolchain-root "$env:REPROBIT_MSVC_5_0_SP3_ROOT"
+          --execute-probe
+      # On the very first run of this fixture (and whenever a pinned revision
+      # changes the produced bytes) this step fails: prepare_reference.py
+      # reports the actual digest, leaving reference/ untouched. Record that
+      # pin with --calibrate and commit reprobit/oracles/program.json before
+      # the lane can pass; that committed pin is the cross-run byte identity
+      # proof every later run must reproduce.
+      - name: Authenticate the reference against its committed oracles
+        run: >-
+          python examples/sp3-byte-identity/prepare_reference.py
+          --toolchain-root "$env:REPROBIT_MSVC_5_0_SP3_ROOT"
+      - name: Run the MSVC 5.0 SP3 byte-identity fixture
+        run: >-
+          python -m pytest -q
+          --junitxml="$env:RUNNER_TEMP\sp3-tests.xml"
+          tests/test_msvc50_sp3_integration.py
+      - name: Upload native diagnostics only
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-sp3-diagnostics
+          path: |
+            ${{ runner.temp }}/native-runner.txt
+            ${{ runner.temp }}/sp3-tests.xml
+            ${{ runner.temp }}/sp3-logs/*.log
+          if-no-files-found: warn
+          retention-days: 7
+
+  wine-sp3-byte-identity:
+    name: Wine / MSVC 5.0 SP3 byte identity
+    runs-on: ubuntu-latest
+    # The fixture certifies the same byte pin through the POSIX Wine transport
+    # as native Windows; a Wine lane proving byte identity makes the SP3 pin
+    # cross-host, so one committed toolchain lock works on both host kinds.
+    timeout-minutes: 45
+    env:
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install 32-bit Wine
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends wine wine32:i386
+          wine --version
+          command -v wineserver
+      - run: python -m pip install -e ".[test]"
+      # The authenticated MSVC 5.0 SP3 tree is cached between runs. The key
+      # covers every pin the provisioner authenticates against (the file and
+      # tree authorities, the recorded archaic-msvc revision, and the packaged
+      # cross-host transport assets under runtime/), so a changed pin never
+      # meets a stale tree; on a hit, `rbit toolchain provision`
+      # re-authenticates every admitted file before anything uses it. Bump the
+      # v1 prefix to discard a cache entry by hand.
+      - name: Restore the authenticated compiler
+        id: msvc50-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}/archaic-msvc500sp3
+          key: msvc50-wine-v1-${{ runner.os }}-${{ hashFiles('src/reprobit/msvc50_provision.py', 'src/reprobit/msvc42_provision.py', 'src/reprobit/msvc50_authorities.py', 'src/reprobit/toolchains.py', 'runtime/**') }}
+      - name: Provision and authenticate the external compiler
+        run: >-
+          rbit toolchain provision
+          msvc_5_0_sp3
+          --destination "$RUNNER_TEMP/archaic-msvc500sp3"
+          --no-save
+      - name: Save the authenticated compiler
+        if: steps.msvc50-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ runner.temp }}/archaic-msvc500sp3
+          key: ${{ steps.msvc50-cache.outputs.cache-primary-key }}
+      - name: Probe the Wine transport and toolchain
+        run: >-
+          rbit doctor
+          --profile msvc_5_0_sp3
+          --toolchain-root "$RUNNER_TEMP/archaic-msvc500sp3"
+          --execute-probe
+      # After calibration on the native Windows lane, and on any later run,
+      # this step must reproduce the committed byte pin through Wine. It fails
+      # otherwise, exactly like the native lane, so the pinned bytes cannot
+      # drift between the two host kinds.
+      - name: Authenticate the reference through Wine
+        run: >-
+          python examples/sp3-byte-identity/prepare_reference.py
+          --toolchain-root "$RUNNER_TEMP/archaic-msvc500sp3"
+      - name: Run the MSVC 5.0 SP3 byte-identity fixture under Wine
+        run: >-
+          python -m pytest -q
+          --junitxml="$RUNNER_TEMP/wine-sp3-tests.xml"
+          tests/test_msvc50_sp3_integration.py
+      - name: Upload Wine diagnostics only
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: wine-sp3-diagnostics
+          path: |
+            ${{ runner.temp }}/wine-sp3-tests.xml
+            ${{ runner.temp }}/sp3-logs/*.log
+          if-no-files-found: warn
+          retention-days: 7
+
   release:
     name: GitHub release
     # A tag push runs every job above; the release is cut only when all of

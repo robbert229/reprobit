@@ -61,6 +61,13 @@ def test_wheel_declares_required_non_python_assets() -> None:
         "runtime/msvc42-wine/msvcenv.sh",
         "runtime/msvc42-wine/rc",
         "runtime/msvc42-wine/wine-msvc.sh",
+        "runtime/msvc50-wine/README.md",
+        "runtime/msvc50-wine/cl",
+        "runtime/msvc50-wine/lib",
+        "runtime/msvc50-wine/link",
+        "runtime/msvc50-wine/msvcenv.sh",
+        "runtime/msvc50-wine/rc",
+        "runtime/msvc50-wine/wine-msvc.sh",
         "src/reprobit/py.typed",
     ):
         assert (ROOT / relative).is_file()

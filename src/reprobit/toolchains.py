@@ -195,7 +195,18 @@ _MSVC50_PRODUCERS = (
     "bin/cvtres.exe",
 )
 _MSVC50_INPUT_ROOTS = ("include", "mfc/include", "atl/include", "lib", "mfc/lib")
-_MSVC50_RUNTIME = ("bin/msdis100.dll",)
+_MSVC50_RUNTIME = (
+    "bin/msdis100.dll",
+    # The MSVC 5.0 C and C++ runtimes every bin tool imports at startup are
+    # not present in bin/ of the pinned releases; each release's redist/
+    # directory carries them, and the provisioner places them into bin/
+    # (see msvc50_provision._RUNTIME_PLACEMENT).
+    "bin/msvcrt.dll",
+    "bin/msvcp50.dll",
+    # RCDLL.DLL is the resource-compiler runtime that rc.exe imports; unlike
+    # the CRT pair it already sits at bin/ in every release.
+    "bin/rcdll.dll",
+)
 
 _PROFILES = {
     MSVC_42: ToolchainProfile(
@@ -227,6 +238,11 @@ _PROFILES = {
         required_runtime_files=_MSVC42_RUNTIME,
         wine_dll_overrides=(("msvcrt40", "n"), ("msvcrt20", "n")),
     ),
+    # The 5.0 profiles deliberately carry no wine_dll_overrides. The Wine
+    # fidelity finding (docs/wine.md) established that Wine's builtin
+    # msvcrt.dll and imagehlp.dll do not perturb 5.0 compiler or linker
+    # output, and that a native msvcrt override would be unimplementable
+    # (Wine's own advapi32.dll depends on msvcrt.dll).
     MSVC_50_RTM: ToolchainProfile(
         identifier=MSVC_50_RTM,
         display_name="Microsoft Visual C++ 5.0 RTM",

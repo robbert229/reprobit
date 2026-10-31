@@ -69,9 +69,21 @@ MSVC50_FILE_AUTHORITIES = {
             167424,
             "06aaaca9c928bdef790259c9c30328529e10d1ec2f77da09c4ff74de7734fe69",
         ),
+        "bin/msvcp50.dll": Msvc50FileAuthority(
+            565760,
+            "91cd76f9fa3b25008decb12c005c194bdf66c8d6526a954de7051bec9aae462a",
+        ),
+        "bin/msvcrt.dll": Msvc50FileAuthority(
+            271632,
+            "d398de0da85572ae6e40254f93ffe0ab0bc4bfcb77681b4a0c358493552707bb",
+        ),
         "bin/rc.exe": Msvc50FileAuthority(
             7952,
             "14a84379d318c76760bd550afaece03b5e8b39b49cbf6de7e0f7f0eac8216242",
+        ),
+        "bin/rcdll.dll": Msvc50FileAuthority(
+            108304,
+            "3c36f9b3d433eb5354655796659d6247684df8158b367d334969183b35454f3c",
         ),
     },
     "msvc_5_0_sp1": {
@@ -111,9 +123,21 @@ MSVC50_FILE_AUTHORITIES = {
             174592,
             "730497a2cc447ad0ea91c52ed9aa1b9d21572f4ca37ce686937946c5a98f7f8c",
         ),
+        "bin/msvcp50.dll": Msvc50FileAuthority(
+            565760,
+            "91cd76f9fa3b25008decb12c005c194bdf66c8d6526a954de7051bec9aae462a",
+        ),
+        "bin/msvcrt.dll": Msvc50FileAuthority(
+            280576,
+            "df9f2aab7f7119f214c5d743d961fde4bf324f19011fbbb7e9cf666856fba0ba",
+        ),
         "bin/rc.exe": Msvc50FileAuthority(
             7952,
             "14a84379d318c76760bd550afaece03b5e8b39b49cbf6de7e0f7f0eac8216242",
+        ),
+        "bin/rcdll.dll": Msvc50FileAuthority(
+            108304,
+            "3c36f9b3d433eb5354655796659d6247684df8158b367d334969183b35454f3c",
         ),
     },
     "msvc_5_0_sp2": {
@@ -153,9 +177,21 @@ MSVC50_FILE_AUTHORITIES = {
             174592,
             "730497a2cc447ad0ea91c52ed9aa1b9d21572f4ca37ce686937946c5a98f7f8c",
         ),
+        "bin/msvcp50.dll": Msvc50FileAuthority(
+            565760,
+            "91cd76f9fa3b25008decb12c005c194bdf66c8d6526a954de7051bec9aae462a",
+        ),
+        "bin/msvcrt.dll": Msvc50FileAuthority(
+            280576,
+            "df9f2aab7f7119f214c5d743d961fde4bf324f19011fbbb7e9cf666856fba0ba",
+        ),
         "bin/rc.exe": Msvc50FileAuthority(
             7952,
             "14a84379d318c76760bd550afaece03b5e8b39b49cbf6de7e0f7f0eac8216242",
+        ),
+        "bin/rcdll.dll": Msvc50FileAuthority(
+            108304,
+            "3c36f9b3d433eb5354655796659d6247684df8158b367d334969183b35454f3c",
         ),
     },
     "msvc_5_0_sp3": {
@@ -195,9 +231,21 @@ MSVC50_FILE_AUTHORITIES = {
             174592,
             "730497a2cc447ad0ea91c52ed9aa1b9d21572f4ca37ce686937946c5a98f7f8c",
         ),
+        "bin/msvcp50.dll": Msvc50FileAuthority(
+            565760,
+            "91cd76f9fa3b25008decb12c005c194bdf66c8d6526a954de7051bec9aae462a",
+        ),
+        "bin/msvcrt.dll": Msvc50FileAuthority(
+            277776,
+            "e390b0529fb9ee1214bb68302a4658b578134d92ab76bc5eb48f3badd843d210",
+        ),
         "bin/rc.exe": Msvc50FileAuthority(
             7952,
             "14a84379d318c76760bd550afaece03b5e8b39b49cbf6de7e0f7f0eac8216242",
+        ),
+        "bin/rcdll.dll": Msvc50FileAuthority(
+            108304,
+            "3c36f9b3d433eb5354655796659d6247684df8158b367d334969183b35454f3c",
         ),
     },
 }

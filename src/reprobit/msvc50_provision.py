@@ -6,9 +6,9 @@ admitted files and input trees, authenticates the result against the reviewed
 authorities in :mod:`reprobit.msvc50_authorities`, and publishes atomically.
 It intentionally does not cache or redistribute the Microsoft payload.
 
-Unlike MSVC 4.2, no 5.0 release needs a binary patch, and the cross-host
-Wine transports are not provisioned here yet (see the platform notes); native
-Windows installs and project locks are complete with what this module builds.
+Unlike MSVC 4.2, no 5.0 release needs a binary patch.  The cross-host Wine
+transport snapshot is versioned and authenticated here so cross-host projects
+lock one runtime set that works on both POSIX and native Windows.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 
+from reprobit.assets import runtime_asset_directory
 from reprobit.msvc42_provision import (
     FileAuthority,
     ProgressCallback,
@@ -46,6 +47,53 @@ from reprobit.toolchains import (
 )
 
 MSVC_50_PROFILES = (MSVC_50_RTM, MSVC_50_SP1, MSVC_50_SP2, MSVC_50_SP3)
+
+# These are host-side, permissively licensed shell transports versioned and
+# distributed with ReproBit.  They are deliberately outside profile_sources:
+# compiler/runtime/header/library payload still comes only from the pinned
+# archaic-msvc repository above.  Keeping their installed bytes fixed lets a
+# project use one toolchain lock on POSIX and native Windows.  The cl, rc,
+# link, lib, and wine-msvc.sh scripts are byte-identical to the MSVC 4.2
+# snapshot, so they share its committed authorities; only msvcenv.sh is
+# 5.0-specific because the 5.0 tools bind against MSVCRT.dll instead of the
+# two 4.2 C runtimes.  The finding encoded in msvcenv.sh is that Wine's
+# builtin msvcrt does not perturb 5.0 output, so no DLL overrides are needed.
+_TRANSPORT_FILES = {
+    "wine/x86/cl": FileAuthority(
+        2_900, "01f87f5c7532cc8d0a1fefcbb28031924b718d31c8172949630b5384a51c232d"
+    ),
+    "wine/x86/rc": FileAuthority(
+        940, "185d8d83fa318273a02a50dfa8fbbadc2f02607d0da8d81263e740747485e58d"
+    ),
+    "wine/x86/link": FileAuthority(
+        944, "e1a319a1c69d3b4718d26bae58b3369e37a9275cf03dcf1c61ae339cb08a3014"
+    ),
+    "wine/x86/lib": FileAuthority(
+        942, "666710820b68ead0c5be94f2b53f1737146ab59b125719c3ed8333ea71b80d67"
+    ),
+    "wine/x86/wine-msvc.sh": FileAuthority(
+        4_086, "13663766b596946d429c9340976ff75cf9955b7664f5d59ffd49edaf30fe5b8d"
+    ),
+}
+
+# The locked selector scripts source this during one-off CMake graph
+# configuration.  Direct authenticated builds execute wine-msvc.sh through
+# ReproBit's own proxy, so projects do not need to add this support file to
+# their portable lock; the provisioner still authenticates it.
+_TRANSPORT_SUPPORT_FILES = {
+    "wine/x86/msvcenv.sh": FileAuthority(
+        2_800, "955db7f3f42a29cf32c16cd9875f7f291a7ecb8b1ee0662663e70a79b016ab4b"
+    )
+}
+_PROVISIONED_TRANSPORT_FILES = {**_TRANSPORT_FILES, **_TRANSPORT_SUPPORT_FILES}
+
+# Installed bin runtime DLLs whose bytes live under a different repo path.
+# Every released tree carries the runtimes in redist/; the provisioner places
+# them into bin/ so the tools can load them at startup on modern Windows.
+_RUNTIME_PLACEMENT = {
+    "bin/msvcrt.dll": "redist/msvcrt.dll",
+    "bin/msvcp50.dll": "redist/msvcp50.dll",
+}
 
 
 def _file_table(
@@ -89,6 +137,8 @@ def verify_msvc50(root: Path, profile_identifier: str) -> None:
         _require_file(admitted_root.joinpath(*relative.split("/")), authority)
     for relative, authority in _cmake_frontend_authorities(profile_identifier).items():
         _require_file(admitted_root.joinpath(*relative.split("/")), authority)
+    for relative, authority in _PROVISIONED_TRANSPORT_FILES.items():
+        _require_file(admitted_root.joinpath(*relative.split("/")), authority)
     for relative, tree_authority in _tree_authorities(profile_identifier).items():
         tree = admitted_root.joinpath(*relative.split("/"))
         if tree.is_symlink() or not tree.is_dir():
@@ -117,6 +167,7 @@ def _reject_unadmitted(root: Path, profile_identifier: str) -> None:
     """
     admitted = set(_file_authorities(profile_identifier))
     admitted.update(_cmake_frontend_authorities(profile_identifier))
+    admitted.update(_PROVISIONED_TRANSPORT_FILES)
     tree_roots = tuple(f"{relative}/" for relative in _tree_authorities(profile_identifier))
     extras = []
     for path in sorted(root.rglob("*")):
@@ -134,7 +185,31 @@ def _reject_unadmitted(root: Path, profile_identifier: str) -> None:
 
 def _cone_paths(installation_profile: ToolchainProfile) -> tuple[str, ...]:
     roots = {relative.split("/", 1)[0] for relative in installation_profile.sources[0].paths}
+    roots.update(repo_path.split("/", 1)[0] for repo_path in _RUNTIME_PLACEMENT.values())
     return tuple(sorted(roots))
+
+
+def _transport_asset(relative: str, authority: FileAuthority) -> Path:
+    try:
+        asset_root = runtime_asset_directory("msvc50-wine")
+    except FileNotFoundError as error:
+        raise ProvisionError(str(error)) from error
+    source = asset_root / Path(relative).name
+    _require_file(source, authority)
+    return source
+
+
+def _install_transport_assets(destination_root: Path) -> None:
+    for relative, authority in _PROVISIONED_TRANSPORT_FILES.items():
+        source = _transport_asset(relative, authority)
+        destination = destination_root.joinpath(*relative.split("/"))
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.exists() or destination.is_symlink():
+            raise ProvisionError(f"transport destination already exists: {destination}")
+        with source.open("rb") as input_stream, destination.open("xb") as output_stream:
+            shutil.copyfileobj(input_stream, output_stream)
+        destination.chmod(0o755)
+        _require_file(destination, authority)
 
 
 def provision_msvc50(
@@ -172,11 +247,21 @@ def provision_msvc50(
         _emit(progress, f"fetching {repository_name}@{source.revision[:12]}")
         _checkout(checkout, source.repository, source.revision, _cone_paths(installation_profile))
         for relative in _file_authorities(profile_identifier):
+            if relative in _RUNTIME_PLACEMENT:
+                continue
             _copy_file(checkout, payload, relative)
         for relative in _cmake_frontend_authorities(profile_identifier):
             _copy_file(checkout, payload, relative)
         for relative in _tree_authorities(profile_identifier):
             _copy_tree(checkout, payload, relative)
+        for installed, repo_path in _RUNTIME_PLACEMENT.items():
+            _copy_file(checkout, payload, repo_path)
+            (payload / repo_path).replace(payload / installed)
+        redist = payload / "redist"
+        if redist.is_dir() and not any(redist.iterdir()):
+            redist.rmdir()
+        _emit(progress, "installing authenticated cross-host transport files")
+        _install_transport_assets(payload)
         _emit(progress, "authenticating files and portable input trees")
         verify_msvc50(payload, profile_identifier)
         payload.replace(destination)

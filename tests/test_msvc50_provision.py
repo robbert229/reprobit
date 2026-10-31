@@ -28,9 +28,14 @@ SP3 = "msvc_5_0_sp3"
 NOT_ADMITTED = "bin/psapi_extra.dll"
 
 
+def _repo_path(installed: str) -> str:
+    """Fabricated upstream mirrors the real layout: runtimes live in redist/."""
+    return msvc50_provision._RUNTIME_PLACEMENT.get(installed, installed)
+
+
 def _fabricate_upstream(root: Path) -> None:
     for relative in MSVC50_FILE_AUTHORITIES[SP3]:
-        path = root.joinpath(*relative.split("/"))
+        path = root.joinpath(*_repo_path(relative).split("/"))
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"fabricated:" + relative.encode("ascii"))
     for relative in MSVC50_CMAKE_FRONTEND_AUTHORITIES[SP3]:
@@ -62,7 +67,7 @@ def _install_fake_checkout(
 
 def _install_fake_authorities(monkeypatch: pytest.MonkeyPatch, fabricated: Path) -> None:
     def file_table(relative: str) -> FileAuthority:
-        path = fabricated.joinpath(*relative.split("/"))
+        path = fabricated.joinpath(*_repo_path(relative).split("/"))
         return FileAuthority(path.stat().st_size, hashlib.sha256(path.read_bytes()).hexdigest())
 
     def file_authorities(identifier: str) -> dict[str, FileAuthority]:
@@ -188,6 +193,12 @@ def test_verify_rejects_tree_mutation(
     _install_fake_authorities(monkeypatch, fabricated)
     installed = tmp_path / "installed"
     shutil.copytree(fabricated, installed)
+    for installed_path, repo_path in msvc50_provision._RUNTIME_PLACEMENT.items():
+        source = installed.joinpath(*repo_path.split("/"))
+        destination = installed.joinpath(*installed_path.split("/"))
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        source.replace(destination)
+    msvc50_provision._install_transport_assets(installed)
     shutil.rmtree(installed / "atl/include")
 
     with pytest.raises(ProvisionError, match="absent or redirected"):
@@ -209,3 +220,78 @@ def test_provision_rejects_redirected_destination(tmp_path: Path) -> None:
 
     with pytest.raises(ProvisionError, match="redirected path"):
         msvc50_provision.provision_msvc50(redirected, SP3)
+
+
+@pytest.mark.parametrize(
+    ("relative", "authority"),
+    msvc50_provision._PROVISIONED_TRANSPORT_FILES.items(),
+)
+def test_packaged_transport_assets_match_fixed_authority(
+    relative: str,
+    authority: FileAuthority,
+) -> None:
+    source = msvc50_provision._transport_asset(relative, authority)
+
+    assert source.stat().st_size == authority.size
+    assert hashlib.sha256(source.read_bytes()).hexdigest() == authority.sha256
+    assert b"Permission to use, copy, modify" in source.read_bytes()
+
+
+def test_missing_packaged_transport_is_a_provision_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def missing(_name: str) -> Path:
+        raise FileNotFoundError("simulated missing wheel asset")
+
+    monkeypatch.setattr(msvc50_provision, "runtime_asset_directory", missing)
+
+    with pytest.raises(ProvisionError, match="missing wheel asset"):
+        msvc50_provision._transport_asset(
+            "wine/x86/cl", msvc50_provision._TRANSPORT_FILES["wine/x86/cl"]
+        )
+
+
+def test_transport_install_is_exact_regular_and_non_overwriting(tmp_path: Path) -> None:
+    msvc50_provision._install_transport_assets(tmp_path)
+
+    for relative, authority in msvc50_provision._PROVISIONED_TRANSPORT_FILES.items():
+        installed = tmp_path.joinpath(*relative.split("/"))
+        assert installed.is_file()
+        assert not installed.is_symlink()
+        assert installed.stat().st_size == authority.size
+        assert hashlib.sha256(installed.read_bytes()).hexdigest() == authority.sha256
+        if os.name == "posix":
+            assert os.access(installed, os.X_OK)
+
+    with pytest.raises(ProvisionError, match="already exists"):
+        msvc50_provision._install_transport_assets(tmp_path)
+
+
+def test_complete_verification_requires_cross_host_transport(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(msvc50_provision, "_file_authorities", lambda identifier: {})
+    monkeypatch.setattr(msvc50_provision, "_tree_authorities", lambda identifier: {})
+    monkeypatch.setattr(msvc50_provision, "_cmake_frontend_authorities", lambda identifier: {})
+
+    with pytest.raises(ProvisionError, match="absent or redirected"):
+        msvc50_provision.verify_msvc50(tmp_path, SP3)
+
+    msvc50_provision._install_transport_assets(tmp_path)
+    msvc50_provision.verify_msvc50(tmp_path, SP3)
+
+
+def test_complete_verification_rejects_transport_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(msvc50_provision, "_file_authorities", lambda identifier: {})
+    monkeypatch.setattr(msvc50_provision, "_tree_authorities", lambda identifier: {})
+    monkeypatch.setattr(msvc50_provision, "_cmake_frontend_authorities", lambda identifier: {})
+    msvc50_provision._install_transport_assets(tmp_path)
+    transport = tmp_path / "wine" / "x86" / "wine-msvc.sh"
+    transport.write_bytes(transport.read_bytes() + b"\n")
+
+    with pytest.raises(ProvisionError, match="file authority differs"):
+        msvc50_provision.verify_msvc50(tmp_path, SP3)
