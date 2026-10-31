@@ -17,6 +17,7 @@ from typing import Literal, Protocol
 
 from reprobit import __version__
 from reprobit.build import BuildPlan, BuildStep
+from reprobit.classic.compiler_identity import msvc500sp3_identity_report_context
 from reprobit.evidence_audit import EvidenceAudit, EvidenceAuditor, EvidenceClaim, EvidenceIssue
 from reprobit.execution import (
     BuildExecutionReceipt,
@@ -937,6 +938,15 @@ class ReproductionEngine:
         explorer_context = getattr(executor, "explorer_context", None)
         if callable(explorer_context):
             report = report.with_exploration(explorer_context(report))
+        if request.bundle.toolchain_lock.profile == "msvc_5_0_sp3":
+            identity_context = msvc500sp3_identity_report_context(request.bundle.toolchain_lock)
+            if identity_context is not None:
+                report = report.with_exploration(
+                    {
+                        **report.exploration,
+                        **identity_context,
+                    }
+                )
         final_reseal = getattr(executor, "reseal_published_targets", None)
         if final_reseal is not None and not callable(final_reseal):
             raise EngineError("build executor exposes an invalid final reseal hook")

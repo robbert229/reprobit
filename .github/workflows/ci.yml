@@ -100,12 +100,16 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
-      - name: Install 32-bit Wine
+      - name: Install Wine server and 32-bit support
         run: |
           sudo dpkg --add-architecture i386
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends wine wine32:i386
+          sudo apt-get install -y --no-install-recommends wine wine64 wine32:i386
           wine --version
+          wineserver_dir="$(dirname "$(dpkg-query -L wine64 | grep -E '/wineserver$' | head -n 1)")"
+          test -x "$wineserver_dir/wineserver"
+          echo "$wineserver_dir" >> "$GITHUB_PATH"
+          export PATH="$wineserver_dir:$PATH"
           command -v wineserver
       - run: python -m pip install -e ".[test]"
       # The authenticated MSVC 4.2 tree is cached between runs. The key covers
@@ -347,12 +351,16 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
-      - name: Install 32-bit Wine
+      - name: Install Wine server and 32-bit support
         run: |
           sudo dpkg --add-architecture i386
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends wine wine32:i386
+          sudo apt-get install -y --no-install-recommends wine wine64 wine32:i386
           wine --version
+          wineserver_dir="$(dirname "$(dpkg-query -L wine64 | grep -E '/wineserver$' | head -n 1)")"
+          test -x "$wineserver_dir/wineserver"
+          echo "$wineserver_dir" >> "$GITHUB_PATH"
+          export PATH="$wineserver_dir:$PATH"
           command -v wineserver
       - run: python -m pip install -e ".[test]"
       # The authenticated MSVC 5.0 SP3 tree is cached between runs. The key
