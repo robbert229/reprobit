@@ -452,15 +452,26 @@ def _monkeypatch_msvc50_authorities(monkeypatch: pytest.MonkeyPatch, installed: 
     monkeypatch.setattr(msvc50_provision, "_tree_authorities", tree_authorities)
 
 
+@pytest.mark.parametrize(
+    "identifier,suffix",
+    (
+        ("msvc_5_0_rtm", "RTM"),
+        ("msvc_5_0_sp1", "SP1"),
+        ("msvc_5_0_sp2", "SP2"),
+        ("msvc_5_0_sp3", "SP3"),
+    ),
+)
 def test_setup_provisions_and_verifies_an_msvc50_project_without_manual_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    identifier: str,
+    suffix: str,
 ) -> None:
-    monkeypatch.delenv("REPROBIT_MSVC_5_0_SP3_ROOT", raising=False)
+    monkeypatch.delenv(f"REPROBIT_MSVC_5_0_{suffix}_ROOT", raising=False)
     project = tmp_path / "sample"
     installed = tmp_path / "provisioned"
-    _fabricate_msvc50_installation(installed, "msvc_5_0_sp3")
+    _fabricate_msvc50_installation(installed, identifier)
     _monkeypatch_msvc50_authorities(monkeypatch, installed)
     fetched: list[str] = []
 
@@ -477,11 +488,11 @@ def test_setup_provisions_and_verifies_an_msvc50_project_without_manual_root(
             doctor=lambda *, execute_probe: BackendDoctorReport("fixture", "fixture", ()),
         ),
     )
-    assert main(["init", str(project), "--profile", "msvc_5_0_sp3"]) == 0
+    assert main(["init", str(project), "--profile", identifier]) == 0
     capsys.readouterr()
 
     assert main(["setup", str(project), "--no-save", "--skip-probe"]) == 0
 
-    assert fetched == ["msvc_5_0_sp3"]
+    assert fetched == [identifier]
     assert "Environment ready" in capsys.readouterr().out
     assert (project / "reprobit" / "toolchain.lock.json").is_file()

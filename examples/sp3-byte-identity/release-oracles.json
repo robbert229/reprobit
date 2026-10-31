@@ -1,0 +1,18 @@
+{
+  "msvc_5_0_rtm": {
+    "sha256": "3bd61c7b16f6a66f6d3df281d66256b9509a19a93ed1762e2782e2b5f2133d6a",
+    "size": 1024
+  },
+  "msvc_5_0_sp1": {
+    "sha256": "f17007caf4ad2b08ed93b88821c661262307fa53d2f06a6e78515e86a305e283",
+    "size": 1024
+  },
+  "msvc_5_0_sp2": {
+    "sha256": "f17007caf4ad2b08ed93b88821c661262307fa53d2f06a6e78515e86a305e283",
+    "size": 1024
+  },
+  "msvc_5_0_sp3": {
+    "sha256": "79b3416c27aa5ad062800ed09a5efb4534c6080bf5e45b99d21a3bdd207ddd2a",
+    "size": 1024
+  }
+}
