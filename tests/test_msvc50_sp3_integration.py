@@ -20,9 +20,10 @@ from typing import Any
 import pytest
 
 from reprobit.model import Digest
+from reprobit.producer_graph import toolchain_document_digest
 from reprobit.project_loader import load_project_tree
 from reprobit.report import CacheMode, Report
-from reprobit.schema import OracleDocument
+from reprobit.schema import OracleDocument, ToolchainLock
 
 ROOT = Path(__file__).parents[1]
 SAMPLE = ROOT / "examples" / "sp3-byte-identity"
@@ -100,15 +101,7 @@ def test_release_fixture_provisions_pins_verifies_byte_identical(
         ),
     )
     config = project / "reprobit.toml"
-    config.write_text(
-        config.read_text()
-        .replace("msvc_5_0_sp3", profile)
-        .replace("sp3-byte-identity", f"{release}-byte-identity")
-    )
-    build_plan = project / "reprobit" / "build-plan.json"
-    build_plan.write_text(
-        build_plan.read_text().replace("sp3-byte-identity", f"{release}-byte-identity")
-    )
+    config.write_text(config.read_text().replace("msvc_5_0_sp3", profile))
     environment = os.environ.copy()
     environment[root_variable] = os.fspath(toolchain_root)
     environment["PYTHONUTF8"] = "1"
@@ -136,6 +129,12 @@ def test_release_fixture_provisions_pins_verifies_byte_identical(
         environment=environment,
     )
     assert locked.returncode == 0, locked.stdout + locked.stderr
+    lock_path = project / "reprobit" / "toolchain.lock.json"
+    lock = ToolchainLock.model_validate_json(lock_path.read_bytes())
+    graph_path = project / "reprobit" / "producer-graph.json"
+    graph = json.loads(graph_path.read_text())
+    graph["toolchain_lock_digest"] = toolchain_document_digest(lock).model_dump(mode="json")
+    graph_path.write_text(json.dumps(graph, separators=(",", ":")))
 
     prepared = _run(
         (
