@@ -14,7 +14,6 @@ from typing import Final
 from reprobit.model import Digest
 from reprobit.schema import MsvcRelease, ToolchainLock
 from reprobit.strict_json import canonical_json
-from reprobit.msvc50_authorities import MSVC50_FILE_AUTHORITIES
 
 MSVC420_WIN32_I386_TARGET: Final = "msvc-4.20-win32-i386"
 
@@ -25,6 +24,10 @@ _SOURCE_REVISION: Final = "b42c244f0a83ba15ba2ffb62b0dc240d7b2dea50"
 _RECEIPT_SCHEMA: Final = "reprobit.classic-compiler-identity.v1"
 _ISSUANCE_KEY: Final = object()
 MSVC500SP3_WIN32_I386_TARGET: Final = "msvc-5.00-sp3-win32-i386"
+_MSVC500SP3_PROFILE: Final = "msvc_5_0_sp3"
+_MSVC500SP3_REPOSITORY: Final = "https://github.com/archaic-msvc/msvc500sp3.git"
+_MSVC500SP3_REVISION: Final = "259a03f0bc863de5baf657ec064cb60cb20a2cdc"
+_MSVC500SP3_PATHS: Final = ("bin/cl.exe", "bin/c1xx.dll", "bin/c2.exe")
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +47,27 @@ class CanonicalCompilerTool:
             "roles": list(self.roles),
         }
 
+
+_MSVC500SP3_TOOLS: Final = (
+    CanonicalCompilerTool(
+        "bin/cl.exe",
+        46_080,
+        Digest(value="bf9f9c74f756fed96e13f7f9a4273495c7dde0a1fb968e3ef6d760ad6d73dfeb"),
+        ("compiler",),
+    ),
+    CanonicalCompilerTool(
+        "bin/c1xx.dll",
+        1_051_408,
+        Digest(value="e27df3bb9a37058c85dad3fb7d1ed30b9e52d38fb6c0f66c8fdba0a11111d3d9"),
+        ("runtime",),
+    ),
+    CanonicalCompilerTool(
+        "bin/c2.exe",
+        660_240,
+        Digest(value="e75aecaf4073b0817ffb638cae5fff636b2e2d1a090daabf8f68dbc954515fae"),
+        ("runtime",),
+    ),
+)
 
 _CANONICAL_TOOLS: Final = (
     CanonicalCompilerTool(
@@ -205,55 +229,107 @@ def issue_msvc420_compiler_identity(lock: ToolchainLock) -> Msvc420CompilerIdent
 @dataclass(frozen=True, slots=True)
 class Msvc500Sp3CompilerIdentity:
     """Reviewed MSVC 5.0 SP3 compiler identity receipt."""
+
     toolchain_lock_digest: Digest
-    target: str = MSVC500SP3_WIN32_I386_TARGET
+    _issuance_key: object
+
+    def __post_init__(self) -> None:
+        if self._issuance_key is not _ISSUANCE_KEY:
+            raise TypeError("MSVC 5.0 SP3 identities must be issued from a canonical lock")
+
+    @property
+    def target(self) -> str:
+        return MSVC500SP3_WIN32_I386_TARGET
 
     def proof_receipt(self) -> dict[str, object]:
-        authority = MSVC50_FILE_AUTHORITIES["msvc_5_0_sp3"]
         tools = [
-            {"path": path, "size": authority[path].size,
-             "digest": Digest(value=authority[path].sha256).model_dump(mode="json"),
-             "roles": ["compiler"] if path == "bin/cl.exe" else ["runtime"]}
-            for path in ("bin/cl.exe", "bin/c1xx.dll", "bin/c2.exe")
+            {
+                "path": tool.path,
+                "size": tool.size,
+                "digest": tool.digest.model_dump(mode="json"),
+                "roles": list(tool.roles),
+            }
+            for tool in _MSVC500SP3_TOOLS
         ]
         material = {
-            "schema": "reprobit.classic-compiler-identity.v1", "target": self.target,
-            "adapter": "classic-msvc", "profile": "msvc_5_0_sp3", "release": "5.0-sp3",
-            "architecture": "x86", "coff_machine": "i386",
-            "source": {"repository": "https://github.com/archaic-msvc/msvc500sp3.git",
-                       "revision": "259a03f0bc863de5baf657ec064cb60cb20a2cdc",
-                       "paths": [x["path"] for x in tools]},
-            "tools": tools, "toolchain_lock_digest": self.toolchain_lock_digest.model_dump(mode="json")}
-        return {**material, "receipt_digest": Digest.from_bytes(canonical_json(material)).model_dump(mode="json")}
+            "schema": _RECEIPT_SCHEMA,
+            "target": self.target,
+            "adapter": _LOCK_ADAPTER,
+            "profile": _MSVC500SP3_PROFILE,
+            "release": MsvcRelease.V5_SP3.value,
+            "architecture": "x86",
+            "coff_machine": "i386",
+            "source": {
+                "repository": _MSVC500SP3_REPOSITORY,
+                "revision": _MSVC500SP3_REVISION,
+                "paths": list(_MSVC500SP3_PATHS),
+            },
+            "tools": tools,
+            "toolchain_lock_digest": self.toolchain_lock_digest.model_dump(mode="json"),
+        }
+        return {
+            **material,
+            "receipt_digest": Digest.from_bytes(canonical_json(material)).model_dump(mode="json"),
+        }
 
 
 def issue_msvc500sp3_compiler_identity(lock: ToolchainLock) -> Msvc500Sp3CompilerIdentity | None:
     """Issue canonical SP3 identity only from a lock naming every reviewed compiler byte."""
-    profile, repository = "msvc_5_0_sp3", "https://github.com/archaic-msvc/msvc500sp3.git"
-    revision = "259a03f0bc863de5baf657ec064cb60cb20a2cdc"
-    paths = ("bin/cl.exe", "bin/c1xx.dll", "bin/c2.exe")
-    if not isinstance(lock, ToolchainLock) or lock.adapter != "classic-msvc" or lock.profile != profile or lock.release is not MsvcRelease.V5_SP3:
+    if (
+        not isinstance(lock, ToolchainLock)
+        or type(lock.schema_version) is not int
+        or lock.schema_version != 3
+        or lock.adapter != _LOCK_ADAPTER
+        or lock.profile != _MSVC500SP3_PROFILE
+        or lock.release is not MsvcRelease.V5_SP3
+    ):
         return None
-    sources = [s for s in lock.profile_sources if s.repository == repository and s.revision == revision]
-    if len(sources) != 1 or any(p not in sources[0].paths for p in paths): return None
-    if any(sum(p.casefold() == expected for s in lock.profile_sources for p in s.paths) != 1 for expected in paths): return None
+    sources = [
+        source
+        for source in lock.profile_sources
+        if source.repository == _MSVC500SP3_REPOSITORY and source.revision == _MSVC500SP3_REVISION
+    ]
+    if len(sources) != 1 or any(path not in sources[0].paths for path in _MSVC500SP3_PATHS):
+        return None
+    if any(
+        sum(path.casefold() == expected for source in lock.profile_sources for path in source.paths)
+        != 1
+        for expected in _MSVC500SP3_PATHS
+    ):
+        return None
     all_tools = (*lock.tools, *lock.runtime_files)
     tools = {t.path.casefold(): t for t in all_tools}
-    if len(tools) != len(all_tools): return None
-    authority = MSVC50_FILE_AUTHORITIES[profile]
-    for path in paths:
+    if len(tools) != len(all_tools):
+        return None
+    for expected_tool in _MSVC500SP3_TOOLS:
+        path = expected_tool.path
         tool = tools.get(path)
-        roles = ("compiler",) if path == "bin/cl.exe" else ("runtime",)
-        if tool is None or tool.path != path or tool.size != authority[path].size or tool.digest.value != authority[path].sha256 or tool.roles != roles: return None
-    return Msvc500Sp3CompilerIdentity(Digest.from_bytes(canonical_json(lock)))
+        if (
+            tool is None
+            or tool.path != path
+            or tool.size != expected_tool.size
+            or tool.digest != expected_tool.digest
+            or tool.roles != expected_tool.roles
+        ):
+            return None
+    if sum("compiler" in tool.roles for tool in all_tools) != 1:
+        return None
+    return Msvc500Sp3CompilerIdentity(Digest.from_bytes(canonical_json(lock)), _ISSUANCE_KEY)
+
+
+def msvc500sp3_identity_report_context(lock: ToolchainLock) -> dict[str, object] | None:
+    """Return the report field for a canonical SP3 lock, or no claim."""
+    identity = issue_msvc500sp3_compiler_identity(lock)
+    return None if identity is None else {"compiler_identity": identity.proof_receipt()}
 
 
 __all__ = [
     "MSVC420_WIN32_I386_TARGET",
+    "MSVC500SP3_WIN32_I386_TARGET",
     "CanonicalCompilerTool",
     "Msvc420CompilerIdentity",
-    "issue_msvc420_compiler_identity",
     "Msvc500Sp3CompilerIdentity",
+    "issue_msvc420_compiler_identity",
     "issue_msvc500sp3_compiler_identity",
-    "MSVC500SP3_WIN32_I386_TARGET",
+    "msvc500sp3_identity_report_context",
 ]

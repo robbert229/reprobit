@@ -183,29 +183,62 @@ def test_refuses_an_extra_compiler_role_tool() -> None:
 
 
 def test_msvc50_sp3_identity_requires_all_reviewed_compiler_bytes() -> None:
-    from reprobit.classic.compiler_identity import issue_msvc500sp3_compiler_identity
+    from reprobit.classic.compiler_identity import (
+        Msvc500Sp3CompilerIdentity,
+        issue_msvc500sp3_compiler_identity,
+        msvc500sp3_identity_report_context,
+    )
     from reprobit.msvc50_authorities import MSVC50_FILE_AUTHORITIES
 
     profile = "msvc_5_0_sp3"
     paths = ("bin/c1xx.dll", "bin/c2.exe", "bin/cl.exe")
     authority = MSVC50_FILE_AUTHORITIES[profile]
     lock = ToolchainLock(
-        schema_version=3, adapter="classic-msvc", profile=profile,
+        schema_version=3,
+        adapter="classic-msvc",
+        profile=profile,
         release=MsvcRelease.V5_SP3,
-        profile_sources=(ToolchainProfileSource(
-            repository="https://github.com/archaic-msvc/msvc500sp3.git",
-            revision="259a03f0bc863de5baf657ec064cb60cb20a2cdc", paths=paths),),
-        tools=tuple(LockedTool(
-            id=f"tool.{i}", path=path, size=authority[path].size,
-            digest=Digest(value=authority[path].sha256),
-            roles=("compiler",) if path == "bin/cl.exe" else ("runtime",))
-            for i, path in enumerate(paths)),
+        profile_sources=(
+            ToolchainProfileSource(
+                repository="https://github.com/archaic-msvc/msvc500sp3.git",
+                revision="259a03f0bc863de5baf657ec064cb60cb20a2cdc",
+                paths=paths,
+            ),
+        ),
+        tools=tuple(
+            LockedTool(
+                id=f"tool.{i}",
+                path=path,
+                size=authority[path].size,
+                digest=Digest(value=authority[path].sha256),
+                roles=("compiler",) if path == "bin/cl.exe" else ("runtime",),
+            )
+            for i, path in enumerate(paths)
+        ),
     )
     identity = issue_msvc500sp3_compiler_identity(lock)
     assert identity is not None
     assert identity.target == "msvc-5.00-sp3-win32-i386"
     assert identity.proof_receipt()["profile"] == profile
-    altered = lock.model_copy(update={"tools": (lock.tools[0].model_copy(update={"size": 1}), *lock.tools[1:])})
+    assert msvc500sp3_identity_report_context(lock) == {
+        "compiler_identity": identity.proof_receipt()
+    }
+    with pytest.raises(TypeError, match="must be issued"):
+        Msvc500Sp3CompilerIdentity(Digest(value="0" * 64), object())
+    altered = lock.model_copy(
+        update={"tools": (lock.tools[0].model_copy(update={"size": 1}), *lock.tools[1:])}
+    )
     assert issue_msvc500sp3_compiler_identity(altered) is None
     partial = lock.model_copy(update={"tools": lock.tools[:2]})
     assert issue_msvc500sp3_compiler_identity(partial) is None
+    wrong_schema = lock.model_copy(update={"schema_version": 2})
+    assert issue_msvc500sp3_compiler_identity(wrong_schema) is None
+    extra_compiler = LockedTool(
+        id="tool.extra-compiler",
+        path="bin/extra.exe",
+        size=1,
+        digest=Digest(value="0" * 64),
+        roles=("compiler",),
+    )
+    forged = lock.model_copy(update={"tools": (*lock.tools, extra_compiler)})
+    assert issue_msvc500sp3_compiler_identity(forged) is None
