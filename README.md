@@ -18,11 +18,12 @@ The result is more than a matching checksum. ReproBit checks three separate clai
    original executable.
 
 ReproBit is pre-release software. It recognizes profiles for Microsoft Visual C++ 4.2 and the
-5.0 releases. End-to-end evidence with the real compiler covers 4.2 on native Windows CI, and the
-5.0 SP3 release now carries the same byte-identity proof on both native Windows and the POSIX Wine
-transport; the other 5.0 releases remain modeled but unproven. The shared build, verification,
-reporting, and incremental pieces are designed to support more compiler families through reviewed
-library releases.
+5.0 releases. It can automatically acquire and authenticate all four MSVC 5.0 profiles. Public CI
+reproduces a committed byte-identity pin for RTM, SP1, SP2, and SP3 on both native Windows and the
+POSIX Wine transport, and cold-verifies the fixture with a clean authenticity report on both host
+types. The 4.2 native Windows lane provides host and compiler-chain evidence. The shared build,
+verification, reporting, and incremental pieces are designed to support more compiler families
+through reviewed library releases.
 
 ## Install
 
@@ -44,8 +45,9 @@ then run the same `python -m pip install .` and `rbit --version` commands. Keep
 the environment active while using `rbit` in your own project.
 
 ReproBit runs with Wine on macOS and Linux and natively on Windows. It can fetch and authenticate
-the supported MSVC 4.2 files from the pinned archaic-msvc repositories, or use an existing local
-installation. Reference binaries remain project-owned and are never redistributed by ReproBit.
+the supported MSVC 4.2 and 5.0 toolchains from pinned archaic-msvc repositories, or use an existing
+local installation. Reference binaries remain project-owned and are never redistributed by
+ReproBit.
 
 ## Quick start
 

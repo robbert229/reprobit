@@ -1,4 +1,4 @@
-# Native Windows and MSVC 4.2
+# Native Windows and MSVC 4.2 / 5.0
 
 This is the canonical guide to ReproBit's native Windows path. macOS and Linux
 can test portable behavior, but only Windows can exercise the native isolation
@@ -14,9 +14,10 @@ rbit setup .
 rbit status .
 ```
 
-`setup` provisions and authenticates MSVC 4.2 when needed, remembers its local
-path, writes or checks the project lock, and runs the native execution probe.
-To choose a specific installation directory instead:
+`setup` provisions and authenticates the project's selected MSVC 4.2 or 5.0
+profile when needed, remembers its local path, writes or checks the project
+lock, and runs the native execution probe. The 5.0 profiles cover RTM, SP1,
+SP2, and SP3. To choose a specific installation directory instead:
 
 ```powershell
 rbit toolchain provision --destination C:\toolchains\msvc42
@@ -112,8 +113,9 @@ rebuilds and re-authenticates the toolchain, runs the private-drive and process-
 lifetime tests, and compiles through the real MSVC 4.2 child chain. It uploads
 only tests and diagnostic logs.
 
-This is end-to-end host evidence for MSVC 4.2. The MSVC 5.0 fixture carries
-committed RTM, SP1, SP2, and SP3 reference pins. Native Windows and Wine lanes
-authenticate each release installation, generate its project lock, and
-reproduce its committed pin (see
-[platforms](platforms.md#what-public-ci-proves)).
+The native gate provides host and compiler-chain evidence for MSVC 4.2. The
+MSVC 5.0 fixture carries committed RTM, SP1, SP2, and SP3 reference pins.
+Native Windows and Wine lanes authenticate each release installation, generate
+its project lock, reproduce its committed pin, then cold-verify the fixture
+with a clean byte-exact authenticity verdict. See
+[platforms](platforms.md#what-public-ci-proves) for the full evidence summary.

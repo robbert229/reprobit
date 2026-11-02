@@ -47,11 +47,17 @@ that fails when it is stale:
   `test_cli_*`, `test_discovery_*`, `test_msvc*`, `test_repair*`, ...).
 - `tests/fixtures/`: small committed inputs such as `classic_smoke.cpp`.
 - Real-compiler tests skip themselves unless a toolchain root is configured in
-  the environment: `REPROBIT_MSVC_4_2_ROOT` (and `REPROBIT_MSVC_5_0_*_ROOT`
-  for the modeled 5.0 profiles). Some additionally need Wine on POSIX, native
-  Windows, or the `REPROBIT_MSVC42_PE_*`/`REPROBIT_MSVC42_PDB_*` fixture
-  variables. A default run therefore reports a few dozen skips; that is
-  expected.
+  the environment: `REPROBIT_MSVC_4_2_ROOT` for 4.2, and
+  `REPROBIT_MSVC_5_0_RTM_ROOT`, `REPROBIT_MSVC_5_0_SP1_ROOT`,
+  `REPROBIT_MSVC_5_0_SP2_ROOT`, or `REPROBIT_MSVC_5_0_SP3_ROOT` for the
+  corresponding 5.0 release. The `msvc42` and `msvc50` pytest markers select
+  the authenticated 4.2 tests and the 5.0 release integration matrix,
+  respectively. The upstream authority re-audit additionally uses
+  `REPROBIT_MSVC_5_0_UPSTREAM_ROOT`; CI captures per-release pins with
+  `REPROBIT_MSVC_5_0_ORACLE_OUTPUT`. Some tests additionally need Wine on
+  POSIX, native Windows, or the `REPROBIT_MSVC42_PE_*`/`REPROBIT_MSVC42_PDB_*`
+  fixture variables. A default run therefore reports a few dozen skips; that
+  is expected.
 - Windows-only behaviour (directory junctions, logon sessions, Job Objects)
   is skipped on other platforms and exercised by the Windows CI job.
 - Structural tests that protect the design rather than a feature:
