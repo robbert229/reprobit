@@ -43,7 +43,9 @@ The MSVC 5.0 fixture has committed byte pins for RTM, SP1, SP2, and SP3. Native 
 Wine lanes independently provision each release, generate a lock from its authenticated
 installation, and reproduce the release's committed reference pin. The same RTM, SP1, and SP2
 pins are reproduced on both host kinds; SP1 and SP2 currently produce the same reference bytes.
+For all four releases, the fixture then runs a cold `rbit verify` and requires a byte-exact result
+with a clean authenticity report on both host kinds.
 
-That gate proves the 4.2 host and compiler path, not a project's full byte-identity verdict from
-scratch. Project certification still needs the project's locked toolchain, reference data, and a
-fixture that builds from scratch on its intended host.
+The 4.2 native gate proves its host and compiler path. The 5.0 lanes additionally prove the fixture's
+full byte-identity verdict from scratch. A project's certification still needs its own locked
+toolchain, reference data, and a fixture that builds from scratch on its intended host.
