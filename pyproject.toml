@@ -40,7 +40,7 @@ addopts = "-ra --strict-config --strict-markers"
 testpaths = ["tests"]
 markers = [
     "msvc42: needs an authenticated MSVC 4.2 installation (REPROBIT_MSVC_4_2_ROOT)",
-    "msvc50_sp3: needs an authenticated MSVC 5.0 SP3 installation (REPROBIT_MSVC_5_0_SP3_ROOT)",
+    "msvc50: needs an authenticated MSVC 5.0 installation for the release integration matrix",
 ]
 
 [tool.ruff]

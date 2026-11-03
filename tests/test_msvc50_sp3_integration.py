@@ -35,7 +35,7 @@ RELEASES = (
     ("sp3", "msvc_5_0_sp3", "REPROBIT_MSVC_5_0_SP3_ROOT"),
 )
 
-pytestmark = pytest.mark.msvc50_sp3
+pytestmark = pytest.mark.msvc50
 
 
 def _rbit() -> Path:
