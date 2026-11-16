@@ -392,6 +392,8 @@ def _validate_noncompiler_option_grammar(node: ProducerNode) -> None:
                 continue
             if folded.startswith(("/out:", "-out:")):
                 continue
+            if folded.startswith(_ROLE_INPUT_PREFIXES):
+                continue
             if re.fullmatch(r"(?i)[/-]machine:i386", value):
                 continue
             if not value.startswith(("/", "-")) and (
@@ -477,6 +479,10 @@ def librarian_input_sequence(node: ProducerNode) -> tuple[str, ...]:
 
     if node.role is not ProducerRole.LIBRARIAN:
         raise ProducerGraphError("librarian input sequence is defined only for librarian nodes")
+    if any(value.casefold().startswith(_ROLE_INPUT_PREFIXES) for value in node.arguments):
+        # LIB /DEF writes an import library: its objects only resolve the
+        # exported names and never become archive members.
+        return ()
     references: list[str] = []
     for value in node.arguments:
         if value.startswith(("/", "-")):
@@ -600,7 +606,15 @@ class ProducerNode(StrictModel):
                     f"producer argv/input edges differ: missing={missing}, extra={extra}"
                 )
             if self.role in {ProducerRole.RESOURCE, ProducerRole.LIBRARIAN}:
-                if required_outputs != declared_outputs or secondary_outputs:
+                implicit: frozenset[str] = frozenset()
+                if self.role is ProducerRole.LIBRARIAN and any(
+                    value.casefold().startswith(_ROLE_INPUT_PREFIXES) for value in self.arguments
+                ):
+                    # LIB /DEF also writes <out>.exp beside the import library.
+                    implicit = frozenset(
+                        str(PurePosixPath(value).with_suffix(".exp")) for value in required_outputs
+                    )
+                if required_outputs | implicit != declared_outputs or secondary_outputs:
                     raise ValueError("producer argv/output edges differ")
             else:
                 if len(required_outputs) != 1 or not required_outputs <= declared_outputs:
@@ -619,7 +633,10 @@ class ProducerNode(StrictModel):
                     if kind != "source" or suffix != ".rc":
                         raise ValueError("resource inputs must be manifest source .rc files")
                 elif self.role is ProducerRole.LIBRARIAN:
-                    if kind != "build" or suffix != ".obj":
+                    if suffix == ".def":
+                        if kind != "source":
+                            raise ValueError("librarian DEF inputs must be manifest source files")
+                    elif kind != "build" or suffix != ".obj":
                         raise ValueError("librarian inputs must be current-run build objects")
                 elif suffix in {".obj", ".res"}:
                     if kind != "build":

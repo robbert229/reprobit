@@ -23,6 +23,7 @@ from reprobit.discovery_contracts import (
     DeclarationShapeSearch,
     DiscoveryError,
     DiscoveryPlan,
+    ExternRunPairSearch,
     InclusiveRange,
     MosaicLimits,
     enumerate_declaration_states,
@@ -65,16 +66,33 @@ def _portable_relative(value: str, *, label: str) -> str:
     return value
 
 
+class ProjectGrindExternRuns(StrictModel):
+    """A run of ``extern int`` declarations after the unit's final include.
+
+    The C-compatible carrier: class shapes and forward class declarations
+    compile only as C++.
+    """
+
+    counts: InclusiveRange
+    prefix: Annotated[str, Field(pattern=r"^[A-Za-z][A-Za-z0-9_]*$")] = "ReproBitPad"
+    width: Annotated[int, Field(ge=1, le=3)] = 3
+
+
 class ProjectGrindPlan(StrictModel):
-    """One deliberately small, project-aware declaration search."""
+    """One deliberately small, project-aware declaration search.
+
+    It searches either declaration shapes (``classes`` and ``functions``) or
+    extern runs (``extern_runs``), never both.
+    """
 
     schema_version: Literal[1] = 1
     reference_object: Annotated[str, Field(min_length=1, max_length=8192)]
     target: Identifier
     translation_unit: Identifier
     symbol: Annotated[str, Field(min_length=1, max_length=2048)]
-    classes: InclusiveRange
-    functions: InclusiveRange
+    classes: InclusiveRange | None = None
+    functions: InclusiveRange | None = None
+    extern_runs: ProjectGrindExternRuns | None = None
 
     @field_validator("reference_object")
     @classmethod
@@ -83,6 +101,11 @@ class ProjectGrindPlan(StrictModel):
 
     @model_validator(mode="after")
     def lean_initial_scope(self) -> ProjectGrindPlan:
+        shapes = (self.classes is not None, self.functions is not None)
+        if self.extern_runs is None and shapes != (True, True):
+            raise ValueError("a grind plan needs classes and functions, or extern_runs")
+        if self.extern_runs is not None and any(shapes):
+            raise ValueError("a grind plan searches declaration shapes or extern runs, not both")
         try:
             enumerate_declaration_states(self.plan)
         except DiscoveryError as exc:
@@ -95,17 +118,28 @@ class ProjectGrindPlan(StrictModel):
     def plan(self) -> DiscoveryPlan:
         """Translate the small public plan into the shared bounded enumerator."""
 
+        search: DeclarationShapeSearch | ExternRunPairSearch
+        if self.extern_runs is not None:
+            search = ExternRunPairSearch(
+                family=DeclarationFamily.EXTERN_RUN_PAIR,
+                header_prefix=self.extern_runs.prefix,
+                seat_prefix=self.extern_runs.prefix + "Seat",
+                header_counts=self.extern_runs.counts,
+                seat_counts=InclusiveRange(start=0, stop=0),
+                width=self.extern_runs.width,
+            )
+        else:
+            assert self.classes is not None and self.functions is not None
+            search = DeclarationShapeSearch(
+                family=DeclarationFamily.DECLARATION_SHAPE,
+                classes=self.classes,
+                functions=self.functions,
+            )
         return DiscoveryPlan(
             target=self.target,
             translation_unit=self.translation_unit,
             symbols=(self.symbol,),
-            searches=(
-                DeclarationShapeSearch(
-                    family=DeclarationFamily.DECLARATION_SHAPE,
-                    classes=self.classes,
-                    functions=self.functions,
-                ),
-            ),
+            searches=(search,),
             max_cells=64,
             mosaic=MosaicLimits(enabled=False),
         )

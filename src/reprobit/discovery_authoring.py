@@ -100,7 +100,7 @@ class DeclarationShapeEqualBodyAuthoring:
     donor: AuthoredClassicRecord
     function: AuthoredClassicRecord
     candidate_object: bytes
-    composition_proof: StrictEqualBodyCompositionProof
+    composition_proof: StrictEqualBodyCompositionProof | None
 
     @property
     def records(self) -> tuple[AuthoredClassicRecord, AuthoredClassicRecord]:
@@ -485,11 +485,6 @@ def build_declaration_shape_equal_body(
     relocation identity, line rows, and the closed FPO debug-child shape.
     """
 
-    if type(seed_object) is not bytes or not seed_object:
-        raise DiscoveryAuthoringError("seed_object must be non-empty immutable bytes")
-    if type(donor_object) is not bytes or not donor_object:
-        raise DiscoveryAuthoringError("donor_object must be non-empty immutable bytes")
-
     donor = build_declaration_shape_donor(
         target_id=target_id,
         translation_unit_id=translation_unit_id,
@@ -498,6 +493,38 @@ def build_declaration_shape_equal_body(
         functions=functions,
         beneficiary_symbols=(symbol,),
     )
+    return build_donor_equal_body(
+        donor=donor,
+        target_id=target_id,
+        translation_unit_id=translation_unit_id,
+        build_target=build_target,
+        symbol=symbol,
+        seed_object=seed_object,
+        donor_object=donor_object,
+    )
+
+
+def build_donor_equal_body(
+    *,
+    donor: AuthoredClassicRecord,
+    target_id: str,
+    translation_unit_id: str,
+    build_target: str,
+    symbol: str,
+    seed_object: bytes,
+    donor_object: bytes,
+) -> DeclarationShapeEqualBodyAuthoring:
+    """Author a strict equal-body consumer of an already authored donor record.
+
+    ``donor`` is any payload-free declaration donor (a declaration shape or an
+    extern run) whose beneficiaries name ``symbol``. Both objects must be fresh
+    COFF bytes from the caller's project-aware compiler lane.
+    """
+
+    if type(seed_object) is not bytes or not seed_object:
+        raise DiscoveryAuthoringError("seed_object must be non-empty immutable bytes")
+    if type(donor_object) is not bytes or not donor_object:
+        raise DiscoveryAuthoringError("donor_object must be non-empty immutable bytes")
     template: dict[str, Any] = {
         "mangled": symbol,
         "splice_class": ClassicRecipeFamily.EQUAL_BODY_STRICT.value,
@@ -605,6 +632,69 @@ def build_measured_function_record(
     checks reject the pair raises ``DiscoveryAuthoringError``.
     """
 
+    record, _candidate = _measured_function(
+        target_id=target_id,
+        translation_unit_id=translation_unit_id,
+        build_target=build_target,
+        symbol=symbol,
+        family=family,
+        donor_id=donor_id,
+        seed_object=seed_object,
+        donor_object=donor_object,
+        rationale=_REAUTHORED_FUNCTION_RATIONALE,
+    )
+    return record
+
+
+def build_donor_reloc_layout_equal_body(
+    *,
+    donor: AuthoredClassicRecord,
+    target_id: str,
+    translation_unit_id: str,
+    build_target: str,
+    symbol: str,
+    seed_object: bytes,
+    donor_object: bytes,
+) -> DeclarationShapeEqualBodyAuthoring:
+    """Author an equal-body consumer that admits compile-order symbol renames.
+
+    The strict splice refuses any relocation rename. A declaration donor also
+    renumbers the ``<name>$S<serial>`` file statics it precedes, which the
+    relocation-layout family's closed checks admit when base name, type and
+    storage stay the same.
+    """
+
+    record, candidate = _measured_function(
+        target_id=target_id,
+        translation_unit_id=translation_unit_id,
+        build_target=build_target,
+        symbol=symbol,
+        family=ClassicRecipeFamily.EQUAL_BODY_EH_RELOC_LAYOUT,
+        donor_id=donor.intervention.id,
+        seed_object=seed_object,
+        donor_object=donor_object,
+        rationale=_FUNCTION_RATIONALE,
+    )
+    return DeclarationShapeEqualBodyAuthoring(
+        donor=donor,
+        function=record,
+        candidate_object=candidate,
+        composition_proof=None,
+    )
+
+
+def _measured_function(
+    *,
+    target_id: str,
+    translation_unit_id: str,
+    build_target: str,
+    symbol: str,
+    family: ClassicRecipeFamily,
+    donor_id: str,
+    seed_object: bytes,
+    donor_object: bytes,
+    rationale: str,
+) -> tuple[AuthoredClassicRecord, bytes]:
     if family not in REAUTHORABLE_FAMILIES:
         raise DiscoveryAuthoringError(f"{family.value} records cannot be measured into existence")
     if type(seed_object) is not bytes or not seed_object:
@@ -635,7 +725,7 @@ def build_measured_function_record(
         intervention = ClassicRecipeIntervention(
             id=intervention_id,
             scope=scope,
-            rationale=_REAUTHORED_FUNCTION_RATIONALE,
+            rationale=rationale,
             dependencies=(donor_id,),
             family=family,
             role=ClassicRecipeRole.FUNCTION,
@@ -652,7 +742,7 @@ def build_measured_function_record(
         candidate = ClassicFamilyDispatcher().dispatch(intervention, materials)
         if candidate.output == seed_object:
             raise DiscoveryAuthoringError("composer did not change the seed object")
-        return AuthoredClassicRecord(intervention, receipt)
+        return AuthoredClassicRecord(intervention, receipt), candidate.output
     except DiscoveryAuthoringError:
         raise
     except (ByteIdentityError, ClassicProjectError, DonorSourceError, ValidationError) as exc:

@@ -24,6 +24,7 @@ from reprobit.discovery_contracts import enumerate_declaration_states
 from reprobit.discovery_grind import (
     ColdTrialEvidence,
     ProjectGrindCallbacks,
+    describe_state,
     require_single_acceptance,
     run_project_grind,
 )
@@ -400,7 +401,7 @@ def command_discover_grind(
             f"{grind_report_line}"
         )
     elif result.published:
-        classes, functions = (solution.state.parameter(name) for name in ("classes", "functions"))
+        declarations = describe_state(solution.state)
         intervention_file, proof_file = solution.authority_files
         saved_summary = (
             "ReproBit saved 1 function intervention, reused the matching shared donor, "
@@ -423,7 +424,7 @@ def command_discover_grind(
         next_step = NextStep(verify_argv if result.exact else continue_argv)
         message = (
             f"{outcome_label} saved for '{solution.symbol}': "
-            f"classes={classes}, functions={functions}.\n"
+            f"{declarations}.\n"
             f"{verdict_line} {saved_summary} in one safe update.\n"
             f"Changed: {intervention_file}, {proof_file}\n"
             f"Added cost: {solution.added_cost} relative points.\n"
@@ -434,7 +435,7 @@ def command_discover_grind(
         )
     else:
         next_step = NextStep(approval_argv)
-        classes, functions = (solution.state.parameter(name) for name in ("classes", "functions"))
+        declarations = describe_state(solution.state)
         reuse_line = (
             "Approval will save 1 function intervention, reuse the matching shared donor, "
             "and update its cost assignment.\n"
@@ -453,7 +454,7 @@ def command_discover_grind(
         )
         message = (
             f"{outcome_label} found for '{solution.symbol}': "
-            f"classes={classes}, functions={functions}.\n"
+            f"{declarations}.\n"
             f"{verdict_line} Only review reports were written; project files stayed unchanged.\n"
             f"{reuse_line}"
             f"Added cost if approved: {solution.added_cost} relative points.\n"
