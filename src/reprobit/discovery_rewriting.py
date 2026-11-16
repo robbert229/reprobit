@@ -14,6 +14,7 @@ is the project-owned COFF the grind plan names.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from typing import Any, cast
 
 from pydantic import ValidationError
@@ -48,7 +49,12 @@ from reprobit.classic.scheduling_apply import (
 )
 from reprobit.classic.scheduling_certificates import measure_instruction_schedule_debug_envelope
 from reprobit.classic.scheduling_dependence import (
+    IA32_SCHEDULE_IMMEDIATE_PUSH_THEOREM,
+    ScheduleTheoremContext,
+    _ia32_schedule_immediate_push_projection,
+    ia32_esp_relative_displacement,
     ia32_schedule_dependence_edges,
+    ia32_schedule_exact_immediate_push,
     ia32_schedule_stack_adjustments,
 )
 from reprobit.classic_donors import DonorSourceError, merge_candidate_constraints
@@ -93,22 +99,86 @@ _RELOCATION_FIELDS = (
 )
 
 
-def _window_order(pieces: list[bytes], target: bytes) -> list[int] | None:
-    """A permutation of ``pieces`` whose concatenation is ``target``, if any."""
+# The most candidate orders one window may try before it grows; identical
+# pieces with an ESP displacement are the only source of more than one.
+_MAX_WINDOW_CANDIDATES = 4096
+
+
+def _window_orders(
+    pieces: list[bytes], masks: list[tuple[int, int] | None], target: bytes
+) -> Iterator[list[int]]:
+    """Permutations of ``pieces`` whose concatenation is ``target`` outside each mask.
+
+    A piece's mask is its direct ESP displacement field, which a stack rebase
+    may change; every other byte must match exactly.  Identical unmasked
+    pieces are interchangeable, so only the lowest unused one is tried, which
+    keeps their source order.
+    """
+
+    def fits(index: int, cursor: int) -> bool:
+        piece = pieces[index]
+        chunk = target[cursor : cursor + len(piece)]
+        if len(chunk) != len(piece):
+            return False
+        mask = masks[index]
+        if mask is None:
+            return chunk == piece
+        low, high = mask
+        return chunk[:low] == piece[:low] and chunk[high:] == piece[high:]
 
     order: list[int] = []
     used: set[int] = set()
-    cursor = 0
-    while cursor < len(target):
+
+    def walk(cursor: int) -> Iterator[list[int]]:
+        if cursor == len(target):
+            if len(order) == len(pieces):
+                yield list(order)
+            return
+        tried: set[bytes] = set()
         for index, piece in enumerate(pieces):
-            if index not in used and target[cursor : cursor + len(piece)] == piece:
-                order.append(index)
-                used.add(index)
-                cursor += len(piece)
-                break
-        else:
+            if index in used or not fits(index, cursor):
+                continue
+            if masks[index] is None:
+                if piece in tried:
+                    continue
+                tried.add(piece)
+            order.append(index)
+            used.add(index)
+            yield from walk(cursor + len(piece))
+            order.pop()
+            used.discard(index)
+
+    yield from walk(0)
+
+
+def _rebased_window(
+    body: bytes,
+    inside: list[dict[str, Any]] | None,
+    pieces: list[bytes],
+    order: list[int],
+    context: str,
+) -> bytes | None:
+    """The window's bytes in ``order`` after the derived ESP rebase, or None.
+
+    The rebase is `ia32_schedule_stack_adjustments` in the immediate-push
+    theorem's scope (register and exact immediate PUSHes); a rebase that
+    would grow an encoding refuses, and so does this order.  Without decoded
+    instructions no rebase is possible and the pieces are joined as they are.
+    """
+
+    rebased = [bytearray(piece) for piece in pieces]
+    if inside is not None:
+        try:
+            adjustments = ia32_schedule_stack_adjustments(
+                body, inside, order, context, immediate_push=True
+            )
+        except ByteIdentityError:
             return None
-    return order if len(order) == len(pieces) else None
+        for index, at, _old, new in adjustments:
+            found = cast(tuple[Any, ...], ia32_esp_relative_displacement(body, inside[index]))
+            local = at - int(inside[index]["offset"])
+            rebased[index][local : local + found[1]] = new.to_bytes(found[1], "little", signed=True)
+    return b"".join(bytes(rebased[source]) for source in order)
 
 
 # The alignment fill MSVC 5.0 emits between a function's last instruction and
@@ -178,13 +248,16 @@ def derive_schedule_windows(
     target_body: bytes,
     spans: list[tuple[int, int]],
     relocation_offsets: frozenset[int],
+    relocations: dict[int, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """The smallest reorder windows that turn ``donor_body`` into ``target_body``.
 
     Each window spans whole donor instructions, holds no relocated byte, and
-    the target bytes over it are a permutation of its instructions.  A window
-    grows one instruction at a time, up to ``MAX_WINDOW_INSTRUCTIONS``, until
-    that holds; overlapping windows merge.
+    the target bytes over it are its instructions in some order, each direct
+    ESP displacement rebased across the PUSHes it crosses exactly as
+    `ia32_schedule_stack_adjustments` derives it.  A window grows one
+    instruction at a time, up to ``MAX_WINDOW_INSTRUCTIONS``, until that
+    holds; overlapping windows merge.
     """
 
     if len(donor_body) != len(target_body):
@@ -203,6 +276,45 @@ def derive_schedule_windows(
     for position, (start, length) in enumerate(spans):
         for offset in range(start, start + length):
             position_of[offset] = position
+    decoded: dict[int, dict[str, Any] | None] = {}
+
+    def decode(position: int) -> dict[str, Any] | None:
+        if position not in decoded:
+            try:
+                decoded[position] = decode_ia32_bijection_instruction(
+                    donor_body, spans[position][0], "window derivation", relocations
+                )
+            except ByteIdentityError:
+                decoded[position] = None
+        return decoded[position]
+
+    def search(first: int, last: int) -> list[int] | None:
+        start = spans[first][0]
+        end = spans[last][0] + spans[last][1]
+        if relocation_offsets.intersection(range(start, end)):
+            return None
+        pieces = [donor_body[s : s + n] for s, n in spans[first : last + 1]]
+        items = [decode(position) for position in range(first, last + 1)]
+        inside = None if any(item is None for item in items) else cast(list[dict[str, Any]], items)
+        masks: list[tuple[int, int] | None] = []
+        for piece_start, item in zip((s for s, _n in spans[first : last + 1]), items, strict=True):
+            found = None if item is None else ia32_esp_relative_displacement(donor_body, item)
+            if found is None or found[0] == "no_displacement":
+                masks.append(None)
+            else:
+                masks.append((found[0] - piece_start, found[0] - piece_start + found[1]))
+        identity = list(range(len(pieces)))
+        target = target_body[start:end]
+        for count, order in enumerate(_window_orders(pieces, masks, target)):
+            if count >= _MAX_WINDOW_CANDIDATES:
+                break
+            if (
+                order != identity
+                and _rebased_window(donor_body, inside, pieces, order, "window derivation")
+                == target
+            ):
+                return order
+        return None
 
     windows: list[tuple[int, int, list[int]]] = []
     pending = sorted({position_of[offset] for offset in differing})
@@ -213,14 +325,10 @@ def derive_schedule_windows(
             last += 1
         found: tuple[int, int, list[int]] | None = None
         while last - first + 1 <= MAX_WINDOW_INSTRUCTIONS:
-            start = spans[first][0]
-            end = spans[last][0] + spans[last][1]
-            if not relocation_offsets.intersection(range(start, end)):
-                pieces = [donor_body[s : s + n] for s, n in spans[first : last + 1]]
-                order = _window_order(pieces, target_body[start:end])
-                if order is not None and order != list(range(len(pieces))):
-                    found = (first, last, order)
-                    break
+            order = search(first, last)
+            if order is not None:
+                found = (first, last, order)
+                break
             grow_left = first > 0 and (last - first) % 2 == 0
             if grow_left:
                 first -= 1
@@ -536,8 +644,14 @@ def _window_pins(
     line_rows: list[tuple[int, int]],
     image_index: dict[int, int],
     context: str,
+    relocated_offsets: frozenset[int] = frozenset(),
 ) -> dict[str, Any]:
-    """Measure one window's dependence DAG, stack adjustments and line attribution."""
+    """Measure one window's dependence DAG, stack adjustments and line attribution.
+
+    A window that moves a direct ESP operand across an exact immediate PUSH
+    declares the immediate-push theorem, whose scope counts that PUSH as the
+    stack update it is; every other window is measured exactly as before.
+    """
 
     start, end, order = window["start"], window["end"], list(window["target_order"])
     inside = []
@@ -545,8 +659,35 @@ def _window_pins(
     for length in window["source_instruction_lengths"]:
         inside.append(decode_ia32_bijection_instruction(body, cursor, context, relocations))
         cursor += length
-    stack = ia32_schedule_stack_adjustments(body, inside, order, context)
-    _facts, edges = ia32_schedule_dependence_edges(inside, context, body, bool(stack))
+    position = {source: target for target, source in enumerate(order)}
+    immediate_push = any(
+        (push < operand) != (position[push] < position[operand])
+        for push, pushed in enumerate(inside)
+        if ia32_schedule_exact_immediate_push(body, pushed)
+        for operand, item in enumerate(inside)
+        if ia32_esp_relative_displacement(body, item) is not None
+    )
+    stack = ia32_schedule_stack_adjustments(
+        body, inside, order, context, immediate_push=immediate_push
+    )
+    facts, edges = ia32_schedule_dependence_edges(
+        inside, context, body, bool(stack), immediate_push=immediate_push
+    )
+    if immediate_push:
+        edges, _receipt = _ia32_schedule_immediate_push_projection(
+            ScheduleTheoremContext(
+                instructions=inside,
+                facts=facts,
+                strict_edges=edges,
+                order=order,
+                theorem=IA32_SCHEDULE_IMMEDIATE_PUSH_THEOREM,
+                body=body,
+                compiler_identity=None,
+            ),
+            stack,
+            frozenset(offset for offset in relocated_offsets if start <= offset < end),
+            context,
+        )
     require_topological_instruction_order(len(inside), edges, order, context)
     attribution = [
         [offset, line, order[image_index[offset] - image_index[start]]]
@@ -561,6 +702,8 @@ def _window_pins(
     }
     if stack:
         pins["stack_adjustments"] = stack
+    if immediate_push:
+        pins["stack_frontier_theorem"] = IA32_SCHEDULE_IMMEDIATE_PUSH_THEOREM
     return pins
 
 
@@ -638,7 +781,7 @@ def build_donor_schedule_rewriting(
         swaps: list[dict[str, Any]] = []
         try:
             decisions = derive_schedule_windows(
-                donor_body, target_body, spans, relocated_byte_offsets(rows)
+                donor_body, target_body, spans, relocated_byte_offsets(rows), relocations
             )
         except DiscoveryAuthoringError as window_error:
             decisions = []
@@ -670,14 +813,22 @@ def build_donor_schedule_rewriting(
         line_rows = _moved_line_rows(donor_coff, dp, decisions)
         window_pins = [
             _window_pins(
-                donor_body, window, relocations, line_rows, image_index, f"{context} window {index}"
+                donor_body,
+                window,
+                relocations,
+                line_rows,
+                image_index,
+                f"{context} window {index}",
+                relocated_byte_offsets(rows),
             )
             for index, window in enumerate(decisions)
         ]
-        # A measured stack adjustment is part of the reordering itself.
+        # A measured stack adjustment, and the theorem it needs, are part of
+        # the reordering itself.
         for window, pins in zip(decisions, window_pins, strict=True):
-            if "stack_adjustments" in pins:
-                window["stack_adjustments"] = pins.pop("stack_adjustments")
+            for key in ("stack_adjustments", "stack_frontier_theorem"):
+                if key in pins:
+                    window[key] = pins.pop(key)
         instructions = decode_ia32_bijection_body(
             donor_body, f"{context} pre-image", relocations, view_length
         )
