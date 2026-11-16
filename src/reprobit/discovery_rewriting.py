@@ -32,7 +32,9 @@ from reprobit.classic.coff import (
 )
 from reprobit.classic.composition_mosaic import instruction_mosaic_metadata_sha256
 from reprobit.classic.foundation import sha256_bytes
+from reprobit.classic.register_bijection import apply_register_bijection
 from reprobit.classic.register_semantics import (
+    IA32_GENERAL_REGISTER_NAMES,
     decode_ia32_bijection_body,
     decode_ia32_bijection_instruction,
 )
@@ -184,6 +186,99 @@ def derive_schedule_windows(
     ]
 
 
+_PUSH_R32 = range(0x50, 0x58)
+_POP_R32 = range(0x58, 0x60)
+
+
+def _frame_edges(body: bytes, instructions: list[dict[str, Any]]) -> set[int]:
+    """Indices of the prologue (``sub esp``/register pushes) and every epilogue.
+
+    An epilogue is the run of register pops and ``add esp, imm`` that ends in
+    a ``ret``; those instructions save and restore the caller's registers, so
+    a callee-saved permutation must leave them alone.
+    """
+
+    def is_esp_adjust(item: dict[str, Any]) -> bool:
+        raw = body[item["offset"] : item["offset"] + item["length"]]
+        return raw[:2] in (b"\x83\xec", b"\x81\xec", b"\x83\xc4", b"\x81\xc4")
+
+    frame: set[int] = set()
+    for index, item in enumerate(instructions):
+        if body[item["offset"]] in _PUSH_R32 or is_esp_adjust(item):
+            frame.add(index)
+            continue
+        break
+    for index, item in enumerate(instructions):
+        if item["flow"] != "ret":
+            continue
+        frame.add(index)
+        cursor = index - 1
+        while cursor >= 0 and (
+            body[instructions[cursor]["offset"]] in _POP_R32 or is_esp_adjust(instructions[cursor])
+        ):
+            frame.add(cursor)
+            cursor -= 1
+    return frame
+
+
+def derive_register_bijection(
+    donor_body: bytes,
+    target_body: bytes,
+    relocations: dict[int, Any],
+    code_length: int | None,
+) -> dict[str, Any]:
+    """A callee-saved register permutation of the body proper, or refuse.
+
+    Both bodies must decode to the same instruction grid.  The mapping is read
+    from the register fields of every instruction outside the prologue and
+    the epilogues, and must be one bijection of a register set; the regions
+    are the maximal runs of those instructions.
+    """
+
+    donor = decode_ia32_bijection_body(donor_body, "rewriting donor", relocations, code_length)
+    target = decode_ia32_bijection_body(
+        target_body, "rewriting reference", relocations, code_length
+    )
+    if [(item["offset"], item["length"]) for item in donor] != [
+        (item["offset"], item["length"]) for item in target
+    ]:
+        raise DiscoveryAuthoringError("donor and reference instruction grids differ")
+    frame = _frame_edges(donor_body, donor)
+    mapping: dict[str, str] = {}
+    for index, (left, right) in enumerate(zip(donor, target, strict=True)):
+        if index in frame:
+            continue
+        for (left_at, left_shift), (right_at, right_shift) in zip(
+            left["fields"], right["fields"], strict=False
+        ):
+            source = IA32_GENERAL_REGISTER_NAMES[donor_body[left_at] >> left_shift & 7]
+            image = IA32_GENERAL_REGISTER_NAMES[target_body[right_at] >> right_shift & 7]
+            if mapping.setdefault(source, image) != image:
+                raise DiscoveryAuthoringError(
+                    f"register {source} maps to two registers at donor offset {left['offset']}"
+                )
+    mapping = {source: image for source, image in mapping.items() if source != image}
+    if not mapping or set(mapping) != set(mapping.values()):
+        raise DiscoveryAuthoringError("the register differences are not one register bijection")
+    regions: list[list[int]] = []
+    for index, item in enumerate(donor):
+        if index in frame:
+            continue
+        end = item["offset"] + item["length"]
+        if regions and regions[-1][1] == item["offset"]:
+            regions[-1][1] = end
+        else:
+            regions.append([item["offset"], end])
+    decision: dict[str, Any] = {
+        "mapping": dict(sorted(mapping.items())),
+        "region_start": regions[0][0],
+        "region_end": regions[-1][1],
+    }
+    if len(regions) > 1:
+        decision["regions"] = regions
+    return decision
+
+
 def _window_pins(
     body: bytes,
     window: dict[str, Any],
@@ -287,9 +382,19 @@ def build_donor_schedule_rewriting(
         spans, _targets = ia32_schedule_body_walk(
             donor_body, relocations, context, view_length, internal_targets
         )
-        decisions = derive_schedule_windows(
-            donor_body, target_body, spans, relocated_byte_offsets(rows)
-        )
+        bijection: dict[str, Any] | None = None
+        try:
+            decisions = derive_schedule_windows(
+                donor_body, target_body, spans, relocated_byte_offsets(rows)
+            )
+        except DiscoveryAuthoringError as window_error:
+            try:
+                bijection = derive_register_bijection(
+                    donor_body, target_body, relocations, view_length
+                )
+            except DiscoveryAuthoringError:
+                raise window_error from None
+            decisions = []
         image_spans, _ = ia32_schedule_body_walk(
             target_body, relocations, f"{context} image", view_length, internal_targets
         )
@@ -308,6 +413,24 @@ def build_donor_schedule_rewriting(
         instructions = decode_ia32_bijection_body(
             donor_body, f"{context} pre-image", relocations, view_length
         )
+        bijection_pins: dict[str, Any] = {}
+        if bijection is not None:
+            _image, proof = apply_register_bijection(
+                donor_body,
+                bijection["mapping"],
+                [tuple(pair) for pair in bijection["regions"]]
+                if "regions" in bijection
+                else (bijection["region_start"], bijection["region_end"]),
+                relocated_byte_offsets(rows),
+                f"{context} bijection",
+                relocations,
+                view_length,
+                internal_targets,
+            )
+            bijection_pins = {
+                "expected_rewritten_offsets": proof["rewritten_offsets"],
+                "expected_region_instruction_count": proof["region_instruction_count"],
+            }
         seed_functions = function_multiset(seed)
         donor_functions = function_multiset(donor_coff)
         extras = sorted(
@@ -362,13 +485,22 @@ def build_donor_schedule_rewriting(
         for index, pins in enumerate(window_pins):
             for key, value in pins.items():
                 expected[f"donor_rewriting.windows[{index}].{key}"] = value
+        for key, value in bijection_pins.items():
+            expected[f"donor_rewriting.register_bijections[0].{key}"] = value
 
         scope = Scope(target=target_id, translation_unit=translation_unit_id, function=symbol)
         family = ClassicRecipeFamily.RETAIL_EXACT_DONOR_REWRITING
         parameters = (
             ClassicField(
                 name="donor_rewriting",
-                value=cast(JsonValue, {"kind": DONOR_REWRITING_KIND, "windows": decisions}),
+                value=cast(
+                    JsonValue,
+                    {
+                        "kind": DONOR_REWRITING_KIND,
+                        "windows": decisions,
+                        **({"register_bijections": [bijection]} if bijection else {}),
+                    },
+                ),
             ),
         )
         intervention_id = _stable_id(

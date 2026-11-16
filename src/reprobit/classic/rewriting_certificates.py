@@ -455,7 +455,9 @@ def _validate_register_bijections(
         }
         if composed:
             keys.add("debug_s_register_map")
-        exact_audit_keys(item, keys, item_context)
+            exact_audit_keys(item, keys, item_context)
+        else:
+            exact_audit_keys(item, keys | {"regions"}, item_context, optional={"regions"})
         mapping = item.get("mapping")
         require(
             isinstance(mapping, dict)
@@ -503,12 +505,40 @@ def _validate_register_bijections(
                         not set(mapping) & set(earlier["mapping"]),
                         f"{item_context}: overlapping regions rename a common register",
                     )
+        spans = [[start, end]]
+        if "regions" in item:
+            # Several regions share the mapping (a body with more than one
+            # epilogue); region_start/region_end are their overall span.
+            raw_regions = item.get("regions")
+            require(
+                isinstance(raw_regions, list) and 2 <= len(raw_regions) <= 16,
+                f"{item_context}.regions is invalid",
+            )
+            spans = []
+            cursor = start
+            for position, pair in enumerate(raw_regions):
+                require(
+                    isinstance(pair, list)
+                    and len(pair) == 2
+                    and all(type(value) is int for value in pair)
+                    and cursor <= pair[0] < pair[1] <= end,
+                    f"{item_context}.regions[{position}] is invalid or out of order",
+                )
+                spans.append([pair[0], pair[1]])
+                cursor = pair[1]
+            require(
+                spans[0][0] == start and spans[-1][1] == end,
+                f"{item_context}.regions do not span region_start..region_end",
+            )
         offsets = item.get("expected_rewritten_offsets")
         require(
             isinstance(offsets, list)
             and bool(offsets)
             and (offsets == sorted(set(offsets)))
-            and all(type(offset) is int and start <= offset < end for offset in offsets),
+            and all(
+                type(offset) is int and any(left <= offset < right for left, right in spans)
+                for offset in offsets
+            ),
             f"{item_context}.expected_rewritten_offsets is invalid",
         )
         bijection_bytes.extend(offsets)
@@ -559,6 +589,8 @@ def _validate_register_bijections(
             ),
             "expected_rewritten_offsets": list(offsets),
         }
+        if len(spans) > 1:
+            normalized_item["regions"] = spans
         if composed:
             normalized_item["debug_s_register_map"] = normalized_map
         normalized_bijections.append(normalized_item)
