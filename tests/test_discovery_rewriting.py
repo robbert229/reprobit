@@ -328,3 +328,13 @@ def test_sib_swaps_are_derived_only_when_they_explain_every_difference() -> None
     ]
     with pytest.raises(DiscoveryAuthoringError, match="operand order"):
         derive_sib_operand_swaps(body, bytes.fromhex("8d04128b4c1804c3"), {}, None)
+
+
+def test_a_local_register_permutation_gets_its_own_region() -> None:
+    from reprobit.discovery_rewriting import derive_regional_bijections
+
+    # mov ecx, [esp+4]; mov edx, [esp+8]; add ecx, edx; mov eax, ecx; ret
+    body = bytes.fromhex("8b4c24048b54240803ca8bc1c3")
+    target = bytes.fromhex("8b5424048b4c240803d18bc2c3")
+    items = derive_regional_bijections(body, target, {}, None, frozenset(), frozenset())
+    assert items == [{"mapping": {"ecx": "edx", "edx": "ecx"}, "region_start": 0, "region_end": 14}]
