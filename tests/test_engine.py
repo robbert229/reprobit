@@ -568,6 +568,105 @@ def test_toolchain_header_root_is_bound_to_complete_portable_tree_lock(
     assert [code for _claim, code, _message in issues] == ["toolchain-root-lock"]
 
 
+@pytest.mark.parametrize(
+    "variant",
+    ("authenticated", "unlocked-input", "unreviewed-input", "other-path", "tampered"),
+)
+def test_staged_link_runtime_root_is_bound_to_its_locked_derivation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    variant: str,
+) -> None:
+    from reprobit import msvc50_link_runtime
+    from reprobit.msvc50_authorities import Msvc50FileAuthority
+
+    sources = {
+        source: f"reviewed {source}".encode()
+        for source, _ in msvc50_link_runtime.STAGED_SOURCES.values()
+    }
+    staged_payload = b"staged link.exe"
+    monkeypatch.setattr(
+        msvc50_link_runtime,
+        "MSVC50_FILE_AUTHORITIES",
+        {
+            "synthetic": {
+                path: Msvc50FileAuthority(len(payload), digest_bytes(payload))
+                for path, payload in sources.items()
+            }
+        },
+    )
+    monkeypatch.setattr(
+        msvc50_link_runtime,
+        "MSVC50_NATIVE_CRT_LINK_AUTHORITIES",
+        {
+            "synthetic": {
+                "link.exe": Msvc50FileAuthority(len(staged_payload), digest_bytes(staged_payload))
+            }
+        },
+    )
+    locked_sources = dict(sources)
+    if variant == "unlocked-input":
+        del locked_sources["bin/msdis100.dll"]
+    if variant == "unreviewed-input":
+        locked_sources["bin/msvcrt.dll"] = b"Wine's builtin msvcrt"
+    bundle, _provider = _bundle(tmp_path, b"exact")
+    bundle = bundle.model_copy(
+        update={
+            "toolchain_lock": bundle.toolchain_lock.model_copy(
+                update={
+                    "profile": "synthetic",
+                    "tools": tuple(
+                        LockedTool(
+                            id=f"tool.{index}",
+                            path=path,
+                            digest=Digest.from_bytes(payload),
+                            size=len(payload),
+                        )
+                        for index, (path, payload) in enumerate(sorted(locked_sources.items()))
+                    ),
+                }
+            )
+        }
+    )
+    staged = tmp_path / "toolchain" / msvc50_link_runtime.STAGED_DIRECTORY / "link.exe"
+    staged.parent.mkdir(parents=True)
+    staged.write_bytes(b"staged LINK.EXE" if variant == "tampered" else staged_payload)
+    directory = "bin" if variant == "other-path" else msvc50_link_runtime.STAGED_DIRECTORY
+    artifact = Artifact(
+        id="toolchain.staged-link",
+        kind=ArtifactKind.TOOLCHAIN,
+        logical_path=rf"R:\toolchain\{directory}\link.exe",
+        digest=Digest.from_bytes(staged.read_bytes()),
+        size=staged.stat().st_size,
+        origin=ArtifactOrigin.FRESH_SEED,
+        receipt_path=str(staged.resolve()),
+    )
+    node = ProvenanceNode(
+        id="toolchain.staged-link.root",
+        kind=ProvenanceKind.TOOLCHAIN,
+        operation="locked_toolchain",
+        origin=ArtifactOrigin.FRESH_SEED,
+        artifact_id=artifact.id,
+    )
+    build = BuildExecutionReceipt(
+        cold=True,
+        inputs=(FileReceipt(staged, artifact.digest, artifact.size, fresh=False),),
+        outputs=(),
+        steps=(),
+    )
+    issues: list[tuple[EvidenceClaim, str, str]] = []
+    EvidenceAuditor._validate_input_roots(
+        bundle,
+        build,
+        {artifact.id: artifact},
+        {node.id: node},
+        lambda claim, code, message: issues.append((claim, code, message)),
+    )
+
+    expected = [] if variant == "authenticated" else ["toolchain-root-lock"]
+    assert [code for _claim, code, _message in issues] == expected
+
+
 def test_engine_runs_build_verifies_evidence_and_materializes_reports(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

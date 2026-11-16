@@ -138,8 +138,11 @@ def producer_cache_key(material: dict[str, JsonValue]) -> str:
         "composition_inputs",
         "transform_inputs",
     }
+    # The staged MSVC 5.0 LINK runtime's identity, present only in link and
+    # analysis-link keys (reprobit.msvc50_link_runtime).
+    optional = {"link_runtime"}
     missing = required - set(material)
-    extra = set(material) - required
+    extra = set(material) - required - optional
     if missing or extra:
         raise IncrementalAuthorityError(
             f"producer cache key material field mismatch; missing={sorted(missing)}, "
