@@ -33,7 +33,59 @@ def _ia32_schedule_flag_table() -> dict[int, tuple[bool, bool]]:
     for index in range(8):
         table[80 + index] = (False, False)
     table[0x6A] = (False, False)
+    # IMUL r32, r/m32: OF/CF written, the rest undefined -- all flags written.
+    table[0xFAF] = (False, True)
+    # The x87 escapes leave EFLAGS alone; ia32_schedule_instruction_facts
+    # refines each one (memory form, FCOMI-family flag writers, FNSTSW AX).
+    for opcode in range(0xD8, 0xE0):
+        table[opcode] = (False, False)
     return table
+
+
+IA32_SCHEDULE_X87_STATE = "x87"
+_X87_READ, _X87_WRITE = (True, False), (False, True)
+
+
+def _ia32_x87_memory_forms() -> dict[tuple[int, int], tuple[bool, bool, int]]:
+    """(opcode, ModRM reg) of each admitted x87 memory form -> (reads, writes, width)."""
+
+    forms: dict[tuple[int, int], tuple[bool, bool, int]] = {}
+    for reg in range(8):
+        forms[(0xD8, reg)] = (*_X87_READ, 4)  # arithmetic/compare, m32real
+        forms[(0xDA, reg)] = (*_X87_READ, 4)  # arithmetic/compare, m32int
+        forms[(0xDC, reg)] = (*_X87_READ, 8)  # arithmetic/compare, m64real
+        forms[(0xDE, reg)] = (*_X87_READ, 2)  # arithmetic/compare, m16int
+    forms.update(
+        {
+            (0xD9, 0): (*_X87_READ, 4),  # FLD m32real
+            (0xD9, 2): (*_X87_WRITE, 4),  # FST m32real
+            (0xD9, 3): (*_X87_WRITE, 4),  # FSTP m32real
+            (0xD9, 5): (*_X87_READ, 2),  # FLDCW m16
+            (0xD9, 7): (*_X87_WRITE, 2),  # FNSTCW m16
+            (0xDB, 0): (*_X87_READ, 4),  # FILD m32int
+            (0xDB, 2): (*_X87_WRITE, 4),  # FIST m32int
+            (0xDB, 3): (*_X87_WRITE, 4),  # FISTP m32int
+            (0xDB, 5): (*_X87_READ, 10),  # FLD m80real
+            (0xDB, 7): (*_X87_WRITE, 10),  # FSTP m80real
+            (0xDD, 0): (*_X87_READ, 8),  # FLD m64real
+            (0xDD, 2): (*_X87_WRITE, 8),  # FST m64real
+            (0xDD, 3): (*_X87_WRITE, 8),  # FSTP m64real
+            (0xDD, 7): (*_X87_WRITE, 2),  # FNSTSW m16
+            (0xDF, 0): (*_X87_READ, 2),  # FILD m16int
+            (0xDF, 2): (*_X87_WRITE, 2),  # FIST m16int
+            (0xDF, 3): (*_X87_WRITE, 2),  # FISTP m16int
+            (0xDF, 4): (*_X87_READ, 10),  # FBLD m80bcd
+            (0xDF, 5): (*_X87_READ, 8),  # FILD m64int
+            (0xDF, 6): (*_X87_WRITE, 10),  # FBSTP m80bcd
+            (0xDF, 7): (*_X87_WRITE, 8),  # FISTP m64int
+        }
+    )
+    return forms
+
+
+_IA32_X87_MEMORY_FORMS = _ia32_x87_memory_forms()
+# FUCOMI/FCOMI and their popping forms write ZF/PF/CF.
+_IA32_X87_FLAG_WRITERS = frozenset({(0xDB, 5), (0xDB, 6), (0xDF, 5), (0xDF, 6)})
 
 
 _IA32_SCHEDULE_REGISTER_PUSH_OPCODES = frozenset(range(0x50, 0x58))
@@ -205,6 +257,33 @@ def ia32_schedule_instruction_facts(instruction: dict[str, Any], context: str) -
         f"{context}: a control-transfer instruction is outside the instruction-schedule table",
     )
     memory = instruction["memory"]
+    reads = instruction["reads"]
+    writes = instruction["writes"]
+    if 0xD8 <= opcode <= 0xDF:
+        # Every x87 instruction reads and writes the FPU register stack, its
+        # status and its control word, so x87 instructions never reorder
+        # among themselves; only their exact memory operands and integer
+        # registers order them against other instructions.
+        encoding = instruction["encoding"]
+        require(encoding is not None, f"{context}: an x87 instruction lacks its ModRM")
+        form = (opcode, encoding["reg"])
+        reads = frozenset(reads) | {IA32_SCHEDULE_X87_STATE}
+        writes = frozenset(writes) | {IA32_SCHEDULE_X87_STATE}
+        if encoding["mode"] == 3:
+            require(memory is None, f"{context}: an x87 register form reports memory")
+            if form in _IA32_X87_FLAG_WRITERS:
+                flag_effect = (False, True)
+            if opcode == 0xDF and encoding["reg"] == 4 and encoding["rm"] == 0:
+                writes = writes | {"eax"}  # FNSTSW AX
+        else:
+            semantics = _IA32_X87_MEMORY_FORMS.get(form)
+            require(
+                semantics is not None,
+                f"{context}: x87 form 0x{opcode:02x} /{encoding['reg']} is outside the instruction-schedule table",
+            )
+            require(memory is not None, f"{context}: an x87 memory form reports no memory")
+            read, write, width = cast(tuple[bool, bool, int], semantics)
+            memory = {**memory, "read": read, "write": write, "width": width}
     if opcode in _IA32_SCHEDULE_STACK_PUSH_OPCODES:
         require(
             memory is None, f"{context}: a register push also reports an explicit memory operand"
@@ -242,8 +321,8 @@ def ia32_schedule_instruction_facts(instruction: dict[str, Any], context: str) -
         "offset": instruction["offset"],
         "length": instruction["length"],
         "opcode": opcode,
-        "reads": instruction["reads"],
-        "writes": instruction["writes"],
+        "reads": reads,
+        "writes": writes,
         "reads_flags": flag_effect[0],
         "writes_flags": flag_effect[1],
         "memory": memory,

@@ -121,3 +121,52 @@ def test_a_reference_no_window_reaches_authors_nothing() -> None:
             donor_object=seed,
             reference_object=make_coff(body=bytes(wrong)),
         )
+
+
+def _facts(body: bytes) -> list[dict]:
+    from reprobit.classic.register_semantics import decode_ia32_bijection_instruction
+    from reprobit.classic.scheduling_dependence import ia32_schedule_instruction_facts
+
+    facts, offset = [], 0
+    for length in [item[1] for item in _spans(body)]:
+        item = decode_ia32_bijection_instruction(body, offset, "test")
+        facts.append(ia32_schedule_instruction_facts(item, "test"))
+        offset += length
+    return facts
+
+
+def test_x87_memory_forms_carry_their_direction_and_width() -> None:
+    # fld dword [esp+8]; fstp qword [esp+16]; fild dword [esp+4]; fistp dword [esp]
+    facts = _facts(bytes.fromhex("d9442408dd5c2410db442404db1c24"))
+    memory = [
+        (item["memory"]["read"], item["memory"]["write"], item["memory"]["width"]) for item in facts
+    ]
+    assert memory == [(True, False, 4), (False, True, 8), (True, False, 4), (False, True, 4)]
+    assert all("x87" in item["reads"] and "x87" in item["writes"] for item in facts)
+
+
+def test_x87_instructions_stay_ordered_and_integer_ones_cross_them() -> None:
+    from reprobit.classic.register_semantics import decode_ia32_bijection_instruction
+    from reprobit.classic.scheduling_dependence import ia32_schedule_dependence_edges
+
+    # fld st(0); mov eax, ecx; fmulp st(1)
+    body = bytes.fromhex("d9c08bc1dec9")
+    items, offset = [], 0
+    for length in [item[1] for item in _spans(body)]:
+        items.append(decode_ia32_bijection_instruction(body, offset, "test"))
+        offset += length
+    _, edges = ia32_schedule_dependence_edges(items, "test", body)
+    assert [edge[:2] for edge in edges] == [[0, 2]]
+
+
+def test_fnstsw_ax_writes_eax_and_imul_writes_flags() -> None:
+    fnstsw, imul = _facts(bytes.fromhex("dfe00fafc1"))
+    assert "eax" in fnstsw["writes"]
+    assert imul["writes_flags"] and not imul["reads_flags"]
+
+
+def test_an_unlisted_x87_memory_form_is_refused() -> None:
+    from reprobit.binary import ByteIdentityError
+
+    with pytest.raises(ByteIdentityError, match="x87 form"):
+        _facts(bytes.fromhex("d93424"))  # fnstenv [esp]
