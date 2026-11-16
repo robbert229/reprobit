@@ -212,3 +212,61 @@ def test_a_register_mapped_two_ways_is_not_a_bijection() -> None:
     partly[17:19] = bytes.fromhex("8bf2")  # the second exit keeps mov esi, edx: esi maps two ways
     with pytest.raises(DiscoveryAuthoringError):
         derive_register_bijection(TWO_EXIT, bytes(partly), {}, None)
+
+
+def test_grind_falls_back_to_a_same_slot_resize_when_the_splices_refuse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    import reprobit.discovery_grind as grind
+    from reprobit.discovery_project import DeclarationFamily
+
+    calls: list[str] = []
+
+    def refuse(name: str):
+        def builder(**_kwargs):
+            calls.append(name)
+            raise DiscoveryAuthoringError(f"{name} refused")
+
+        return builder
+
+    record = SimpleNamespace(intervention=SimpleNamespace(id="f"), receipt=None)
+
+    def measured(**kwargs):
+        calls.append(kwargs["family"].value)
+        return record
+
+    monkeypatch.setattr(grind, "build_donor_equal_body", refuse("strict"))
+    monkeypatch.setattr(grind, "build_donor_reloc_layout_equal_body", refuse("reloc"))
+    monkeypatch.setattr(grind, "build_measured_function_record", measured)
+    monkeypatch.setattr(
+        grind, "merge_candidate_constraints", lambda *_args: SimpleNamespace(materialize=dict)
+    )
+    monkeypatch.setattr(
+        grind,
+        "ClassicFamilyDispatcher",
+        lambda: SimpleNamespace(dispatch=lambda *_args: SimpleNamespace(output=b"composed")),
+    )
+    monkeypatch.setattr(grind, "_require_grind_family", lambda _state: None)
+    monkeypatch.setattr(
+        grind,
+        "_extern_run",
+        lambda _state: SimpleNamespace(
+            header_prefix="ReproBitPad",
+            header_count=3,
+            seat_prefix="ReproBitPadSeat",
+            seat_count=0,
+            width=3,
+        ),
+    )
+    monkeypatch.setattr(grind, "_header_placement", lambda _context: "after_includes")
+    state = SimpleNamespace(family=DeclarationFamily.EXTERN_RUN_PAIR)
+    context = SimpleNamespace(
+        unit=SimpleNamespace(target_id="program", id=UNIT, build_target="program"),
+        symbol=TARGET_SYMBOL,
+    )
+    authored = grind._state_equal_body(state, context, seed_object=b"s", donor_object=b"d")
+    assert calls == ["strict", "reloc", "same_slot_resize"]
+    assert authored.candidate_object == b"composed"
+    assert authored.function is record

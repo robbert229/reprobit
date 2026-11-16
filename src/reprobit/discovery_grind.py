@@ -18,7 +18,12 @@ from reprobit.authority_snapshot import (
     JsonAuthorityDirectorySnapshot,
     assert_json_authority_unchanged,
 )
-from reprobit.classic_donors import generate_declaration_shape, generate_extern_run
+from reprobit.classic_donors import (
+    generate_declaration_shape,
+    generate_extern_run,
+    merge_candidate_constraints,
+)
+from reprobit.classic_project import ClassicDispatchMaterials, ClassicFamilyDispatcher
 from reprobit.costs import calculate_cost
 from reprobit.discovery_authoring import (
     AuthoredClassicRecord,
@@ -29,6 +34,7 @@ from reprobit.discovery_authoring import (
     build_donor_equal_body,
     build_donor_reloc_layout_equal_body,
     build_extern_run_donor,
+    build_measured_function_record,
     merge_authored_records,
 )
 from reprobit.discovery_contracts import (
@@ -334,7 +340,35 @@ def _state_equal_body(
                 donor_object=donor_object,
             )
         except DiscoveryAuthoringError:
+            pass
+        # A donor whose body has a different length still fits its slot when
+        # the same-slot resize family's closed checks hold.
+        try:
+            record = build_measured_function_record(
+                target_id=unit.target_id,
+                translation_unit_id=unit.id,
+                build_target=unit.build_target,
+                symbol=context.symbol,
+                family=ClassicRecipeFamily.SAME_SLOT_RESIZE,
+                donor_id=donor.intervention.id,
+                seed_object=seed_object,
+                donor_object=donor_object,
+            )
+        except DiscoveryAuthoringError:
             raise strict_error from None
+        candidate = ClassicFamilyDispatcher().dispatch(
+            record.intervention,
+            ClassicDispatchMaterials(
+                seed_object=seed_object,
+                donor_object=donor_object,
+                candidate_constraints=merge_candidate_constraints(
+                    record.intervention, record.receipt
+                ).materialize(),
+            ),
+        )
+        return DeclarationShapeEqualBodyAuthoring(
+            donor=donor, function=record, candidate_object=candidate.output, composition_proof=None
+        )
 
 
 def _state_rewriting(
