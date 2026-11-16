@@ -659,6 +659,11 @@ class DebugFidelityTests(unittest.TestCase):
         self.assertEqual(detail["window_line_rows"], [[8, 12, 3]])
         self.assertEqual(detail["procedure_range"], [SIZE, 2, SIZE - 5])
 
+    def test_a_function_with_only_the_line_sentinel_has_no_rows_to_keep(self):
+        seed = make_coff(line_rows=())
+        detail = self.check(seed, IMAGE, schedule_spec(windows=[window_declaration(line_rows=[])]))
+        self.assertEqual(detail["window_line_rows"], [])
+
     def test_a_line_row_left_off_a_boundary_is_refused(self):
         # offset 15 begins an instruction in the SOURCE order and does not in
         # the image, which is exactly the case obligation 7 exists to catch
