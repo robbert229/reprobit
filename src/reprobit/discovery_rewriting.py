@@ -280,6 +280,118 @@ def derive_register_bijection(
     return decision
 
 
+MAX_BIJECTION_REGION_INSTRUCTIONS = 48
+
+
+def _region_mapping(
+    donor_body: bytes,
+    target_body: bytes,
+    donor: list[dict[str, Any]],
+    target: list[dict[str, Any]],
+    first: int,
+    last: int,
+) -> dict[str, str] | None:
+    """The register permutation the region's fields name, or None."""
+
+    mapping: dict[str, str] = {}
+    for left, right in zip(donor[first : last + 1], target[first : last + 1], strict=True):
+        for (left_at, left_shift), (right_at, right_shift) in zip(
+            left["fields"], right["fields"], strict=False
+        ):
+            source = IA32_GENERAL_REGISTER_NAMES[donor_body[left_at] >> left_shift & 7]
+            image = IA32_GENERAL_REGISTER_NAMES[target_body[right_at] >> right_shift & 7]
+            if mapping.setdefault(source, image) != image:
+                return None
+    moved = {source: image for source, image in mapping.items() if source != image}
+    if not moved or set(moved) != set(moved.values()):
+        return None
+    if any(mapping.get(image, image) != image for image in moved.values() if image not in moved):
+        return None
+    return moved
+
+
+def derive_regional_bijections(
+    donor_body: bytes,
+    target_body: bytes,
+    relocations: dict[int, Any],
+    code_length: int | None,
+    relocation_offsets: frozenset[int],
+    internal_targets: frozenset[int],
+) -> list[dict[str, Any]]:
+    """Disjoint register permutations, each proved over its own region.
+
+    For each run of differing instructions, the smallest enclosing region
+    (growing to ``MAX_BIJECTION_REGION_INSTRUCTIONS``) whose register fields
+    name one permutation, and whose bijection proof turns that region of the
+    donor into the reference, is kept.
+    """
+
+    donor = decode_ia32_bijection_body(donor_body, "rewriting donor", relocations, code_length)
+    target = decode_ia32_bijection_body(
+        target_body, "rewriting reference", relocations, code_length
+    )
+    if [(item["offset"], item["length"]) for item in donor] != [
+        (item["offset"], item["length"]) for item in target
+    ]:
+        raise DiscoveryAuthoringError("donor and reference instruction grids differ")
+    differing = [
+        index
+        for index, item in enumerate(donor)
+        if donor_body[item["offset"] : item["offset"] + item["length"]]
+        != target_body[item["offset"] : item["offset"] + item["length"]]
+    ]
+    if not differing:
+        raise DiscoveryAuthoringError("donor and reference bodies are already identical")
+    items: list[dict[str, Any]] = []
+    covered = -1
+    for index in differing:
+        if index <= covered:
+            continue
+        found = None
+        for size in range(1, MAX_BIJECTION_REGION_INSTRUCTIONS + 1):
+            for first in range(max(covered + 1, index - size + 1), index + 1):
+                last = first + size - 1
+                if last >= len(donor):
+                    break
+                mapping = _region_mapping(donor_body, target_body, donor, target, first, last)
+                if mapping is None:
+                    continue
+                start = donor[first]["offset"]
+                end = donor[last]["offset"] + donor[last]["length"]
+                try:
+                    image, _proof = apply_register_bijection(
+                        donor_body,
+                        mapping,
+                        (start, end),
+                        relocation_offsets,
+                        "regional bijection",
+                        relocations,
+                        code_length,
+                        internal_targets,
+                    )
+                except ByteIdentityError:
+                    continue
+                if image[start:end] == target_body[start:end]:
+                    found = (first, last, mapping)
+                    break
+            if found is not None:
+                break
+        if found is None:
+            raise DiscoveryAuthoringError(
+                f"no register permutation region reaches the reference at {donor[index]['offset']}"
+            )
+        first, last, mapping = found
+        items.append(
+            {
+                "mapping": dict(sorted(mapping.items())),
+                "region_start": donor[first]["offset"],
+                "region_end": donor[last]["offset"] + donor[last]["length"],
+            }
+        )
+        covered = last
+    return items
+
+
 def derive_sib_operand_swaps(
     donor_body: bytes,
     target_body: bytes,
@@ -421,7 +533,7 @@ def build_donor_schedule_rewriting(
         spans, _targets = ia32_schedule_body_walk(
             donor_body, relocations, context, view_length, internal_targets
         )
-        bijection: dict[str, Any] | None = None
+        bijections: list[dict[str, Any]] = []
         swaps: list[dict[str, Any]] = []
         try:
             decisions = derive_schedule_windows(
@@ -430,16 +542,26 @@ def build_donor_schedule_rewriting(
         except DiscoveryAuthoringError as window_error:
             decisions = []
             try:
-                bijection = derive_register_bijection(
-                    donor_body, target_body, relocations, view_length
-                )
+                bijections = [
+                    derive_register_bijection(donor_body, target_body, relocations, view_length)
+                ]
             except DiscoveryAuthoringError:
                 try:
                     swaps = derive_sib_operand_swaps(
                         donor_body, target_body, relocations, view_length
                     )
                 except DiscoveryAuthoringError:
-                    raise window_error from None
+                    try:
+                        bijections = derive_regional_bijections(
+                            donor_body,
+                            target_body,
+                            relocations,
+                            view_length,
+                            relocated_byte_offsets(rows),
+                            internal_targets,
+                        )
+                    except DiscoveryAuthoringError:
+                        raise window_error from None
         image_spans, _ = ia32_schedule_body_walk(
             target_body, relocations, f"{context} image", view_length, internal_targets
         )
@@ -481,10 +603,11 @@ def build_donor_schedule_rewriting(
                 view_length,
             )
             swap_pins = [[site["sib_at"]] for site in swap_proof["sites"]]
-        bijection_pins: dict[str, Any] = {}
-        if bijection is not None:
-            _image, proof = apply_register_bijection(
-                donor_body,
+        bijection_pins: list[dict[str, Any]] = []
+        image_so_far = donor_body
+        for bijection in bijections:
+            image_so_far, proof = apply_register_bijection(
+                image_so_far,
                 bijection["mapping"],
                 [tuple(pair) for pair in bijection["regions"]]
                 if "regions" in bijection
@@ -495,10 +618,12 @@ def build_donor_schedule_rewriting(
                 view_length,
                 internal_targets,
             )
-            bijection_pins = {
-                "expected_rewritten_offsets": proof["rewritten_offsets"],
-                "expected_region_instruction_count": proof["region_instruction_count"],
-            }
+            bijection_pins.append(
+                {
+                    "expected_rewritten_offsets": proof["rewritten_offsets"],
+                    "expected_region_instruction_count": proof["region_instruction_count"],
+                }
+            )
         seed_functions = function_multiset(seed)
         donor_functions = function_multiset(donor_coff)
         extras = sorted(
@@ -553,8 +678,9 @@ def build_donor_schedule_rewriting(
         for index, pins in enumerate(window_pins):
             for key, value in pins.items():
                 expected[f"donor_rewriting.windows[{index}].{key}"] = value
-        for key, value in bijection_pins.items():
-            expected[f"donor_rewriting.register_bijections[0].{key}"] = value
+        for position, pins in enumerate(bijection_pins):
+            for key, value in pins.items():
+                expected[f"donor_rewriting.register_bijections[{position}].{key}"] = value
         for position, rewritten_bytes in enumerate(swap_pins):
             pin = f"donor_rewriting.sib_operand_swaps[{position}].expected_rewritten_offsets"
             expected[pin] = rewritten_bytes
@@ -569,7 +695,7 @@ def build_donor_schedule_rewriting(
                     {
                         "kind": DONOR_REWRITING_KIND,
                         "windows": decisions,
-                        **({"register_bijections": [bijection]} if bijection else {}),
+                        **({"register_bijections": bijections} if bijections else {}),
                         **({"sib_operand_swaps": swaps} if swaps else {}),
                     },
                 ),
