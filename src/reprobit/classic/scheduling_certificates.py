@@ -18,7 +18,12 @@ from .coff import (
     _comdat_child_closure,
     function_symbol,
 )
-from .debug import CODEVIEW_PROCEDURE_RECORD_TYPES, FPO_RECORD_KEYS, parse_codeview_symbol_stream
+from .debug import (
+    CODEVIEW_PROCEDURE_RECORD_TYPES,
+    FPO_RECORD_KEYS,
+    fpo_proc_size_fits,
+    parse_codeview_symbol_stream,
+)
 from .foundation import (
     RelocationView,
     exact_audit_keys,
@@ -155,8 +160,16 @@ def require_instruction_schedule_debug_fidelity(
         [code_length, debug_start, debug_end] == spec["expected_procedure_range"],
         f"{context}: the procedure record's code range differs from its declaration",
     )
+    # The procedure spans the whole body (MSVC 4.20, a switch table included)
+    # or, for MSVC 5.0, the code before the COMDAT's NOP alignment fill.
     require(
-        code_length == len(image), f"{context}: the procedure record's code length is not the body"
+        code_length == len(image)
+        or (
+            view.code_length is not None
+            and code_length == view.code_length
+            and fpo_proc_size_fits(code_length, len(image), image)
+        ),
+        f"{context}: the procedure record's code length is not the body",
     )
     for name, value in (("debug_start", debug_start), ("debug_end", debug_end)):
         require(
