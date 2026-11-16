@@ -338,3 +338,24 @@ def test_a_local_register_permutation_gets_its_own_region() -> None:
     target = bytes.fromhex("8b5424048b4c240803d18bc2c3")
     items = derive_regional_bijections(body, target, {}, None, frozenset(), frozenset())
     assert items == [{"mapping": {"ecx": "edx", "edx": "ecx"}, "region_start": 0, "region_end": 12}]
+
+
+def test_msvc50_code_end_stops_before_a_switch_table() -> None:
+    from reprobit.discovery_rewriting import msvc50_code_end
+
+    # ... ret, nop, mov edi,edi, then two table entries into this section.
+    code = bytes.fromhex("33c0" "c3" "90" "8bff")
+    body = code + bytes(8) + b"\x90" * 4
+    rows = [
+        {"offset": len(code), "width": 4, "target_section": 3},
+        {"offset": len(code) + 4, "width": 4, "target_section": 3},
+    ]
+    assert msvc50_code_end(body, rows, 3, len(code) + 8) == 3
+    # A table into another section is not this body's switch table.
+    other = [dict(row, target_section=7) for row in rows]
+    assert msvc50_code_end(body, other, 3, len(code) + 8) == len(code) + 8
+    # Without a terminal instruction before the fill the extent stands.
+    falls = bytes.fromhex("33c0" "40" "90" "8bff") + bytes(8)
+    assert msvc50_code_end(falls, rows, 3, len(code) + 8) == len(code) + 8
+    # No table: the procedure length stands.
+    assert msvc50_code_end(body, [], 3, len(code) + 8) == len(code) + 8

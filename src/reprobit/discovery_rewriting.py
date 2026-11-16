@@ -19,6 +19,7 @@ from typing import Any, cast
 from pydantic import ValidationError
 
 from reprobit.binary import ByteIdentityError
+from reprobit.ia32_decode import supported_ia32_instruction_length
 from reprobit.classic.address_forms import apply_sib_operand_swaps
 from reprobit.classic.candidate_recipe import (
     internal_relocation_targets,
@@ -108,6 +109,68 @@ def _window_order(pieces: list[bytes], target: bytes) -> list[int] | None:
         else:
             return None
     return order if len(order) == len(pieces) else None
+
+
+# The alignment fill MSVC 5.0 emits between a function's last instruction and
+# a switch table that follows it: nop, mov edi,edi, and the lea no-ops.
+_MSVC50_ALIGNMENT_FILL = frozenset(
+    {
+        b"\x90",
+        b"\x8b\xff",
+        b"\x8d\x49\x00",
+        b"\x8d\x64\x24\x00",
+        b"\x8d\xa4\x24\x00\x00\x00\x00",
+        b"\x8d\x9b\x00\x00\x00\x00",
+    }
+)
+_TERMINAL_OPCODES = frozenset({0xC3, 0xC2, 0xE9, 0xEB})
+
+
+def msvc50_code_end(
+    body: bytes, rows: list[dict[str, Any]], section_number: int, procedure_length: int
+) -> int:
+    """Where a function's code ends, when its procedure extent holds a switch table.
+
+    MSVC 5.0's procedure length covers a switch table placed after the code
+    (and the alignment fill before it), where MSVC 4.20's ended at the code.
+    The table is a run of 4-byte relocations into this same section that ends
+    exactly at the procedure length.  The code then ends at the last
+    ``ret``/``jmp`` before it, provided everything between is alignment fill;
+    otherwise the procedure length stands unchanged.
+    """
+
+    table = sorted(
+        row["offset"]
+        for row in rows
+        if row.get("width") == 4 and row.get("target_section") == section_number
+    )
+    start = procedure_length
+    while start - 4 in table:
+        start -= 4
+    if start == procedure_length:
+        return procedure_length
+    spans = []
+    offset = 0
+    try:
+        while offset < start:
+            length = supported_ia32_instruction_length(body[offset:start], "code end")
+            spans.append((offset, length))
+            offset += length
+    except ByteIdentityError:
+        return procedure_length
+    if offset != start:
+        return procedure_length
+    for index in range(len(spans) - 1, -1, -1):
+        at, length = spans[index]
+        piece = body[at : at + length]
+        if piece in _MSVC50_ALIGNMENT_FILL:
+            continue
+        if piece[0] in _TERMINAL_OPCODES or (
+            piece[0] == 0xFF and length > 1 and piece[1] >> 3 & 7 == 4
+        ):
+            return at + length
+        return procedure_length
+    return procedure_length
 
 
 def derive_schedule_windows(
@@ -528,7 +591,9 @@ def build_donor_schedule_rewriting(
         relocations = relocation_symbol_map(rows)
         internal_targets = internal_relocation_targets(rows, dp["number"])
         envelope = measure_instruction_schedule_debug_envelope(donor_coff, dp, context)
-        code_length = envelope["procedure_range"][0]
+        code_length = msvc50_code_end(
+            donor_body, rows, dp["number"], envelope["procedure_range"][0]
+        )
         view_length = code_length if code_length != len(donor_body) else None
         spans, _targets = ia32_schedule_body_walk(
             donor_body, relocations, context, view_length, internal_targets
