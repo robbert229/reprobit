@@ -375,3 +375,21 @@ def test_producer_key_requires_every_dependency_class() -> None:
     del material["recursive_reads"]
     with pytest.raises(IncrementalAuthorityError, match="recursive_reads"):
         producer_cache_key(material)  # type: ignore[arg-type]
+
+
+def test_producer_key_admits_the_link_runtime_and_nothing_else() -> None:
+    material = {
+        name: [] if name not in {"graph", "node", "role", "cwd", "path_profile"} else "x"
+        for name in (
+            "graph", "node", "role", "toolchain", "runtime", "argv", "cwd", "environment",
+            "path_profile", "direct_inputs", "producer_dependencies", "recursive_reads",
+            "overlay_inputs", "generated_inputs", "donor_inputs", "composition_inputs",
+            "transform_inputs",
+        )
+    }
+    plain = producer_cache_key(material)  # type: ignore[arg-type]
+    material["link_runtime"] = {"profile": "msvc_5_0_rtm"}
+    assert producer_cache_key(material) != plain  # type: ignore[arg-type]
+    material["unknown"] = []
+    with pytest.raises(IncrementalAuthorityError, match="unknown"):
+        producer_cache_key(material)  # type: ignore[arg-type]
