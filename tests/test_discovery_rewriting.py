@@ -170,3 +170,45 @@ def test_an_unlisted_x87_memory_form_is_refused() -> None:
 
     with pytest.raises(ByteIdentityError, match="x87 form"):
         _facts(bytes.fromhex("d93424"))  # fnstenv [esp]
+
+
+# push ebx; push esi; mov ebx, eax; test eax, eax; je +5; mov esi, ecx;
+# add ebx, esi; mov eax, ebx; pop esi; pop ebx; ret  -- then a second exit:
+# mov esi, edx; mov eax, esi; pop esi; pop ebx; ret
+TWO_EXIT = bytes.fromhex("53568bd885c074098bf103de8bc35e5bc38bf28bc65e5bc3")
+SWAPPED = bytes.fromhex("53568bf085c074098bd903f38bc65e5bc38bda8bc35e5bc3")
+
+
+def test_a_callee_saved_permutation_spans_every_region_between_epilogues() -> None:
+    from reprobit.classic.register_bijection import apply_register_bijection
+    from reprobit.discovery_rewriting import derive_register_bijection
+
+    decision = derive_register_bijection(TWO_EXIT, SWAPPED, {}, None)
+    assert decision["mapping"] == {"ebx": "esi", "esi": "ebx"}
+    assert decision["regions"] == [[2, 14], [17, 21]]
+    image, proof = apply_register_bijection(
+        TWO_EXIT,
+        decision["mapping"],
+        [tuple(pair) for pair in decision["regions"]],
+        frozenset(),
+        "t",
+    )
+    assert image == SWAPPED
+    assert proof["region_instruction_count"] == 8
+
+
+def test_a_single_region_cannot_hold_two_epilogues() -> None:
+    from reprobit.binary import ByteIdentityError
+    from reprobit.classic.register_bijection import apply_register_bijection
+
+    with pytest.raises(ByteIdentityError, match="live"):
+        apply_register_bijection(TWO_EXIT, {"ebx": "esi", "esi": "ebx"}, (2, 21), frozenset(), "t")
+
+
+def test_a_register_mapped_two_ways_is_not_a_bijection() -> None:
+    from reprobit.discovery_rewriting import derive_register_bijection
+
+    partly = bytearray(SWAPPED)
+    partly[17:19] = bytes.fromhex("8bf2")  # the second exit keeps mov esi, edx: esi maps two ways
+    with pytest.raises(DiscoveryAuthoringError):
+        derive_register_bijection(TWO_EXIT, bytes(partly), {}, None)

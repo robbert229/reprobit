@@ -708,7 +708,9 @@ def produce_donor_rewriting_candidate(
         image, proof = apply_register_bijection(
             image,
             item["mapping"],
-            (item["region_start"], item["region_end"]),
+            [tuple(pair) for pair in item["regions"]]
+            if item.get("regions")
+            else (item["region_start"], item["region_end"]),
             relocation_offsets,
             f"donor-rewriting bijection {index}",
             relocation_symbols,
