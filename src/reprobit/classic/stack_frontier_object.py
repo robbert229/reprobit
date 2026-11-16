@@ -11,11 +11,11 @@ from reprobit.model import Digest
 from .debug import (
     CODEVIEW_END_RECORD_TYPE,
     CODEVIEW_PROCEDURE_RECORD_TYPES,
+    CODEVIEW_REGISTER_RECORD_TYPES,
     parse_codeview_symbol_stream,
     parse_fpo_data,
 )
 from .register_bijection import (
-    CODEVIEW_REGISTER_RECORD_TYPE,
     _codeview_register_field,
     _codeview_register_name,
 )
@@ -200,7 +200,7 @@ def _paired_debug_this(
     this_records = [
         item
         for item in records
-        if item["type"] == CODEVIEW_REGISTER_RECORD_TYPE and item["name"] == "this"
+        if item["type"] in CODEVIEW_REGISTER_RECORD_TYPES and item["name"] == "this"
     ]
     require(
         len(this_records) == 1,

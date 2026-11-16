@@ -7,7 +7,12 @@ from typing import Any, cast
 
 from reprobit.binary import ByteIdentityError, require
 
-from .debug import CODEVIEW_SYMBOL_NAME_OFFSETS, parse_codeview_symbol_stream
+from .debug import (
+    CODEVIEW_REGISTER_RECORD_TYPES,
+    CODEVIEW_SYMBOL_NAME_OFFSETS,
+    codeview_register_field_offset,
+    parse_codeview_symbol_stream,
+)
 from .foundation import (
     exact_audit_keys,
     local_symbol_kind,
@@ -262,7 +267,7 @@ def apply_register_bijection(
 
 def _codeview_register_field(record: dict[str, Any], context: str) -> int:
     """The offset of one S_REGISTER record's two-byte register field."""
-    field_at: int = record["offset"] + 4 + 2
+    field_at: int = record["offset"] + 4 + codeview_register_field_offset(record["type"])
     require(
         field_at + 2 <= record["offset"] + record["size"],
         f"{context}: S_REGISTER record has no register field",
@@ -315,7 +320,7 @@ def apply_codeview_register_bijection(
     if donor_stream is None:
         seen = []
         for record in records:
-            if record["type"] != CODEVIEW_REGISTER_RECORD_TYPE:
+            if record["type"] not in CODEVIEW_REGISTER_RECORD_TYPES:
                 continue
             field_at = _codeview_register_field(record, context)
             try:
@@ -347,7 +352,7 @@ def apply_codeview_register_bijection(
         )
         movable: set[int] = set()
         for seed_record, donor_record in zip(records, donor_records, strict=True):
-            if seed_record["type"] == CODEVIEW_REGISTER_RECORD_TYPE:
+            if seed_record["type"] in CODEVIEW_REGISTER_RECORD_TYPES:
                 field_at = _codeview_register_field(seed_record, context)
                 movable.update((field_at, field_at + 1))
                 continue
@@ -370,7 +375,7 @@ def apply_codeview_register_bijection(
             f"{context}: the donor's debug$S differs outside its S_REGISTER fields and object-local names",
         )
         for seed_record in records:
-            if seed_record["type"] != CODEVIEW_REGISTER_RECORD_TYPE:
+            if seed_record["type"] not in CODEVIEW_REGISTER_RECORD_TYPES:
                 continue
             field_at = _codeview_register_field(seed_record, context)
             name = _codeview_register_name(donor_stream, field_at, context)
@@ -387,7 +392,7 @@ def apply_codeview_register_bijection(
             declared_record = by_offset.get(item["record_offset"])
             require(
                 declared_record is not None
-                and declared_record["type"] == CODEVIEW_REGISTER_RECORD_TYPE
+                and declared_record["type"] in CODEVIEW_REGISTER_RECORD_TYPES
                 and (declared_record["name"] == item["name"]),
                 f"{context}: the S_REGISTER map names no such record",
             )

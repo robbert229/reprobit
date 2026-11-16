@@ -6,13 +6,12 @@ from typing import Any
 
 from reprobit.binary import require
 
-from .debug import parse_codeview_symbol_stream
+from .debug import CODEVIEW_REGISTER_RECORD_TYPES, parse_codeview_symbol_stream
 from .foundation import (
     RelocationView,
     require_payload_free_declaration,
 )
 from .register_bijection import (
-    CODEVIEW_REGISTER_RECORD_TYPE,
     _codeview_register_field,
     _codeview_register_name,
 )
@@ -328,7 +327,7 @@ def require_web_recolour_debug_registers(
     records = parse_codeview_symbol_stream(stream, context)
     measured = []
     for record in records:
-        if record["type"] != CODEVIEW_REGISTER_RECORD_TYPE:
+        if record["type"] not in CODEVIEW_REGISTER_RECORD_TYPES:
             continue
         field_at = _codeview_register_field(record, context)
         measured.append(
