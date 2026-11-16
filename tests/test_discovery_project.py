@@ -228,3 +228,21 @@ def test_grind_plan_extern_runs_search_c_compatible_declarations() -> None:
 def test_grind_plan_names_exactly_one_search(search: dict[str, object]) -> None:
     with pytest.raises(ValidationError):
         ProjectGrindPlan.model_validate(_grind_plan_fields(**search))
+
+
+def test_grind_plan_extern_runs_default_after_includes_and_admit_prefix() -> None:
+    default = ProjectGrindPlan.model_validate(
+        _grind_plan_fields(extern_runs={"counts": {"start": 1, "stop": 2}})
+    )
+    prefix = ProjectGrindPlan.model_validate(
+        _grind_plan_fields(extern_runs={"counts": {"start": 1, "stop": 2}, "placement": "prefix"})
+    )
+
+    assert default.extern_runs is not None and default.extern_runs.placement == "after_includes"
+    assert prefix.extern_runs is not None and prefix.extern_runs.placement == "prefix"
+    with pytest.raises(ValidationError):
+        ProjectGrindPlan.model_validate(
+            _grind_plan_fields(
+                extern_runs={"counts": {"start": 1, "stop": 2}, "placement": "suffix"}
+            )
+        )

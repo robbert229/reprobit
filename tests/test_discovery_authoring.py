@@ -19,6 +19,7 @@ from reprobit.discovery_authoring import (
     DiscoveryAuthoringError,
     build_declaration_shape_donor,
     build_declaration_shape_equal_body,
+    build_extern_run_donor,
     merge_authored_records,
 )
 from reprobit.model import Digest, Scope
@@ -349,3 +350,30 @@ def test_merge_authored_records_refuses_nonmatching_shards_and_build_targets() -
     )
     with pytest.raises(DiscoveryAuthoringError, match="different build target"):
         merge_authored_records(wrong_target, proofs, authored.records)
+
+
+def _extern_run_donor(**placement: str) -> AuthoredClassicRecord:
+    return build_extern_run_donor(
+        target_id="program",
+        translation_unit_id="tu.unit",
+        build_target="program",
+        header_prefix="ReproBitPad",
+        header_count=3,
+        seat_prefix="ReproBitPadSeat",
+        seat_count=0,
+        width=3,
+        **placement,
+    )
+
+
+def test_extern_run_donor_default_placement_keeps_record_identity() -> None:
+    implicit = _extern_run_donor()
+    explicit = _extern_run_donor(header_placement="after_includes")
+    prefix = _extern_run_donor(header_placement="prefix")
+
+    assert implicit.intervention.id == explicit.intervention.id
+    assert "header_placement" not in {field.name for field in implicit.intervention.parameters}
+    assert prefix.intervention.id != implicit.intervention.id
+    assert ("header_placement", "prefix") in {
+        (field.name, field.value) for field in prefix.intervention.parameters
+    }

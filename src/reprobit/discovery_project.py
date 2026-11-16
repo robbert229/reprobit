@@ -70,10 +70,12 @@ class ProjectGrindExternRuns(StrictModel):
     """A run of ``extern int`` declarations after the unit's final include.
 
     The C-compatible carrier: class shapes and forward class declarations
-    compile only as C++.
+    compile only as C++.  ``placement="prefix"`` seats the run at the unit's
+    start instead, for a function that a later include follows.
     """
 
     counts: InclusiveRange
+    placement: Literal["after_includes", "prefix"] = "after_includes"
     prefix: Annotated[str, Field(pattern=r"^[A-Za-z][A-Za-z0-9_]*$")] = "ReproBitPad"
     width: Annotated[int, Field(ge=1, le=3)] = 3
 
