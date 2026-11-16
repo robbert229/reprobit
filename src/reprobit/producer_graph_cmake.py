@@ -243,6 +243,20 @@ def _link_outputs(
             toolchain_root=toolchain_root,
         )
     ]
+    if role is ProducerRole.LIBRARIAN and _attached_value(arguments, ("/def:", "-def:")):
+        # LIB /DEF writes the export file beside the import library.
+        archive = _attached_value(arguments, ("/out:", "-out:"))
+        if archive is None:
+            raise ProducerGraphError(f"librarian /DEF command for {owner!r} omits /out")
+        outputs.append(
+            _path_reference(
+                os.fspath(Path(archive).with_suffix(".exp")),
+                working_directory=directory,
+                source_root=source_root,
+                build_root=build_root,
+                toolchain_root=toolchain_root,
+            )
+        )
     if role is ProducerRole.LINKER:
         switches = {item.casefold() for item in arguments}
         implementation_library = _attached_value(arguments, ("/implib:", "-implib:"))

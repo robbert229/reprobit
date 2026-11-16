@@ -414,6 +414,18 @@ def _local_symbol_kind(name: str) -> str | None:
     return None
 
 
+def _static_serial_kind(name: str) -> str | None:
+    """``<name>$S<serial>`` file statics, classified by base name alone."""
+
+    kind = _local_symbol_kind(name)
+    if kind is not None:
+        return kind
+    base, separator, serial = name.rpartition("$S")
+    if separator and base and serial.isdigit():
+        return f"S:{base}"
+    return None
+
+
 def require_mosaic_relocation_compatibility(
     seed: CoffObject,
     seed_section: CoffSection,
@@ -423,8 +435,16 @@ def require_mosaic_relocation_compatibility(
     *,
     seed_index: CoffMetadataIndex | None = None,
     donor_index: CoffMetadataIndex | None = None,
+    static_serials: bool = False,
 ) -> None:
-    """Require same-offset relocation semantics for a donor range campaign."""
+    """Require same-offset relocation semantics for a donor range campaign.
+
+    With ``static_serials`` a file static's compile-order serial is ignored
+    (``_s$S395`` pairs with ``_s$S398``): for comparing two compiles of one
+    unit whose declaration counts differ, never for pairing unrelated objects.
+    """
+
+    symbol_kind = _static_serial_kind if static_serials else _local_symbol_kind
 
     if seed_index is not None:
         require(seed_index.coff is seed, "seed COFF metadata index differs")
@@ -447,8 +467,8 @@ def require_mosaic_relocation_compatibility(
             f"{context}: relocation {index} geometry differs",
         )
         same_name = seed_row["target"] == donor_row["target"]
-        seed_kind = _local_symbol_kind(seed_row["target"])
-        donor_kind = _local_symbol_kind(donor_row["target"])
+        seed_kind = symbol_kind(seed_row["target"])
+        donor_kind = symbol_kind(donor_row["target"])
         require(
             same_name or (seed_kind is not None and seed_kind == donor_kind),
             f"{context}: relocation {index} changes symbol identity",

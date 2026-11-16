@@ -18,7 +18,7 @@ from reprobit.authority_snapshot import (
     JsonAuthorityDirectorySnapshot,
     assert_json_authority_unchanged,
 )
-from reprobit.classic_donors import generate_declaration_shape
+from reprobit.classic_donors import generate_declaration_shape, generate_extern_run
 from reprobit.costs import calculate_cost
 from reprobit.discovery_authoring import (
     AuthoredClassicRecord,
@@ -26,6 +26,9 @@ from reprobit.discovery_authoring import (
     DiscoveryAuthoringError,
     build_declaration_shape_donor,
     build_declaration_shape_equal_body,
+    build_donor_equal_body,
+    build_donor_reloc_layout_equal_body,
+    build_extern_run_donor,
     merge_authored_records,
 )
 from reprobit.discovery_contracts import (
@@ -168,14 +171,166 @@ def _write_staged_documents(
     proof_path.write_bytes(canonical_json(proofs))
 
 
+_GRIND_DONOR_FAMILIES = frozenset(
+    {ClassicRecipeFamily.DECLARATION_SHAPE, ClassicRecipeFamily.EXTERN_RUN_PAIR}
+)
+
+
+def _int_parameter(state: DeclarationState, name: str) -> int:
+    value = state.parameter(name)
+    if type(value) is not int:
+        raise GrindError(f"{state.family.value} state has a non-integer {name}")
+    return value
+
+
+def _str_parameter(state: DeclarationState, name: str) -> str:
+    value = state.parameter(name)
+    if type(value) is not str:
+        raise GrindError(f"{state.family.value} state has a non-text {name}")
+    return value
+
+
 def _state_shape(state: DeclarationState) -> tuple[int, int]:
-    if state.family is not DeclarationFamily.DECLARATION_SHAPE:
-        raise GrindError("project grind v1 received a non-declaration-shape state")
-    classes = state.parameter("classes")
-    functions = state.parameter("functions")
-    if type(classes) is not int or type(functions) is not int:
-        raise GrindError("declaration-shape state has non-integer parameters")
-    return classes, functions
+    return _int_parameter(state, "classes"), _int_parameter(state, "functions")
+
+
+@dataclass(frozen=True, slots=True)
+class _ExternRun:
+    header_prefix: str
+    header_count: int
+    seat_prefix: str
+    seat_count: int
+    width: int
+
+
+def _extern_run(state: DeclarationState) -> _ExternRun:
+    return _ExternRun(
+        header_prefix=_str_parameter(state, "header_prefix"),
+        header_count=_int_parameter(state, "header_count"),
+        seat_prefix=_str_parameter(state, "seat_prefix"),
+        seat_count=_int_parameter(state, "seat_count"),
+        width=_int_parameter(state, "width"),
+    )
+
+
+def _require_grind_family(state: DeclarationState) -> None:
+    if state.family not in (
+        DeclarationFamily.DECLARATION_SHAPE,
+        DeclarationFamily.EXTERN_RUN_PAIR,
+    ):
+        raise GrindError(f"project grind cannot author a {state.family.value} donor")
+
+
+def _state_digest(state: DeclarationState) -> str:
+    """The generated-header digest the state's donor record would carry."""
+
+    _require_grind_family(state)
+    if state.family is DeclarationFamily.DECLARATION_SHAPE:
+        return Digest.from_bytes(generate_declaration_shape(*_state_shape(state))).value
+    run = _extern_run(state)
+    generated = b""
+    if run.header_count:
+        generated += generate_extern_run(run.header_prefix, run.header_count, run.width)
+    if run.seat_count:
+        generated += generate_extern_run(run.seat_prefix, run.seat_count, run.width)
+    return Digest.from_bytes(generated).value
+
+
+def _state_donor(state: DeclarationState, context: ProjectGrindContext) -> AuthoredClassicRecord:
+    """The payload-free donor record one grind state compiles."""
+
+    _require_grind_family(state)
+    unit = context.unit
+    if state.family is DeclarationFamily.DECLARATION_SHAPE:
+        classes, functions = _state_shape(state)
+        return build_declaration_shape_donor(
+            target_id=unit.target_id,
+            translation_unit_id=unit.id,
+            build_target=unit.build_target,
+            classes=classes,
+            functions=functions,
+        )
+    run = _extern_run(state)
+    return build_extern_run_donor(
+        target_id=unit.target_id,
+        translation_unit_id=unit.id,
+        build_target=unit.build_target,
+        header_prefix=run.header_prefix,
+        header_count=run.header_count,
+        seat_prefix=run.seat_prefix,
+        seat_count=run.seat_count,
+        width=run.width,
+    )
+
+
+def _state_equal_body(
+    state: DeclarationState,
+    context: ProjectGrindContext,
+    *,
+    seed_object: bytes,
+    donor_object: bytes,
+) -> DeclarationShapeEqualBodyAuthoring:
+    """Author the state's donor, naming the symbol, and its strict equal-body consumer."""
+
+    _require_grind_family(state)
+    unit = context.unit
+    if state.family is DeclarationFamily.DECLARATION_SHAPE:
+        classes, functions = _state_shape(state)
+        return build_declaration_shape_equal_body(
+            target_id=unit.target_id,
+            translation_unit_id=unit.id,
+            build_target=unit.build_target,
+            symbol=context.symbol,
+            classes=classes,
+            functions=functions,
+            seed_object=seed_object,
+            donor_object=donor_object,
+        )
+    run = _extern_run(state)
+    donor = build_extern_run_donor(
+        target_id=unit.target_id,
+        translation_unit_id=unit.id,
+        build_target=unit.build_target,
+        header_prefix=run.header_prefix,
+        header_count=run.header_count,
+        seat_prefix=run.seat_prefix,
+        seat_count=run.seat_count,
+        width=run.width,
+        beneficiary_symbols=(context.symbol,),
+    )
+    try:
+        return build_donor_equal_body(
+            donor=donor,
+            target_id=unit.target_id,
+            translation_unit_id=unit.id,
+            build_target=unit.build_target,
+            symbol=context.symbol,
+            seed_object=seed_object,
+            donor_object=donor_object,
+        )
+    except DiscoveryAuthoringError as strict_error:
+        # An extern run renumbers the file statics it precedes; the strict
+        # splice refuses those renames, the relocation-layout family proves them.
+        try:
+            return build_donor_reloc_layout_equal_body(
+                donor=donor,
+                target_id=unit.target_id,
+                translation_unit_id=unit.id,
+                build_target=unit.build_target,
+                symbol=context.symbol,
+                seed_object=seed_object,
+                donor_object=donor_object,
+            )
+        except DiscoveryAuthoringError:
+            raise strict_error from None
+
+
+def describe_state(state: DeclarationState) -> str:
+    """A short human label for one grind state's declarations."""
+
+    if state.family is DeclarationFamily.EXTERN_RUN_PAIR:
+        return f"extern run of {state.parameter('header_count')} declarations"
+    return f"classes={state.parameter('classes')}, functions={state.parameter('functions')}"
 
 
 def _advance(
@@ -321,20 +476,15 @@ def require_single_acceptance(
         raise error(message)
 
 
-def _shape_digest(state: DeclarationState) -> str:
-    classes, functions = _state_shape(state)
-    return Digest.from_bytes(generate_declaration_shape(classes, functions)).value
-
-
-def _saved_shape_digests(document: InterventionDocument) -> frozenset[str]:
-    """Generated-header digests of the unit's saved declaration-shape donors."""
+def _saved_donor_digests(document: InterventionDocument) -> frozenset[str]:
+    """Generated-header digests of the unit's saved grind-family donors."""
 
     digests: set[str] = set()
     for intervention in document.interventions:
         if (
             isinstance(intervention, ClassicRecipeIntervention)
             and intervention.role is ClassicRecipeRole.DONOR
-            and intervention.family is ClassicRecipeFamily.DECLARATION_SHAPE
+            and intervention.family in _GRIND_DONOR_FAMILIES
         ):
             for field in intervention.parameters:
                 if field.name == "generated_header_sha256" and isinstance(field.value, str):
@@ -406,11 +556,8 @@ def run_project_grind(
             raise GrindError(f"invalid bounded grind plan: {exc}") from exc
         # A state one of the unit's saved donors already renders would share
         # that donor's compiler arena; it is that donor's, not a fresh cell.
-        states = tuple(
-            state
-            for state in states
-            if _shape_digest(state) not in _saved_shape_digests(context.intervention_document)
-        )
+        saved_digests = _saved_donor_digests(context.intervention_document)
+        states = tuple(state for state in states if _state_digest(state) not in saved_digests)
         # Each state has one compatibility disposition and one cold-trial
         # disposition. States that cannot qualify consume the latter as an
         # explicit skip, keeping one honest and monotonic progress total.
@@ -433,19 +580,7 @@ def run_project_grind(
 
         provisional: list[tuple[DeclarationState, AuthoredClassicRecord]] = []
         for state in states:
-            classes, functions = _state_shape(state)
-            provisional.append(
-                (
-                    state,
-                    build_declaration_shape_donor(
-                        target_id=context.unit.target_id,
-                        translation_unit_id=context.unit.id,
-                        build_target=context.unit.build_target,
-                        classes=classes,
-                        functions=functions,
-                    ),
-                )
-            )
+            provisional.append((state, _state_donor(state, context)))
         provisional_documents = merge_authored_records(
             context.intervention_document,
             context.proof_document,
@@ -484,16 +619,11 @@ def run_project_grind(
         original_ids = {item.id for item in context.intervention_document.interventions}
         for state, provisional_record in provisional:
             state_id = declaration_state_id(state)
-            classes, functions = _state_shape(state)
             rejected = False
             try:
-                authored = build_declaration_shape_equal_body(
-                    target_id=context.unit.target_id,
-                    translation_unit_id=context.unit.id,
-                    build_target=context.unit.build_target,
-                    symbol=context.symbol,
-                    classes=classes,
-                    functions=functions,
+                authored = _state_equal_body(
+                    state,
+                    context,
                     seed_object=seed_object,
                     donor_object=donor_objects[provisional_record.intervention.id],
                 )

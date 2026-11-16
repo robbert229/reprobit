@@ -17,6 +17,7 @@ from reprobit.producer_graph import (
     ProducerGraphError,
     ProducerNode,
     ProducerRole,
+    librarian_input_sequence,
     linker_input_sequence,
     materialize_argument,
     materialize_reference,
@@ -602,6 +603,64 @@ def test_archive_and_object_inputs_require_current_run_ancestry(
             arguments=(argument, "/out:${BUILD}/APP.EXE"),
             inputs=(declared_input,),
             outputs=("build/APP.EXE",),
+        )
+
+
+def test_librarian_def_import_library_reads_a_source_def_and_has_no_members() -> None:
+    node = ProducerNode(
+        id="librarian.dinput",
+        role=ProducerRole.LIBRARIAN,
+        owner="dinput",
+        arguments=(
+            "/nologo",
+            "/machine:i386",
+            "/def:${SOURCE}/dinput.def",
+            "/out:${BUILD}/dinput.lib",
+            "${BUILD}/exports.obj",
+        ),
+        inputs=("build/exports.obj", "source/dinput.def"),
+        outputs=("build/dinput.exp", "build/dinput.lib"),
+    )
+
+    # LIB /DEF writes an import library; its objects only resolve the
+    # exported names and never become archive members.
+    assert librarian_input_sequence(node) == ()
+
+
+def test_librarian_def_import_library_must_declare_its_export_file() -> None:
+    with pytest.raises(ValidationError, match="argv/output edges differ"):
+        ProducerNode(
+            id="librarian.dinput",
+            role=ProducerRole.LIBRARIAN,
+            owner="dinput",
+            arguments=(
+                "/def:${SOURCE}/dinput.def",
+                "/out:${BUILD}/dinput.lib",
+                "${BUILD}/exports.obj",
+            ),
+            inputs=("build/exports.obj", "source/dinput.def"),
+            outputs=("build/dinput.lib",),
+        )
+
+
+@pytest.mark.parametrize(
+    ("argument", "declared_input", "message"),
+    (
+        ("/def:${BUILD}/dinput.def", "build/dinput.def", "librarian DEF inputs"),
+        ("/def:${TOOLCHAIN}/dinput.def", "toolchain/dinput.def", "librarian DEF inputs"),
+    ),
+)
+def test_librarian_def_input_must_be_a_manifest_source(
+    argument: str, declared_input: str, message: str
+) -> None:
+    with pytest.raises(ValidationError, match=message):
+        ProducerNode(
+            id="librarian.dinput",
+            role=ProducerRole.LIBRARIAN,
+            owner="dinput",
+            arguments=(argument, "/out:${BUILD}/dinput.lib", "${BUILD}/exports.obj"),
+            inputs=tuple(sorted((declared_input, "build/exports.obj"), key=str.casefold)),
+            outputs=("build/dinput.exp", "build/dinput.lib"),
         )
 
 
