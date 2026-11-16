@@ -369,6 +369,82 @@ def test_linker_input_sequence_preserves_positional_kind_order_and_repeated_arch
     )
 
 
+def _repeated_kernel32_linker(*arguments: str, inputs: tuple[str, ...]) -> ProducerNode:
+    return ProducerNode(
+        id="linker.app",
+        role=ProducerRole.LINKER,
+        owner="app",
+        target_id="app",
+        arguments=(*arguments, "/out:${BUILD}/APP.EXE"),
+        inputs=inputs,
+        outputs=("build/APP.EXE",),
+    )
+
+
+def test_toolchain_library_path_is_its_system_library_and_keeps_its_spelling() -> None:
+    # LINK searches a library name once; the original program searched
+    # kernel32.lib again before user32.lib, so the repeat names the file.
+    node = _repeated_kernel32_linker(
+        "${BUILD}/obj/a.obj",
+        "kernel32.lib",
+        "${BUILD}/libs/runtime.lib",
+        "${TOOLCHAIN}/lib/kernel32.lib",
+        "user32.lib",
+        inputs=(
+            "build/libs/runtime.lib",
+            "build/obj/a.obj",
+            "system-library/kernel32.lib",
+            "system-library/user32.lib",
+        ),
+    )
+
+    assert "${TOOLCHAIN}/lib/kernel32.lib" in node.arguments
+    assert linker_input_sequence(node) == (
+        "build/obj/a.obj",
+        "system-library/kernel32.lib",
+        "build/libs/runtime.lib",
+        "system-library/kernel32.lib",
+        "system-library/user32.lib",
+    )
+    assert producer_graph.linker_library_sequence(node) == (
+        "system-library/kernel32.lib",
+        "build/libs/runtime.lib",
+        "system-library/kernel32.lib",
+        "system-library/user32.lib",
+    )
+    assert producer_graph.toolchain_system_library("${TOOLCHAIN}/lib/kernel32.lib") == (
+        "lib/kernel32.lib",
+        "kernel32.lib",
+    )
+    assert producer_graph.toolchain_system_library("kernel32.lib") is None
+    assert producer_graph.toolchain_system_library("${TOOLCHAIN}/lib/x.obj") is None
+
+
+def test_toolchain_library_path_alone_needs_its_system_library_edge() -> None:
+    node = _repeated_kernel32_linker(
+        "${TOOLCHAIN}/lib/kernel32.lib",
+        inputs=("system-library/kernel32.lib",),
+    )
+    assert linker_input_sequence(node) == ("system-library/kernel32.lib",)
+
+    with pytest.raises(ValidationError, match="argv/input edges differ"):
+        _repeated_kernel32_linker(
+            "${TOOLCHAIN}/lib/kernel32.lib",
+            inputs=("toolchain/lib/kernel32.lib",),
+        )
+    with pytest.raises(ValidationError, match="argv/input edges differ"):
+        _repeated_kernel32_linker("${TOOLCHAIN}/lib/kernel32.lib", inputs=())
+
+
+@pytest.mark.parametrize(
+    "argument",
+    ("${TOOLCHAIN}/lib/../lib/kernel32.lib", "${TOOLCHAIN}/lib/kern el32.lib"),
+)
+def test_toolchain_library_path_must_be_plain_and_normalized(argument: str) -> None:
+    with pytest.raises(ValidationError):
+        _repeated_kernel32_linker(argument, inputs=("system-library/kernel32.lib",))
+
+
 def test_graph_v3_requires_only_declared_source_inputs() -> None:
     node = ProducerNode(
         id="compiler.unit",
@@ -584,7 +660,7 @@ def test_noncompiler_roles_reject_unmodeled_read_bearing_options(
             ProducerRole.LINKER,
             "${TOOLCHAIN}/payload.lib",
             "toolchain/payload.lib",
-            "producer or quarantine ancestry",
+            "argv/input edges differ",
         ),
     ),
 )
@@ -911,6 +987,72 @@ def test_extracts_closed_direct_graph_and_round_trips(tmp_path: Path) -> None:
     assert producer_graph_digest(received) == producer_graph_digest(graph)
 
 
+def test_import_keeps_a_repeated_system_library_toolchain_path(tmp_path: Path) -> None:
+    source, build, toolchain = _configured_fixture(tmp_path)
+    link_txt = build / "CMakeFiles/app.dir/link.txt"
+    toolchain_library = f"{toolchain.as_posix()}/lib/kernel32.lib"
+    link_txt.write_text(
+        link_txt.read_text(encoding="utf-8").replace(
+            "core.lib kernel32.lib", f"kernel32.lib core.lib {toolchain_library} user32.lib"
+        ),
+        encoding="utf-8",
+    )
+    graph = extract_cmake_makefiles_graph(
+        configured_build_root=build,
+        effective_source_root=source,
+        toolchain_root=toolchain,
+        toolchain_lock_digest=_digest("4"),
+        path_profile_id="stable",
+        target_outputs={"app": "APP.EXE"},
+    )
+    linker = next(node for node in graph.nodes if node.role is ProducerRole.LINKER)
+    libraries = tuple(
+        item
+        for item in linker.arguments
+        if item.casefold().endswith(".lib") and not item.startswith(("/", "-"))
+    )
+
+    assert libraries == (
+        "kernel32.lib",
+        "${BUILD}/core.lib",
+        "${TOOLCHAIN}/lib/kernel32.lib",
+        "user32.lib",
+    )
+    assert [item for item in linker.inputs if item.startswith("system-library/")] == [
+        "system-library/kernel32.lib",
+        "system-library/user32.lib",
+    ]
+    assert producer_graph.linker_library_sequence(linker) == (
+        "system-library/kernel32.lib",
+        "build/core.lib",
+        "system-library/kernel32.lib",
+        "system-library/user32.lib",
+    )
+    destination = tmp_path / "producer-graph.json"
+    write_producer_graph(destination, graph)
+    assert read_producer_graph(destination) == graph
+
+
+def test_import_keeps_single_bare_system_libraries_bare(tmp_path: Path) -> None:
+    source, build, toolchain = _configured_fixture(tmp_path)
+    graph = extract_cmake_makefiles_graph(
+        configured_build_root=build,
+        effective_source_root=source,
+        toolchain_root=toolchain,
+        toolchain_lock_digest=_digest("4"),
+        path_profile_id="stable",
+        target_outputs={"app": "APP.EXE"},
+    )
+    linker = next(node for node in graph.nodes if node.role is ProducerRole.LINKER)
+
+    assert "kernel32.lib" in linker.arguments
+    assert not any("${TOOLCHAIN}" in item for item in linker.arguments)
+    assert producer_graph.linker_library_sequence(linker) == (
+        "build/core.lib",
+        "system-library/kernel32.lib",
+    )
+
+
 def test_missing_terminal_target_reports_expected_and_observed_outputs(tmp_path: Path) -> None:
     source, build, toolchain = _configured_fixture(tmp_path)
 
@@ -1175,6 +1317,15 @@ def test_materialize_argument_is_literal_and_complete() -> None:
             toolchain_root="Z:\\msvc",
         )
         == "/IZ:\\src/include"
+    )
+    assert (
+        materialize_argument(
+            "${TOOLCHAIN}/lib/kernel32.lib",
+            source_root="Z:\\src",
+            build_root="Z:\\build",
+            toolchain_root="T:\\msvc\\",
+        )
+        == "T:\\msvc/lib/kernel32.lib"
     )
     with pytest.raises(ProducerGraphError, match="unresolved"):
         materialize_argument(
