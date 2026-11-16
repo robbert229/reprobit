@@ -413,3 +413,99 @@ MSVC50_CMAKE_FRONTEND_AUTHORITIES = {
         ),
     },
 }
+
+# Derived, never installed: the staged LINK runtime each build writes
+# into its private toolchain copy (reprobit.msvc50_link_runtime).
+# link.exe, mspdb50.dll, msdis100.dll and msvcp50.dll are the installed
+# files with their one MSVCRT.dll import renamed MSVCR5.dll; MSVCR5.dll
+# is bin/msvcrt.dll unchanged. Keyed by staged file name.
+MSVC50_NATIVE_CRT_LINK_AUTHORITIES = {
+    "msvc_5_0_rtm": {
+        "MSVCR5.dll": Msvc50FileAuthority(
+            271632,
+            "d398de0da85572ae6e40254f93ffe0ab0bc4bfcb77681b4a0c358493552707bb",
+        ),
+        "link.exe": Msvc50FileAuthority(
+            359424,
+            "fa3315a6bea52396682e548198da17a70c7d83bed87ac6223871748c22f8a368",
+        ),
+        "msdis100.dll": Msvc50FileAuthority(
+            117520,
+            "362651e109e0788b893217617b400e93b25e3ecb3835fb6a95989b9579041866",
+        ),
+        "mspdb50.dll": Msvc50FileAuthority(
+            167424,
+            "19b433a38ba32a3972ade09318106ba80969377e40f5605defd14c8a430aaa0f",
+        ),
+        "msvcp50.dll": Msvc50FileAuthority(
+            565760,
+            "b497a238b00c05336cb960a11716758fdbebdc79976f1b626c3a3053ce2b2527",
+        ),
+    },
+    "msvc_5_0_sp1": {
+        "MSVCR5.dll": Msvc50FileAuthority(
+            280576,
+            "df9f2aab7f7119f214c5d743d961fde4bf324f19011fbbb7e9cf666856fba0ba",
+        ),
+        "link.exe": Msvc50FileAuthority(
+            392704,
+            "63376e197040fee78ae91080d7c0e686343b1ec1dbdf4b8a67dcbb98476c02cc",
+        ),
+        "msdis100.dll": Msvc50FileAuthority(
+            127760,
+            "4a949b2179fb8aa2a7b50a9841761be6b081a1efa8b1d889ce5d1560dd55b495",
+        ),
+        "mspdb50.dll": Msvc50FileAuthority(
+            174592,
+            "700ce96eca0bd6a820985f13ecd4904b97a1630a6dc4d8845f2fe07571028381",
+        ),
+        "msvcp50.dll": Msvc50FileAuthority(
+            565760,
+            "b497a238b00c05336cb960a11716758fdbebdc79976f1b626c3a3053ce2b2527",
+        ),
+    },
+    "msvc_5_0_sp2": {
+        "MSVCR5.dll": Msvc50FileAuthority(
+            280576,
+            "df9f2aab7f7119f214c5d743d961fde4bf324f19011fbbb7e9cf666856fba0ba",
+        ),
+        "link.exe": Msvc50FileAuthority(
+            392704,
+            "63376e197040fee78ae91080d7c0e686343b1ec1dbdf4b8a67dcbb98476c02cc",
+        ),
+        "msdis100.dll": Msvc50FileAuthority(
+            127760,
+            "4a949b2179fb8aa2a7b50a9841761be6b081a1efa8b1d889ce5d1560dd55b495",
+        ),
+        "mspdb50.dll": Msvc50FileAuthority(
+            174592,
+            "700ce96eca0bd6a820985f13ecd4904b97a1630a6dc4d8845f2fe07571028381",
+        ),
+        "msvcp50.dll": Msvc50FileAuthority(
+            565760,
+            "b497a238b00c05336cb960a11716758fdbebdc79976f1b626c3a3053ce2b2527",
+        ),
+    },
+    "msvc_5_0_sp3": {
+        "MSVCR5.dll": Msvc50FileAuthority(
+            277776,
+            "e390b0529fb9ee1214bb68302a4658b578134d92ab76bc5eb48f3badd843d210",
+        ),
+        "link.exe": Msvc50FileAuthority(
+            464896,
+            "5f4bc61d45b47f12bde4ae270e6f4e6f284e40a1ee83ee591b7d6bb1ed8ece84",
+        ),
+        "msdis100.dll": Msvc50FileAuthority(
+            127760,
+            "4a949b2179fb8aa2a7b50a9841761be6b081a1efa8b1d889ce5d1560dd55b495",
+        ),
+        "mspdb50.dll": Msvc50FileAuthority(
+            174592,
+            "700ce96eca0bd6a820985f13ecd4904b97a1630a6dc4d8845f2fe07571028381",
+        ),
+        "msvcp50.dll": Msvc50FileAuthority(
+            565760,
+            "b497a238b00c05336cb960a11716758fdbebdc79976f1b626c3a3053ce2b2527",
+        ),
+    },
+}
