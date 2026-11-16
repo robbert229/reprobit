@@ -756,7 +756,7 @@ def compose_same_slot_resize(
     )
     require(
         fpo_proc_size_fits(donor_cbproc, dp["raw_size"], donor_code)
-        and 0 <= donor_dbgstart <= donor_dbgend < donor_cbproc,
+        and 0 <= donor_dbgstart <= donor_dbgend <= donor_cbproc,
         "donor debug procedure range is stale",
     )
     expected_debug_raw = bytearray(

@@ -112,8 +112,11 @@ def require_instruction_schedule_debug_fidelity(
     boundaries.add(len(image) if code_length is None else code_length)
     index_of = {start: position for position, (start, _) in enumerate(spans)}
     line_bytes = _coff_table_bytes(coff, section, "lines")
+    # The sentinel row is always present; a function the compiler gave no
+    # line row (MSVC 5.0 does so for some one-statement functions) has no
+    # row for a reordering to keep on an instruction boundary.
     require(
-        len(line_bytes) == section["line_count"] * 6 and len(line_bytes) >= 12,
+        len(line_bytes) == section["line_count"] * 6 and len(line_bytes) >= 6,
         f"{context}: the compiler line table is missing",
     )
     marker_index, marker_line = coff_unpack("<IH", line_bytes, 0, f"{context} line sentinel")
