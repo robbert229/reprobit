@@ -40,6 +40,8 @@ from reprobit.model import (
     Quarantine,
     quarantine_proof_binding,
 )
+from reprobit.msvc50_authorities import Msvc50FileAuthority
+from reprobit.msvc50_link_runtime import locked_link_runtime_authorities
 from reprobit.paths import normalize_logical_path
 from reprobit.schema import (
     ClassicRecipeIntervention,
@@ -55,6 +57,37 @@ class EvidenceClaim(StrEnum):
     ORIGIN = "origin"
 
 
+def _toolchain_relative_parts(bundle: ProjectBundle, artifact: Artifact) -> tuple[str, ...] | None:
+    try:
+        logical = PureWindowsPath(normalize_logical_path(artifact.logical_path))
+        logical_root = PureWindowsPath(normalize_logical_path(bundle.spec.paths.toolchain))
+    except Exception:
+        return None
+    if len(logical.parts) <= len(logical_root.parts) or tuple(
+        item.casefold() for item in logical.parts[: len(logical_root.parts)]
+    ) != tuple(item.casefold() for item in logical_root.parts):
+        return None
+    return tuple(logical.parts[len(logical_root.parts) :])
+
+
+def _toolchain_derived_member_is_locked(
+    bundle: ProjectBundle,
+    artifact: Artifact,
+    derived: Mapping[str, Msvc50FileAuthority],
+) -> bool:
+    """Verify one staged LINK runtime file against its lock-authenticated derivation."""
+
+    relative = _toolchain_relative_parts(bundle, artifact)
+    if relative is None:
+        return False
+    authority = derived.get("/".join(relative).casefold())
+    return (
+        authority is not None
+        and artifact.digest.value == authority.sha256
+        and artifact.size == authority.size
+    )
+
+
 def _toolchain_tree_member_is_locked(
     bundle: ProjectBundle,
     artifact: Artifact,
@@ -63,16 +96,9 @@ def _toolchain_tree_member_is_locked(
 ) -> bool:
     """Verify one toolchain leaf against exactly one portable input-tree lock."""
 
-    try:
-        logical = PureWindowsPath(normalize_logical_path(artifact.logical_path))
-        logical_root = PureWindowsPath(normalize_logical_path(bundle.spec.paths.toolchain))
-    except Exception:
+    relative = _toolchain_relative_parts(bundle, artifact)
+    if relative is None:
         return False
-    if len(logical.parts) <= len(logical_root.parts) or tuple(
-        item.casefold() for item in logical.parts[: len(logical_root.parts)]
-    ) != tuple(item.casefold() for item in logical_root.parts):
-        return False
-    relative = tuple(logical.parts[len(logical_root.parts) :])
     matches = 0
     for tree in bundle.toolchain_lock.input_trees:
         tree_parts = PurePosixPath(tree.path).parts
@@ -718,6 +744,19 @@ class EvidenceAuditor:
                 *bundle.toolchain_lock.runtime_files,
             )
         }
+        # The staged MSVC 5.0 LINK runtime (reprobit.msvc50_link_runtime) is
+        # not locked itself; it is admitted only as the reviewed derivation of
+        # locked files.
+        derived = locked_link_runtime_authorities(
+            bundle.toolchain_lock.profile,
+            (
+                (item.path, item.digest.value, item.size)
+                for item in (
+                    *bundle.toolchain_lock.tools,
+                    *bundle.toolchain_lock.runtime_files,
+                )
+            ),
+        )
         tree_cache: dict[tuple[Path, str], bool] = {}
         for node in nodes.values():
             if node.parents or node.kind not in {
@@ -771,6 +810,7 @@ class EvidenceAuditor:
                 node.kind is ProvenanceKind.TOOLCHAIN
                 and artifact.kind is ArtifactKind.TOOLCHAIN
                 and (artifact.digest, artifact.size) not in locked
+                and not _toolchain_derived_member_is_locked(bundle, artifact, derived)
                 and not _toolchain_tree_member_is_locked(bundle, artifact, path, tree_cache)
             ):
                 issue(

@@ -56,8 +56,13 @@ MSVC_50_PROFILES = (MSVC_50_RTM, MSVC_50_SP1, MSVC_50_SP2, MSVC_50_SP3)
 # link, lib, and wine-msvc.sh scripts are byte-identical to the MSVC 4.2
 # snapshot, so they share its committed authorities; only msvcenv.sh is
 # 5.0-specific because the 5.0 tools bind against MSVCRT.dll instead of the
-# two 4.2 C runtimes.  The finding encoded in msvcenv.sh is that Wine's
-# builtin msvcrt does not perturb 5.0 output, so no DLL overrides are needed.
+# two 4.2 C runtimes.  msvcenv.sh says Wine's builtin msvcrt does not perturb
+# 5.0 output.  That is false for LINK, which orders each DLL's import slots
+# with the C runtime's qsort; Wine's qsort orders equal keys differently from
+# Microsoft's 5.00 runtime.  An msvcrt=n override would break Wine itself, so
+# classic builds run LINK from a staged copy bound to the toolchain's own
+# msvcrt.dll instead (reprobit.msvc50_link_runtime; docs/wine.md).  The
+# script keeps its bytes because they are this authority.
 _TRANSPORT_FILES = {
     "wine/x86/cl": FileAuthority(
         2_900, "01f87f5c7532cc8d0a1fefcbb28031924b718d31c8172949630b5384a51c232d"

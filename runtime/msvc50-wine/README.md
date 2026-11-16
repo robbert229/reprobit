@@ -22,15 +22,19 @@ Wine provides builtin `msvcrt.dll` and `imagehlp.dll`; it has no builtins for
 `msvcp50`, `rcdll`, `mspdb50`, or `msdis100`, so those resolve to the
 provisioned native binaries in `bin/` through `WINEPATH`.
 
-The SP3 byte-identity fixture certifies the same bytes through Wine and
-through native Windows: the compiler and linker reproduce the committed oracle
-pin with Wine's builtin `msvcrt` and `imagehlp`. This is the opposite of the
-MSVC 4.2 finding, where Wine's builtin `msvcrt40`/`msvcrt20` qsort diverged
-from Microsoft's and had to be forced native. For 5.0 no `WINEDLLOVERRIDES` is
-required -- and one is not even possible: forcing `msvcrt` to "native" breaks
-Wine itself because Wine's own `advapi32.dll` depends on `msvcrt.dll`. The 5.0
-profiles therefore declare no Wine DLL overrides, and this transport
-intentionally sets none.
+The `msvcenv.sh` comment says Wine's builtin `msvcrt` does not perturb 5.0
+output. That is not true of LINK: LINK orders each DLL's import slots with the
+C runtime's `qsort`, and Wine's `qsort` orders equal keys differently from
+Microsoft's 5.00 runtime, as in the MSVC 4.2 finding (see `docs/wine.md`).
+A `WINEDLLOVERRIDES` entry cannot force the native runtime, because Wine's own
+`advapi32.dll` depends on `msvcrt.dll`, so the 5.0 profiles declare no Wine
+DLL overrides and this transport intentionally sets none. Instead, ReproBit's
+classic builds run LINK from a staged copy whose `MSVCRT.dll` import is
+renamed to the toolchain's own runtime copied as `MSVCR5.dll`
+(`src/reprobit/msvc50_link_runtime.py`). The `link` transport here still runs
+the installed `link.exe` on Wine's runtime; it is used only for one-off CMake
+graph configuration. `msvcenv.sh` keeps its bytes because they are a
+provisioned authority.
 
 The copyright and permissive license notice inherited from the archaic-msvc
 developers and Martin Storsjo is preserved in every transported file. The
