@@ -19,6 +19,7 @@ from typing import Any, cast
 from pydantic import ValidationError
 
 from reprobit.binary import ByteIdentityError
+from reprobit.classic.address_forms import apply_sib_operand_swaps
 from reprobit.classic.candidate_recipe import (
     internal_relocation_targets,
     relocated_byte_offsets,
@@ -279,6 +280,44 @@ def derive_register_bijection(
     return decision
 
 
+def derive_sib_operand_swaps(
+    donor_body: bytes,
+    target_body: bytes,
+    relocations: dict[int, Any],
+    code_length: int | None,
+) -> list[dict[str, Any]]:
+    """The instructions whose only difference is a swapped SIB base and index."""
+
+    donor = decode_ia32_bijection_body(donor_body, "rewriting donor", relocations, code_length)
+    sites = []
+    for item in donor:
+        start, end = item["offset"], item["offset"] + item["length"]
+        if donor_body[start:end] == target_body[start:end]:
+            continue
+        encoding = item["encoding"]
+        sib_at = encoding["sib_at"] if encoding is not None else None
+        if sib_at is None:
+            raise DiscoveryAuthoringError(
+                f"the instruction at {start} differs beyond its operand order"
+            )
+        sib = donor_body[sib_at]
+        swapped = bytearray(donor_body[start:end])
+        swapped[sib_at - start] = (sib & 0xC0) | (sib & 7) << 3 | (sib >> 3 & 7)
+        if bytes(swapped) != target_body[start:end]:
+            raise DiscoveryAuthoringError(
+                f"the instruction at {start} differs beyond its operand order"
+            )
+        sites.append({"instruction_offset": start})
+    if not sites:
+        raise DiscoveryAuthoringError("donor and reference bodies are already identical")
+    if (
+        target_body[donor[-1]["offset"] + donor[-1]["length"] :]
+        != donor_body[donor[-1]["offset"] + donor[-1]["length"] :]
+    ):
+        raise DiscoveryAuthoringError("the reference differs after the donor's code")
+    return sites
+
+
 def _window_pins(
     body: bytes,
     window: dict[str, Any],
@@ -383,18 +422,24 @@ def build_donor_schedule_rewriting(
             donor_body, relocations, context, view_length, internal_targets
         )
         bijection: dict[str, Any] | None = None
+        swaps: list[dict[str, Any]] = []
         try:
             decisions = derive_schedule_windows(
                 donor_body, target_body, spans, relocated_byte_offsets(rows)
             )
         except DiscoveryAuthoringError as window_error:
+            decisions = []
             try:
                 bijection = derive_register_bijection(
                     donor_body, target_body, relocations, view_length
                 )
             except DiscoveryAuthoringError:
-                raise window_error from None
-            decisions = []
+                try:
+                    swaps = derive_sib_operand_swaps(
+                        donor_body, target_body, relocations, view_length
+                    )
+                except DiscoveryAuthoringError:
+                    raise window_error from None
         image_spans, _ = ia32_schedule_body_walk(
             target_body, relocations, f"{context} image", view_length, internal_targets
         )
@@ -413,6 +458,29 @@ def build_donor_schedule_rewriting(
         instructions = decode_ia32_bijection_body(
             donor_body, f"{context} pre-image", relocations, view_length
         )
+        swap_pins: list[list[int]] = []
+        if swaps:
+            _image, swap_proof = apply_sib_operand_swaps(
+                donor_body,
+                [
+                    {
+                        "instruction_offset": site["instruction_offset"],
+                        "expected_rewritten_offsets": [
+                            next(
+                                item["encoding"]["sib_at"]
+                                for item in instructions
+                                if item["offset"] == site["instruction_offset"]
+                            )
+                        ],
+                    }
+                    for site in swaps
+                ],
+                relocated_byte_offsets(rows),
+                f"{context} SIB swaps",
+                relocations,
+                view_length,
+            )
+            swap_pins = [[site["sib_at"]] for site in swap_proof["sites"]]
         bijection_pins: dict[str, Any] = {}
         if bijection is not None:
             _image, proof = apply_register_bijection(
@@ -487,6 +555,9 @@ def build_donor_schedule_rewriting(
                 expected[f"donor_rewriting.windows[{index}].{key}"] = value
         for key, value in bijection_pins.items():
             expected[f"donor_rewriting.register_bijections[0].{key}"] = value
+        for position, rewritten_bytes in enumerate(swap_pins):
+            pin = f"donor_rewriting.sib_operand_swaps[{position}].expected_rewritten_offsets"
+            expected[pin] = rewritten_bytes
 
         scope = Scope(target=target_id, translation_unit=translation_unit_id, function=symbol)
         family = ClassicRecipeFamily.RETAIL_EXACT_DONOR_REWRITING
@@ -499,6 +570,7 @@ def build_donor_schedule_rewriting(
                         "kind": DONOR_REWRITING_KIND,
                         "windows": decisions,
                         **({"register_bijections": [bijection]} if bijection else {}),
+                        **({"sib_operand_swaps": swaps} if swaps else {}),
                     },
                 ),
             ),
