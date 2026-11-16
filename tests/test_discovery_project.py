@@ -7,6 +7,8 @@ from pydantic import ValidationError
 
 import reprobit.discovery_project as discovery_project
 from reprobit.discovery_contracts import (
+    DeclarationFamily,
+    ExternRunPairSearch,
     InclusiveRange,
     enumerate_declaration_states,
 )
@@ -185,3 +187,44 @@ def test_staged_project_removes_its_owned_arena_when_sealing_fails(
         stage_grind_project(tmp_path, ".reprobit-state", (snapshot,)).__enter__()
 
     assert StateStore(tmp_path / ".reprobit-state").status().runs == ()
+
+
+def _grind_plan_fields(**search: object) -> dict[str, object]:
+    return {
+        "reference_object": "reference/unit.obj",
+        "target": "program",
+        "translation_unit": "tu.unit",
+        "symbol": "_function",
+        **search,
+    }
+
+
+def test_grind_plan_extern_runs_search_c_compatible_declarations() -> None:
+    plan = ProjectGrindPlan.model_validate(
+        _grind_plan_fields(extern_runs={"counts": {"start": 1, "stop": 5}})
+    )
+
+    (search,) = plan.plan.searches
+    assert isinstance(search, ExternRunPairSearch)
+    assert (search.header_counts.start, search.header_counts.stop) == (1, 5)
+    assert (search.seat_counts.start, search.seat_counts.stop) == (0, 0)
+    states = enumerate_declaration_states(plan.plan)
+    assert len(states) == 5
+    assert {state.family for state in states} == {DeclarationFamily.EXTERN_RUN_PAIR}
+
+
+@pytest.mark.parametrize(
+    "search",
+    (
+        {},
+        {"classes": {"start": 1, "stop": 2}},
+        {
+            "classes": {"start": 1, "stop": 2},
+            "functions": {"start": 2, "stop": 2},
+            "extern_runs": {"counts": {"start": 1, "stop": 2}},
+        },
+    ),
+)
+def test_grind_plan_names_exactly_one_search(search: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        ProjectGrindPlan.model_validate(_grind_plan_fields(**search))
