@@ -61,6 +61,12 @@ from reprobit.classic_runtime_producer import (
 from reprobit.classic_runtime_warm import ClassicWarmExecution
 from reprobit.intervention_metadata import ClassicRecipeFamily
 from reprobit.model import Digest
+from reprobit.msvc50_link_runtime import (
+    STAGED_LINKER,
+    Msvc50LinkRuntimeError,
+    applies_to_profile,
+    stage_link_runtime,
+)
 from reprobit.producer_graph import ProducerRole, read_producer_graph
 from reprobit.schema import (
     ClassicRecipeIntervention,
@@ -261,6 +267,30 @@ def _capture_and_restore_overlay_outputs(
     )
 
 
+def _stage_profile_linker(
+    bundle: ProjectBundle,
+    projected_toolchain: Path,
+    role_relatives: Mapping[ProducerRole, str],
+) -> tuple[Mapping[ProducerRole, str], tuple[Path, ...]]:
+    """Point the linker role at the profile's staged LINK runtime, if it has one.
+
+    MSVC 5.0's LINK sorts each DLL's import slots with its C runtime's qsort,
+    so it must run on the toolchain's own MSVCRT 5.00 rather than Wine's
+    builtin (:mod:`reprobit.msvc50_link_runtime`).  The staged copy is derived
+    from the locked files already projected into the run, never from the
+    installed toolchain, and is authenticated against reviewed digests.
+    """
+
+    profile_identifier = bundle.spec.toolchain.profile
+    if not applies_to_profile(profile_identifier):
+        return role_relatives, ()
+    try:
+        staged = stage_link_runtime(projected_toolchain, profile_identifier)
+    except Msvc50LinkRuntimeError as exc:
+        raise ClassicProjectError(f"MSVC 5.0 native-CRT LINK runtime: {exc}") from exc
+    return MappingProxyType({**role_relatives, ProducerRole.LINKER: STAGED_LINKER}), staged
+
+
 def prepare_classic_producer_graph_run(
     bundle: ProjectBundle,
     *,
@@ -375,6 +405,9 @@ def prepare_classic_producer_graph_run(
     )
     installation.doctor(toolchain_lock).require_ok()
     role_tool_ids, role_relatives = _graph_role_bindings(bundle, installation)
+    role_relatives, link_runtime_files = _stage_profile_linker(
+        bundle, installation.root, role_relatives
+    )
 
     wrapper_files: tuple[Path, ...] = ()
     proxy_files: tuple[Path, ...] = ()
@@ -526,6 +559,7 @@ def prepare_classic_producer_graph_run(
         *proxy_files,
         *system_library_map.values(),
         *original_toolchain_inputs,
+        *link_runtime_files,
     ]
     if proxy_template is not None:
         authority_inputs.append(proxy_template)

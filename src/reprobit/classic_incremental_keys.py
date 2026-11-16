@@ -24,6 +24,7 @@ from reprobit.classic_incremental_context import (
 from reprobit.classic_orchestration import ClassicPreparedUnit
 from reprobit.incremental_executor import NodeOutcome
 from reprobit.msvc42_debug_companion import MSVC42_DEBUG_PAIR_POLICY
+from reprobit.msvc50_link_runtime import link_runtime_material
 from reprobit.paths import normalize_logical_path
 from reprobit.producer_graph import ProducerNode, ProducerRole
 from reprobit.schema import ProjectBundle
@@ -212,6 +213,9 @@ def _warm_analysis_link_material(
     )
 
 
+_LINK_RUNTIME_ROLES = frozenset({ProducerRole.LINKER.value, "analysis-link"})
+
+
 def _base_material(
     *,
     bundle: ProjectBundle,
@@ -234,7 +238,7 @@ def _base_material(
     graph = bundle.producer_graph
     if graph is None:
         raise ClassicIncrementalError("warm build has no producer graph")
-    return {
+    material: dict[str, JsonValue] = {
         "graph": graph_digest,
         "node": node_identity,
         "role": role,
@@ -260,6 +264,14 @@ def _base_material(
         "composition_inputs": json_value(list(composition_inputs)),
         "transform_inputs": json_value(list(transform_inputs)),
     }
+    # MSVC 5.0 LINK runs from a staged copy on the toolchain's own C runtime
+    # (reprobit.msvc50_link_runtime).  The lock does not change with it, so
+    # every role that runs LINK binds the staged set's identity.
+    if role in _LINK_RUNTIME_ROLES:
+        link_runtime = link_runtime_material(bundle.spec.toolchain.profile)
+        if link_runtime is not None:
+            material["link_runtime"] = link_runtime
+    return material
 
 
 def compiler_material(

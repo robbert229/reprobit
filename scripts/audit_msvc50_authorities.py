@@ -2,7 +2,9 @@
 
 Every declared profile path is checked against the checked-out pinned revision,
 then file size/digest authorities and portable-tree-v1 tree receipts are
-recomputed with the library's own authority code. The script writes
+recomputed with the library's own authority code.  The staged native-CRT LINK
+runtime (:mod:`reprobit.msvc50_link_runtime`) is derived from the same files
+with the library's own derivation and recorded as a fourth table. The script writes
 ``src/reprobit/msvc50_authorities.py`` with ``--write`` and otherwise fails if
 the committed module differs from the audit.
 
@@ -22,6 +24,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from reprobit.msvc50_link_runtime import derive_link_runtime
 from reprobit.msvc50_provision import _RUNTIME_PLACEMENT
 from reprobit.toolchains import (
     MSVC_50_RTM,
@@ -76,6 +79,22 @@ def _file_authority(root: Path, relative: str) -> tuple[int, str]:
         raise AuditError(f"{root.name}: declared file is absent or redirected: {relative}")
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
     return path.stat().st_size, digest
+
+
+def _native_crt_link_authorities(root: Path) -> dict[str, object]:
+    """Derive the staged LINK runtime from the declared installed files."""
+
+    def read(relative: str) -> bytes:
+        source = _RUNTIME_PLACEMENT.get(relative, relative)
+        path = root.joinpath(*source.split("/"))
+        if not path.is_file() or path.is_symlink():
+            raise AuditError(f"{root.name}: derivation input is absent or redirected: {relative}")
+        return path.read_bytes()
+
+    return {
+        name: (len(payload), hashlib.sha256(payload).hexdigest())
+        for name, payload in derive_link_runtime(read).items()
+    }
 
 
 def _tree_authority(root: Path, relative: str) -> dict[str, int | str]:
@@ -163,6 +182,7 @@ def audit_profile(
             for relative in _declared_trees(installation_profile)
         },
         "cmake_frontend": {CMAKE_FRONTEND_PATH: _file_authority(checkout, CMAKE_FRONTEND_PATH)},
+        "native_crt_link": _native_crt_link_authorities(checkout),
     }
 
 
@@ -206,8 +226,19 @@ def _format_authorities(audited: dict[str, dict[str, dict[str, object]]]) -> str
         ("files", "MSVC50_FILE_AUTHORITIES"),
         ("trees", "MSVC50_TREE_AUTHORITIES"),
         ("cmake_frontend", "MSVC50_CMAKE_FRONTEND_AUTHORITIES"),
+        ("native_crt_link", "MSVC50_NATIVE_CRT_LINK_AUTHORITIES"),
     )
     for section, attribute in sections:
+        if attribute == "MSVC50_NATIVE_CRT_LINK_AUTHORITIES":
+            lines.extend(
+                [
+                    "# Derived, never installed: the staged LINK runtime each build writes",
+                    "# into its private toolchain copy (reprobit.msvc50_link_runtime).",
+                    "# link.exe, mspdb50.dll, msdis100.dll and msvcp50.dll are the installed",
+                    "# files with their one MSVCRT.dll import renamed MSVCR5.dll; MSVCR5.dll",
+                    "# is bin/msvcrt.dll unchanged. Keyed by staged file name.",
+                ]
+            )
         if attribute == "MSVC50_CMAKE_FRONTEND_AUTHORITIES":
             lines.extend(
                 [
@@ -264,6 +295,7 @@ def load_committed_authorities(path: Path) -> dict[str, dict[str, dict[str, obje
         "files": module.MSVC50_FILE_AUTHORITIES,
         "trees": module.MSVC50_TREE_AUTHORITIES,
         "cmake_frontend": module.MSVC50_CMAKE_FRONTEND_AUTHORITIES,
+        "native_crt_link": module.MSVC50_NATIVE_CRT_LINK_AUTHORITIES,
     }
     loaded: dict[str, dict[str, dict[str, object]]] = {}
     for identifier in PROFILE_IDENTIFIERS:
@@ -275,7 +307,7 @@ def load_committed_authorities(path: Path) -> dict[str, dict[str, dict[str, obje
                     field_name: getattr(authority, field_name)
                     for field_name in authority.__dataclass_fields__
                 }
-                if section in ("files", "cmake_frontend"):
+                if section in ("files", "cmake_frontend", "native_crt_link"):
                     entries[relative] = (fields["size"], fields["sha256"])
                 else:
                     entries[relative] = {
@@ -325,7 +357,7 @@ def main(argv: list[str] | None = None) -> int:
     committed = load_committed_authorities(args.output)
     if committed != audited:
         for identifier in PROFILE_IDENTIFIERS:
-            for section in ("files", "trees", "cmake_frontend"):
+            for section in ("files", "trees", "cmake_frontend", "native_crt_link"):
                 if committed[identifier][section] != audited[identifier][section]:
                     print(
                         f"{identifier}: committed {section} differ from the audited upstream",

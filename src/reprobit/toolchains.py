@@ -238,11 +238,12 @@ _PROFILES = {
         required_runtime_files=_MSVC42_RUNTIME,
         wine_dll_overrides=(("msvcrt40", "n"), ("msvcrt20", "n")),
     ),
-    # The 5.0 profiles deliberately carry no wine_dll_overrides. The Wine
-    # fidelity finding (docs/wine.md) established that Wine's builtin
-    # msvcrt.dll and imagehlp.dll do not perturb 5.0 compiler or linker
-    # output, and that a native msvcrt override would be unimplementable
-    # (Wine's own advapi32.dll depends on msvcrt.dll).
+    # The 5.0 profiles deliberately carry no wine_dll_overrides: a native
+    # msvcrt override would be unimplementable (Wine's own advapi32.dll
+    # depends on msvcrt.dll).  Wine's builtin msvcrt does perturb LINK, whose
+    # import-slot order comes from the C runtime's qsort, so classic builds
+    # run LINK from a staged copy bound to the toolchain's own msvcrt.dll
+    # (reprobit.msvc50_link_runtime; docs/wine.md).
     MSVC_50_RTM: ToolchainProfile(
         identifier=MSVC_50_RTM,
         display_name="Microsoft Visual C++ 5.0 RTM",

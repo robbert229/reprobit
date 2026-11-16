@@ -23,7 +23,7 @@ through `WINEPATH`.
 | DLL | Wine builtin? | 4.2 | 5.0 |
 | --- | --- | --- | --- |
 | `MSVCRT40.dll` / `msvcrt20.dll` | yes | overridden to native | n/a |
-| `MSVCRT.dll` | yes | n/a | used; no override |
+| `MSVCRT.dll` | yes | n/a | builtin for `cl`, `lib`, `rc`; LINK runs on the native copy staged as `MSVCR5.dll` |
 | `imagehlp.dll` | yes | n/a | used; no override |
 | `msvcp50.dll` | no | n/a | native |
 | `rcdll.dll` | no | native | native |
@@ -44,21 +44,46 @@ it in the application directory.
 ## MSVC 5.0 finding
 
 Every 5.0 bin tool imports `MSVCRT.dll`. Wine also reimplements `msvcrt.dll`
-and `imagehlp.dll`, and both are loaded during a 5.0 build. The SP3
-byte-identity fixture certifies that these Wine builtins **do not perturb
-5.0 compiler or linker output**: the committed oracle pin
-(`79b3416c...dd2a`, 1,024 bytes) reproduces byte-for-byte through Wine, and
-the same pin is the native-Windows calibration point. Two CI lanes proved this
-(from scratch, cold `rbit verify`) on the same repository, one on
-`windows-2022` and one on a POSIX Wine runner.
+and `imagehlp.dll`, and both are loaded during a 5.0 build.
 
-Consistent with that, the 5.0 profiles declare **no** `wine_dll_overrides`.
-There is a second, structural reason this is the only safe choice: forcing
-`msvcrt=n` on a 5.0 profile is impossible, because Wine's own `advapi32.dll`
-depends on `msvcrt.dll`; a native-only override breaks Wine's boot chain
-before any tool starts. No other imported DLL is a Wine builtin, so the
-provisioned native `msvcp50`, `rcdll`, `mspdb50`, and `msdis100` load from
-`bin/` unchanged.
+**Wine's builtin `msvcrt` does perturb 5.0 LINK output.** LINK 5.0 builds
+each DLL's import address table by sorting the loaded import-library members
+with the C runtime's `qsort`, keyed on the DLL name alone, so the imports of
+one DLL compare equal and keep whatever order that `qsort` leaves. Below the
+cutoff of 8 elements Wine's `small_sort` and Microsoft's `shortsort` are the
+same selection sort and agree; from there on Microsoft swaps the pivot to the
+front and Wine does not, exactly as in the 4.2 finding above. A program that
+imports all 21 `d3drm.lib` functions links with two IAT slots exchanged
+(`tests/test_msvc50_link_runtime.py`). The SP3 byte-identity fixture did not
+show this because its program has no imports.
+
+A `WINEDLLOVERRIDES` entry cannot fix it: forcing `msvcrt=n` on a 5.0 profile
+is impossible, because Wine's own `advapi32.dll` depends on `msvcrt.dll`; a
+native-only override breaks Wine's boot chain before any tool starts. So the
+5.0 profiles still declare **no** `wine_dll_overrides`, and every classic
+build instead runs LINK from a staged copy
+(`src/reprobit/msvc50_link_runtime.py`):
+
+- `link.exe`, `mspdb50.dll`, `msdis100.dll` and `msvcp50.dll` are copied with
+  their one `MSVCRT.dll` import renamed to the same-length `MSVCR5.dll`;
+- the toolchain's `msvcrt.dll` is copied beside them as `MSVCR5.dll`.
+
+The loader searches the executable's directory first and Wine has no
+`MSVCR5` builtin, so LINK binds Microsoft's 5.00 runtime while Wine keeps its
+own. The copies live in the run's private toolchain projection
+(`reprobit-native-crt-link/`), never in the installed toolchain. Their bytes
+are a pure function of the locked files: each input must equal its reviewed
+profile authority and each output its reviewed derived authority
+(`MSVC50_NATIVE_CRT_LINK_AUTHORITIES`, recomputed by
+`scripts/audit_msvc50_authorities.py`). The evidence audit admits a staged
+file only at its staged path, with its derived digest, and only when the lock
+admits all five derivation inputs with their reviewed bytes. Cache keys of
+link steps bind the staged set's identity.
+
+`cl`, `lib` and `rc` still run on Wine's builtin `msvcrt`; nothing so far
+shows their output depending on it. No other imported DLL is a Wine builtin,
+so the provisioned native `msvcp50`, `rcdll`, `mspdb50`, and `msdis100` load
+from `bin/` unchanged for those tools.
 
 ## Where the overrides live
 
