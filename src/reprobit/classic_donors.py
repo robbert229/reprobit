@@ -340,6 +340,11 @@ def generate_forward_run(prefix: str, count: int, width: int) -> bytes:
     )
 
 
+# Where an extern-run pair's header run sits: after the unit's final #include
+# (the default, also when the parameter is absent) or at the unit's start.
+EXTERN_HEADER_PLACEMENTS = frozenset({"after_includes", "prefix"})
+
+
 def generate_extern_run(prefix: str, count: int, width: int) -> bytes:
     prefix = _identifier(prefix, "extern-run prefix")
     _integer(count, "extern-run count", minimum=1, maximum=999)
@@ -752,11 +757,18 @@ def validate_donor_recipe(
                 "seat_count",
                 "width",
                 "role_policy",
+                "header_placement",
             },
             family.value,
-            optional={"role_policy"},
+            optional={"role_policy", "header_placement"},
         )
         _validate_role_policy(parameters)
+        # The header run sits after the unit's final #include unless it is
+        # placed at the unit's start, before code that a later include follows.
+        _require(
+            parameters.get("header_placement", "after_includes") in EXTERN_HEADER_PLACEMENTS,
+            "extern-run header placement differs",
+        )
         width = _integer(parameters.get("width"), "width", minimum=1, maximum=3)
         pieces: list[bytes] = []
         for seat in ("header", "seat"):
@@ -1083,7 +1095,12 @@ def _render_ordinary_source(
             if parameters["seat_count"]
             else b""
         )
-        rendered = _insert_after_includes(source, header, family.value) if header else source
+        if not header:
+            rendered = source
+        elif parameters.get("header_placement", "after_includes") == "prefix":
+            rendered = header + source
+        else:
+            rendered = _insert_after_includes(source, header, family.value)
         return _append_lines(rendered, seat) if seat else rendered
     if family is ClassicRecipeFamily.FORWARD_RUN_WITH_SHAPE:
         forward = generate_forward_run(

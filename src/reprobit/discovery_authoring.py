@@ -405,12 +405,16 @@ def build_extern_run_donor(
     seat_count: int,
     width: int,
     beneficiary_symbols: tuple[str, ...] = (),
+    header_placement: str = "after_includes",
 ) -> AuthoredClassicRecord:
     """Build one deterministic, payload-free extern-run donor record without a role policy.
 
-    The header run is seated after the translation unit's final include and
-    the seat run at physical EOF; either count may be zero but not both.  The
-    record carries no ``role_policy``, so any equal-body consumer may host on it.
+    The header run is seated after the translation unit's final include, or
+    at the unit's start with ``header_placement="prefix"`` (for a unit that
+    includes again after the functions it targets), and the seat run at
+    physical EOF; either count may be zero but not both.  The record carries
+    no ``role_policy``, so any equal-body consumer may host on it.  The default
+    placement is left out of the parameters, so existing records keep their ids.
     """
 
     try:
@@ -433,6 +437,8 @@ def build_extern_run_donor(
             "seat_prefix": seat_prefix,
             "width": width,
         }
+        if header_placement != "after_includes":
+            parameters["header_placement"] = header_placement
         intervention_id = _stable_id(
             "donor",
             {

@@ -221,19 +221,28 @@ def _require_grind_family(state: DeclarationState) -> None:
         raise GrindError(f"project grind cannot author a {state.family.value} donor")
 
 
-def _state_digest(state: DeclarationState) -> str:
-    """The generated-header digest the state's donor record would carry."""
+_DEFAULT_HEADER_PLACEMENT = "after_includes"
+
+
+def _header_placement(context: ProjectGrindContext) -> str:
+    runs = context.config.extern_runs
+    return runs.placement if runs is not None else _DEFAULT_HEADER_PLACEMENT
+
+
+def _state_digest(state: DeclarationState, context: ProjectGrindContext) -> tuple[str, str]:
+    """The generated-header digest and placement the state's donor would carry."""
 
     _require_grind_family(state)
     if state.family is DeclarationFamily.DECLARATION_SHAPE:
-        return Digest.from_bytes(generate_declaration_shape(*_state_shape(state))).value
+        generated = generate_declaration_shape(*_state_shape(state))
+        return Digest.from_bytes(generated).value, _DEFAULT_HEADER_PLACEMENT
     run = _extern_run(state)
     generated = b""
     if run.header_count:
         generated += generate_extern_run(run.header_prefix, run.header_count, run.width)
     if run.seat_count:
         generated += generate_extern_run(run.seat_prefix, run.seat_count, run.width)
-    return Digest.from_bytes(generated).value
+    return Digest.from_bytes(generated).value, _header_placement(context)
 
 
 def _state_donor(state: DeclarationState, context: ProjectGrindContext) -> AuthoredClassicRecord:
@@ -260,6 +269,7 @@ def _state_donor(state: DeclarationState, context: ProjectGrindContext) -> Autho
         seat_prefix=run.seat_prefix,
         seat_count=run.seat_count,
         width=run.width,
+        header_placement=_header_placement(context),
     )
 
 
@@ -297,6 +307,7 @@ def _state_equal_body(
         seat_count=run.seat_count,
         width=run.width,
         beneficiary_symbols=(context.symbol,),
+        header_placement=_header_placement(context),
     )
     try:
         return build_donor_equal_body(
@@ -476,19 +487,21 @@ def require_single_acceptance(
         raise error(message)
 
 
-def _saved_donor_digests(document: InterventionDocument) -> frozenset[str]:
-    """Generated-header digests of the unit's saved grind-family donors."""
+def _saved_donor_digests(document: InterventionDocument) -> frozenset[tuple[str, str]]:
+    """Generated-header digests and placements of the unit's saved grind-family donors."""
 
-    digests: set[str] = set()
+    digests: set[tuple[str, str]] = set()
     for intervention in document.interventions:
         if (
             isinstance(intervention, ClassicRecipeIntervention)
             and intervention.role is ClassicRecipeRole.DONOR
             and intervention.family in _GRIND_DONOR_FAMILIES
         ):
-            for field in intervention.parameters:
-                if field.name == "generated_header_sha256" and isinstance(field.value, str):
-                    digests.add(field.value)
+            values = {field.name: field.value for field in intervention.parameters}
+            digest = values.get("generated_header_sha256")
+            placement = values.get("header_placement", _DEFAULT_HEADER_PLACEMENT)
+            if isinstance(digest, str) and isinstance(placement, str):
+                digests.add((digest, placement))
     return frozenset(digests)
 
 
@@ -557,7 +570,9 @@ def run_project_grind(
         # A state one of the unit's saved donors already renders would share
         # that donor's compiler arena; it is that donor's, not a fresh cell.
         saved_digests = _saved_donor_digests(context.intervention_document)
-        states = tuple(state for state in states if _state_digest(state) not in saved_digests)
+        states = tuple(
+            state for state in states if _state_digest(state, context) not in saved_digests
+        )
         # Each state has one compatibility disposition and one cold-trial
         # disposition. States that cannot qualify consume the latter as an
         # explicit skip, keeping one honest and monotonic progress total.

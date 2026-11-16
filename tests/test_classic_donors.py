@@ -20,6 +20,7 @@ from reprobit.classic_donors import (
     matching_candidate_constraints,
     merge_candidate_constraints,
     prepare_donor_compile_request,
+    render_declaration_carrier_source,
     validate_donor_recipe,
 )
 from reprobit.intervention_metadata import CLASSIC_RECIPE_METADATA
@@ -591,3 +592,51 @@ def test_constraint_receipt_cross_checks_identity_family_and_payloads() -> None:
         )
     with pytest.raises(DonorSourceError, match="one proof receipt"):
         matching_candidate_constraints(intervention, [])
+
+
+def _extern_pair(**extra: Any) -> ClassicRecipeIntervention:
+    header = generate_extern_run("g_head", 2, 1)
+    return _intervention(
+        ClassicRecipeFamily.EXTERN_RUN_PAIR,
+        _carrier_parameters(
+            header,
+            header_prefix="g_head",
+            header_count=2,
+            seat_prefix="g_tail",
+            seat_count=0,
+            width=1,
+            **extra,
+        ),
+    )
+
+
+_LATE_INCLUDE_SOURCE = b'#include "a.h"\nint f(void) { return 0; }\n#include "b.h"\n'
+
+
+def test_extern_run_header_defaults_after_the_final_include() -> None:
+    rendered = render_declaration_carrier_source(
+        _extern_pair(),
+        [_receipt(ClassicRecipeFamily.EXTERN_RUN_PAIR)],
+        _LATE_INCLUDE_SOURCE,
+    )
+
+    assert rendered.endswith(b'#include "b.h"\nextern int g_head0;\nextern int g_head1;\n')
+
+
+def test_extern_run_header_prefix_precedes_the_whole_unit() -> None:
+    rendered = render_declaration_carrier_source(
+        _extern_pair(header_placement="prefix"),
+        [_receipt(ClassicRecipeFamily.EXTERN_RUN_PAIR)],
+        _LATE_INCLUDE_SOURCE,
+    )
+
+    assert rendered == b"extern int g_head0;\nextern int g_head1;\n" + _LATE_INCLUDE_SOURCE
+
+
+def test_extern_run_header_rejects_an_unknown_placement() -> None:
+    with pytest.raises(DonorSourceError, match="header placement"):
+        render_declaration_carrier_source(
+            _extern_pair(header_placement="suffix"),
+            [_receipt(ClassicRecipeFamily.EXTERN_RUN_PAIR)],
+            _LATE_INCLUDE_SOURCE,
+        )
