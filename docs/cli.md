@@ -251,9 +251,12 @@ every tracked file. Name a new `--path` set to replace the saved selection.
 
 `source lock` publishes the manifest and, when one exists, its build-plan
 binding in one guarded transaction. Every admitted source file is checked
-again, so an edit racing the lock aborts rather than saving mixed state. It does
-not rewrite translation-unit, intervention, or proof checks. If those checks
-became stale after a routine edit, use `rbit repair .`. The advanced
+again, so an edit racing the lock aborts rather than saving mixed state. An
+edited translation unit whose intervention and proof shards hold no
+intervention and no expected observation guards nothing, so the lock re-pins
+its source digest in the build plan and its intervention shard in the same
+transaction. It does not rewrite any other translation-unit, intervention, or
+proof check: if one became stale after a routine edit, use `rbit repair .`. The advanced
 [`source regenerate`](#rbit-source-regenerate) command lets you inspect only the
 mechanical changes when diagnosing a repair.
 
