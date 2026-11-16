@@ -337,4 +337,4 @@ def test_a_local_register_permutation_gets_its_own_region() -> None:
     body = bytes.fromhex("8b4c24048b54240803ca8bc1c3")
     target = bytes.fromhex("8b5424048b4c240803d18bc2c3")
     items = derive_regional_bijections(body, target, {}, None, frozenset(), frozenset())
-    assert items == [{"mapping": {"ecx": "edx", "edx": "ecx"}, "region_start": 0, "region_end": 14}]
+    assert items == [{"mapping": {"ecx": "edx", "edx": "ecx"}, "region_start": 0, "region_end": 12}]
