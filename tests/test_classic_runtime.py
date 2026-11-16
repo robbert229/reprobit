@@ -1555,6 +1555,128 @@ def test_source_resolved_system_library_rejects_missing_or_changed_sdk_pin(
         )
 
 
+def _toolchain_library_path_fixture(
+    tmp_path: Path,
+    argument: str,
+    *,
+    library_files: tuple[str, ...] = ("lib/kernel32.lib",),
+) -> tuple[ProjectBundle, ProducerGraphDocument, ClassicMSVCToolchain, Path, Path]:
+    source_root = tmp_path / "source"
+    build_root = tmp_path / "build"
+    toolchain_root = tmp_path / "toolchain"
+    source_root.mkdir()
+    build_root.mkdir()
+    for relative in ("lib", "mfc/lib"):
+        (toolchain_root / relative).mkdir(parents=True)
+    for relative in library_files:
+        (toolchain_root / relative).write_bytes(b"kernel32 import library: " + relative.encode())
+    node = ProducerNode(
+        id="linker.program.0000",
+        role=ProducerRole.LINKER,
+        owner="program",
+        target_id="program",
+        arguments=("kernel32.lib", argument, "/out:${BUILD}/APP.EXE"),
+        inputs=("system-library/kernel32.lib",),
+        outputs=("build/APP.EXE",),
+    )
+    graph = ProducerGraphDocument(
+        schema_version=3,
+        toolchain_lock_digest=Digest.from_bytes(b"toolchain"),
+        path_profile_id="fixture",
+        extractor="cmake-makefiles-v1",
+        nodes=(node,),
+    )
+    bundle = _prepare_bundle(tmp_path)
+    bundle = bundle.model_copy(
+        update={
+            "source_manifest": SourceManifestDocument(
+                schema_version=3,
+                complete=True,
+                entries=(
+                    SourceManifestEntry(
+                        path="src/unit.c",
+                        size=len(b"unit"),
+                        digest=Digest.from_bytes(b"unit"),
+                    ),
+                ),
+            ),
+        }
+    )
+    installation = ClassicMSVCToolchain("msvc_4_2", toolchain_root)
+    return bundle, graph, installation, source_root, build_root
+
+
+@pytest.mark.parametrize(
+    ("argument", "library_files"),
+    (
+        ("${TOOLCHAIN}/lib/kernel32.lib", ("lib/kernel32.lib",)),
+        # Win32 opens the path case-insensitively, as LINK sees it.
+        ("${TOOLCHAIN}/lib/kernel32.lib", ("lib/KERNEL32.LIB",)),
+    ),
+)
+def test_toolchain_library_path_binds_to_its_resolved_system_library(
+    tmp_path: Path,
+    argument: str,
+    library_files: tuple[str, ...],
+) -> None:
+    bundle, graph, installation, source_root, build_root = _toolchain_library_path_fixture(
+        tmp_path, argument, library_files=library_files
+    )
+    result = classic_runtime_graph._graph_system_library_map(
+        bundle,
+        graph,
+        installation,
+        effective_root=source_root,
+        build_root=build_root,
+    )
+    assert result == {
+        "system-library/kernel32.lib": (installation.root / library_files[0]).resolve(strict=True)
+    }
+
+
+@pytest.mark.parametrize(
+    ("argument", "library_files"),
+    (
+        # The bare name resolves in lib/ (the first library root); the path
+        # names a different file.
+        ("${TOOLCHAIN}/mfc/lib/kernel32.lib", ("lib/kernel32.lib", "mfc/lib/kernel32.lib")),
+        # The path names no file.
+        ("${TOOLCHAIN}/mfc/lib/kernel32.lib", ("lib/kernel32.lib",)),
+    ),
+)
+def test_toolchain_library_path_must_name_the_resolved_system_library(
+    tmp_path: Path,
+    argument: str,
+    library_files: tuple[str, ...],
+) -> None:
+    bundle, graph, installation, source_root, build_root = _toolchain_library_path_fixture(
+        tmp_path, argument, library_files=library_files
+    )
+    with pytest.raises(ClassicProjectError, match="not the file its system library"):
+        classic_runtime_graph._graph_system_library_map(
+            bundle,
+            graph,
+            installation,
+            effective_root=source_root,
+            build_root=build_root,
+        )
+
+
+def test_toolchain_library_path_refuses_a_redirected_file(tmp_path: Path) -> None:
+    bundle, graph, installation, source_root, build_root = _toolchain_library_path_fixture(
+        tmp_path, "${TOOLCHAIN}/mfc/lib/kernel32.lib"
+    )
+    (installation.root / "mfc/lib/kernel32.lib").symlink_to(installation.root / "lib/kernel32.lib")
+    with pytest.raises(ClassicProjectError, match="not the file its system library"):
+        classic_runtime_graph._graph_system_library_map(
+            bundle,
+            graph,
+            installation,
+            effective_root=source_root,
+            build_root=build_root,
+        )
+
+
 def test_published_target_reseal_detects_same_inode_mutation(tmp_path: Path) -> None:
     bundle = _prepare_bundle(tmp_path)
     snapshot = atomic_publish_relative(tmp_path, "state/program.exe", b"candidate")

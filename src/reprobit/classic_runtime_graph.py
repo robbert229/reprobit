@@ -20,6 +20,7 @@ from reprobit.producer_graph import (
     ProducerRole,
     materialize_argument,
     materialize_reference,
+    toolchain_system_library,
 )
 from reprobit.schema import ProjectBundle
 from reprobit.toolchains import ClassicMSVCToolchain
@@ -333,6 +334,55 @@ def _graph_targets(
     return tuple(sorted(targets, key=lambda item: item.target_id.casefold()))
 
 
+def _toolchain_library_file(root: Path, relative: str) -> Path | None:
+    """Resolve a toolchain-seat path the way the producer's file system does.
+
+    Win32 opens ``lib/kernel32.lib`` case-insensitively, so each component
+    matches its unique case-insensitive sibling when no exact one exists.
+    """
+
+    current = root.resolve(strict=True)
+    for part in PurePosixPath(relative).parts:
+        exact = current / part
+        if exact.exists() or exact.is_symlink():
+            candidate = exact
+        else:
+            matches = tuple(
+                child for child in current.iterdir() if child.name.casefold() == part.casefold()
+            )
+            if len(matches) != 1:
+                return None
+            candidate = matches[0]
+        if candidate.is_symlink():
+            return None
+        current = candidate
+    return current if current.is_file() else None
+
+
+def _verify_toolchain_library_arguments(
+    node: ProducerNode,
+    installation: ClassicMSVCToolchain,
+    libraries: Mapping[str, Path],
+) -> None:
+    """Bind each toolchain-path library argument to its locked system library."""
+
+    if node.role is not ProducerRole.LINKER:
+        return
+    for argument in node.arguments:
+        library = toolchain_system_library(argument)
+        if library is None:
+            continue
+        relative, name = library
+        reference = f"system-library/{name.casefold()}"
+        selected = libraries.get(reference)
+        named = _toolchain_library_file(installation.root, relative)
+        if selected is None or named is None or named.resolve(strict=True) != selected:
+            raise ClassicProjectError(
+                f"producer {node.id!r} names toolchain library {argument!r}, which is not "
+                f"the file its system library {name!r} resolves to"
+            )
+
+
 def _graph_system_library_map(
     bundle: ProjectBundle,
     graph: ProducerGraphDocument,
@@ -455,6 +505,7 @@ def _graph_system_library_map(
                 raise ClassicProjectError(
                     f"system library {name!r} resolves differently across producer nodes"
                 )
+        _verify_toolchain_library_arguments(node, installation, result)
     return MappingProxyType(dict(sorted(result.items(), key=lambda item: item[0].casefold())))
 
 
