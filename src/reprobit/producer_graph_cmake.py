@@ -56,6 +56,7 @@ from reprobit.producer_graph import (
     ProducerNode,
     ProducerRole,
     graph_reference,
+    toolchain_system_library,
     validate_graph_reference,
 )
 
@@ -456,6 +457,18 @@ def _normalize_node(
             inputs.add(graph_reference("build", plain.removeprefix("${BUILD}/")))
         elif re.fullmatch(r"(?i)[a-z0-9_.+@-]+\.lib", plain):
             inputs.add(graph_reference("system-library", plain))
+        elif node.role is ProducerRole.LINKER and plain == argument:
+            # A library named by its toolchain path keeps that spelling in
+            # argv (LINK searches a name once, so a repeat spelled as a path
+            # is searched again) and is the same locked system library.
+            try:
+                toolchain_library = toolchain_system_library(plain)
+            except ValueError as error:
+                raise ProducerGraphError(
+                    f"CMake target {node.owner!r} links an unsupported toolchain library: {plain!r}"
+                ) from error
+            if toolchain_library is not None:
+                inputs.add(graph_reference("system-library", toolchain_library[1]))
     inputs.difference_update(node.outputs)
     return _RawNode(
         role=node.role,

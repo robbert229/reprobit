@@ -28,6 +28,7 @@ _REFERENCE_KINDS = frozenset(
     {"source", "build", "toolchain", "system-library", "quarantine-archive"}
 )
 _WINDOWS_ABSOLUTE = re.compile(r"(?i)[a-z]:[\\/]")
+_SYSTEM_LIBRARY_NAME = re.compile(r"(?i)[a-z0-9_.+@-]+\.lib")
 _SEPARATE_PATH_OPTIONS = frozenset({"/i", "-i", "/fi", "-fi", "/fo", "-fo", "/fd", "-fd"})
 _ATTACHED_PATH_OPTIONS = (
     "/libpath:",
@@ -227,6 +228,28 @@ def validate_graph_reference(value: str, *, output: bool = False) -> str:
     return value
 
 
+def toolchain_system_library(value: str) -> tuple[str, str] | None:
+    """Return a toolchain library path argument's relative path and library name.
+
+    A linker library argument may name a locked system library by its path in
+    the toolchain seat (``${TOOLCHAIN}/lib/kernel32.lib``) instead of by its
+    bare name.  It is the same ``system-library/<name>`` input: the runtime
+    requires the path to be the very file the bare name resolves to.  The
+    spelling still matters to LINK, which searches each library name once, so
+    a later path spelling of an already-listed library is searched again.
+    """
+
+    if not value.startswith("${TOOLCHAIN}/"):
+        return None
+    relative = value.removeprefix("${TOOLCHAIN}/")
+    if PurePosixPath(relative).suffix.casefold() != ".lib":
+        return None
+    name = PurePosixPath(relative).name
+    if _SYSTEM_LIBRARY_NAME.fullmatch(name) is None:
+        raise ValueError("toolchain library argument must name one plain .lib file")
+    return _relative(relative, label="toolchain library argument"), name
+
+
 def _argument_reference(
     value: str,
     *,
@@ -236,12 +259,17 @@ def _argument_reference(
 ) -> str:
     """Translate one already-validated argv path into its graph edge.
 
-    Relative output-option payloads are build-seat paths.  A bare library
-    input is a locked system-library identity; every other input file must
-    carry an explicit logical-seat marker so a project file cannot be mistaken
-    for a toolchain library.
+    Relative output-option payloads are build-seat paths.  A linker library
+    input that is bare, or that names a file in the toolchain seat, is a
+    locked system-library identity; every other input file must carry an
+    explicit logical-seat marker so a project file cannot be mistaken for a
+    toolchain library.
     """
 
+    if bare_library:
+        toolchain_library = toolchain_system_library(value)
+        if toolchain_library is not None:
+            return validate_graph_reference(f"system-library/{toolchain_library[1]}")
     marker = next((item for item in _MARKERS if value.startswith(item)), None)
     if marker is not None:
         suffix = value[len(marker) :]
@@ -264,7 +292,7 @@ def _argument_reference(
     if output:
         relative = _relative(value, label="producer output argument")
         return validate_graph_reference(f"build/{relative}", output=True)
-    if bare_library and re.fullmatch(r"(?i)[a-z0-9_.+@-]+\.lib", value):
+    if bare_library and _SYSTEM_LIBRARY_NAME.fullmatch(value):
         return validate_graph_reference(f"system-library/{value}")
     raise ValueError("producer input file argument must name a logical seat")
 
@@ -977,6 +1005,7 @@ __all__ = [
     "producer_graph_source_requirements",
     "read_producer_graph",
     "toolchain_document_digest",
+    "toolchain_system_library",
     "validate_graph_reference",
     "write_producer_graph",
 ]
