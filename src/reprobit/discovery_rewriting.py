@@ -321,6 +321,21 @@ def derive_register_bijection(
                 raise DiscoveryAuthoringError(
                     f"register {source} maps to two registers at donor offset {left['offset']}"
                 )
+        for (left_at, left_shift), (right_at, right_shift) in zip(
+            left.get("byte_fields", ()), right.get("byte_fields", ()), strict=False
+        ):
+            left_value = donor_body[left_at] >> left_shift & 7
+            right_value = target_body[right_at] >> right_shift & 7
+            if left_value & 4 != right_value & 4:
+                raise DiscoveryAuthoringError(
+                    f"a byte field changes between low and high byte at donor offset {left['offset']}"
+                )
+            source = IA32_GENERAL_REGISTER_NAMES[left_value & 3]
+            image = IA32_GENERAL_REGISTER_NAMES[right_value & 3]
+            if mapping.setdefault(source, image) != image:
+                raise DiscoveryAuthoringError(
+                    f"register {source} maps to two registers at donor offset {left['offset']}"
+                )
     mapping = {source: image for source, image in mapping.items() if source != image}
     if not mapping or set(mapping) != set(mapping.values()):
         raise DiscoveryAuthoringError("the register differences are not one register bijection")
@@ -365,10 +380,31 @@ def _region_mapping(
             image = IA32_GENERAL_REGISTER_NAMES[target_body[right_at] >> right_shift & 7]
             if mapping.setdefault(source, image) != image:
                 return None
+        for (left_at, left_shift), (right_at, right_shift) in zip(
+            left.get("byte_fields", ()), right.get("byte_fields", ()), strict=False
+        ):
+            left_value = donor_body[left_at] >> left_shift & 7
+            right_value = target_body[right_at] >> right_shift & 7
+            if left_value & 4 != right_value & 4:
+                return None
+            source = IA32_GENERAL_REGISTER_NAMES[left_value & 3]
+            image = IA32_GENERAL_REGISTER_NAMES[right_value & 3]
+            if mapping.setdefault(source, image) != image:
+                return None
     moved = {source: image for source, image in mapping.items() if source != image}
-    if not moved or set(moved) != set(moved.values()):
+    if not moved:
         return None
-    if any(mapping.get(image, image) != image for image in moved.values() if image not in moved):
+    # A rename whose image the region never names (edx -> ecx with ecx unused)
+    # closes into a cycle back to its first source; the bijection proof then
+    # requires the image to be dead across the region.
+    for start in [source for source in moved if source not in moved.values()]:
+        end = start
+        while end in moved:
+            end = moved[end]
+        if end in mapping:
+            return None
+        moved[end] = start
+    if set(moved) != set(moved.values()):
         return None
     return moved
 

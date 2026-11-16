@@ -81,6 +81,9 @@ CODEVIEW_X86_REGISTER_NUMBERS = {
 CODEVIEW_REGISTER_RECORD_TYPE = 2
 
 
+_BYTE_REGISTERS = frozenset({"eax", "ecx", "edx", "ebx"})
+
+
 def apply_register_bijection(
     body: bytes,
     mapping: dict[str, Any],
@@ -170,10 +173,24 @@ def apply_register_bijection(
     index_of = {item["offset"]: index for index, item in enumerate(instructions)}
     entries = {index_of[region_start] for region_start, _region_end in regions}
     for item in inside:
-        blocked = support & set(item.get("frozen", frozenset()))
+        byte_only = set(item.get("byte_frozen", frozenset()))
+        blocked = support & (set(item.get("frozen", frozenset())) - byte_only)
         require(
             not blocked,
             f"{context}: {sorted(blocked)} is named by a sub-register field at {item['offset']} that sigma cannot rewrite",
+        )
+        # An 8-bit field names AL..BL (0..3) or AH..BH (4..7), the low and
+        # high bytes of EAX..EBX.  A permutation among those four keeps every
+        # such field encodable, so it is rewritten like a 32-bit field with
+        # its high-byte bit kept; one that leaves them is refused.
+        stranded = sorted(
+            name
+            for name in support & byte_only
+            if name not in _BYTE_REGISTERS or mapping.get(name, name) not in _BYTE_REGISTERS
+        )
+        require(
+            not stranded,
+            f"{context}: {stranded} is named by a byte field at {item['offset']} that sigma would move off a byte register",
         )
     entered_from_outside = set()
     for index, item in enumerate(instructions):
@@ -238,6 +255,20 @@ def apply_register_bijection(
                 f"{context}: a rewritten byte overlaps a relocation",
             )
             image[byte_index] = (image[byte_index] & ~(7 << shift) | numbers[value] << shift) & 255
+            rewritten.append(byte_index)
+        for byte_index, shift in item.get("byte_fields", ()):
+            value = image[byte_index] >> shift & 7
+            if value & 3 not in numbers:
+                continue
+            require(
+                byte_index not in relocation_offsets,
+                f"{context}: a rewritten byte overlaps a relocation",
+            )
+            replacement = numbers[value & 3]
+            require(replacement < 4, f"{context}: a byte field would leave AL..BL")
+            image[byte_index] = (
+                image[byte_index] & ~(7 << shift) | (replacement | value & 4) << shift
+            ) & 255
             rewritten.append(byte_index)
     require(bool(rewritten), f"{context}: the bijection rewrites nothing")
     output = bytes(image)

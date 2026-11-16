@@ -952,20 +952,34 @@ class WidenedSemanticTableTests(unittest.TestCase):
     def test_refuses_a_sub_register_field_sigma_cannot_rewrite(self):
         """AL..BH number the low AND high bytes of only four registers.
 
-        A byte field naming a register in sigma's support cannot carry the
-        32-bit permutation, so it is refused rather than left unrewritten.
+        A byte field whose register sigma moves off EAX..EBX has no encoding,
+        so it is refused rather than left unrewritten.
         """
         body = bytes.fromhex("538b0d000000008a01e8000000005bc3")
         with self.assertRaises(ByteIdentityError) as caught:
             register_algorithms.apply_register_bijection(
                 body,
-                CALL_SIGMA,
+                {"eax": "esi", "esi": "eax"},
                 CALL_REGION,
                 CALL_RELOCATION_OFFSETS,
                 "byte",
                 call_relocations(CDECL_SYMBOL),
             )
-        self.assertIn("is named by a sub-register field", str(caught.exception))
+        self.assertIn("off a byte register", str(caught.exception))
+
+    def test_rewrites_a_byte_field_within_eax_to_ebx(self):
+        """A permutation among EAX..EBX keeps every byte field encodable."""
+        body = bytes.fromhex("538b0d000000008a01e8000000005bc3")
+        image, proof = register_algorithms.apply_register_bijection(
+            body,
+            CALL_SIGMA,
+            CALL_REGION,
+            CALL_RELOCATION_OFFSETS,
+            "byte",
+            call_relocations(CDECL_SYMBOL),
+        )
+        self.assertEqual(image, bytes.fromhex("538b05000000008a08e8000000005bc3"))
+        self.assertEqual(proof["rewritten_offsets"], [2, 8])
 
     def test_a_byte_write_does_not_kill_its_parent(self):
         """`mov al, [ecx]` writes part of EAX, so EAX stays live through it."""
