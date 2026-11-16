@@ -567,8 +567,16 @@ class WindowImageTests(unittest.TestCase):
             self.apply(body, windows)
         self.assertIn("outside the instruction-schedule table", str(caught.exception))
 
-    def test_an_x87_form_inside_the_window_is_refused(self):
+    def test_an_x87_load_aliasing_a_moved_store_is_ordered_by_memory(self):
+        # fld dword [esp+0x18] reads the slot the moved store writes, so the
+        # x87 load joins the DAG with a memory edge and the reorder is refused.
         body = PROLOGUE + bytes.fromhex("d9442418") + WINDOW_SOURCE[4:] + EPILOGUE
+        with self.assertRaises(ByteIdentityError) as caught:
+            self.apply(body)
+        self.assertIn("dependence DAG", str(caught.exception))
+
+    def test_an_unlisted_x87_form_inside_the_window_is_refused(self):
+        body = PROLOGUE + bytes.fromhex("d97424ff") + WINDOW_SOURCE[4:] + EPILOGUE
         with self.assertRaises(ByteIdentityError) as caught:
             self.apply(body)
         self.assertIn("outside the instruction-schedule table", str(caught.exception))
