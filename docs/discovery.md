@@ -119,6 +119,16 @@ Run that plan explicitly. An ordinary `grind` remains project-wide:
 rbit discover grind . --expert-plan reprobit/discovery.json
 ```
 
+A candidate's donor body is spliced as it is (an equal-body record) when it
+equals the reference object's. When the donor holds the reference's
+instructions in another order instead, grind derives the smallest reorder
+windows that reach the reference body and authors a
+`retail_exact_donor_rewriting` record: each window's dependence DAG, line rows
+and stack adjustments are measured from the donor, no window may move a
+relocation, and the ordinary producer must compose the reference body before
+the record is a candidate. It costs more (a semantic rewrite), so it is tried
+only after the splices fail.
+
 Each candidate is compiled through the project's locked compiler graph. A
 candidate can be saved as local progress only after a separate build from
 scratch proves the function and required logic checks. It is exact only when
