@@ -270,3 +270,61 @@ def test_grind_falls_back_to_a_same_slot_resize_when_the_splices_refuse(
     assert calls == ["strict", "reloc", "same_slot_resize"]
     assert authored.candidate_object == b"composed"
     assert authored.function is record
+
+
+def _swap(body: bytes, offset: int, sib_at: int, relocated: frozenset[int] = frozenset()):
+    from reprobit.classic.address_forms import apply_sib_operand_swaps
+
+    return apply_sib_operand_swaps(
+        body,
+        [{"instruction_offset": offset, "expected_rewritten_offsets": [sib_at]}],
+        relocated,
+        "t",
+    )
+
+
+def test_a_sib_base_and_index_exchange_names_the_same_address() -> None:
+    # lea eax, [ecx+edx]; mov ecx, [eax+ebx+4]; ret
+    body = bytes.fromhex("8d04118b4c1804c3")
+    image, proof = _swap(body, 0, 2)
+    assert image == bytes.fromhex("8d040a8b4c1804c3")
+    assert proof["rewritten_offsets"] == [2]
+    image, _ = _swap(body, 3, 5)
+    assert image == bytes.fromhex("8d04118b4c0304c3")
+
+
+@pytest.mark.parametrize(
+    ("body", "message"),
+    [
+        (bytes.fromhex("8d0451c3"), "scaled"),  # lea eax, [ecx+edx*2]
+        (bytes.fromhex("8d0414c3"), "ESP or EBP"),  # lea eax, [esp+edx]
+        (bytes.fromhex("8d442900c3"), "ESP or EBP"),  # lea eax, [ecx+ebp+0]
+        (bytes.fromhex("8d0409c3"), "same register"),  # lea eax, [ecx+ecx]
+    ],
+)
+def test_a_sib_swap_outside_the_commutative_case_is_refused(body: bytes, message: str) -> None:
+    from reprobit.binary import ByteIdentityError
+
+    with pytest.raises(ByteIdentityError, match=message):
+        _swap(body, 0, 2)
+
+
+def test_a_relocated_or_misdeclared_sib_byte_is_refused() -> None:
+    from reprobit.binary import ByteIdentityError
+
+    body = bytes.fromhex("8d0411c3")
+    with pytest.raises(ByteIdentityError, match="relocated"):
+        _swap(body, 0, 2, frozenset({2}))
+    with pytest.raises(ByteIdentityError, match="declaration"):
+        _swap(body, 0, 1)
+
+
+def test_sib_swaps_are_derived_only_when_they_explain_every_difference() -> None:
+    from reprobit.discovery_rewriting import derive_sib_operand_swaps
+
+    body = bytes.fromhex("8d04118b4c1804c3")
+    assert derive_sib_operand_swaps(body, bytes.fromhex("8d040a8b4c1804c3"), {}, None) == [
+        {"instruction_offset": 0}
+    ]
+    with pytest.raises(DiscoveryAuthoringError, match="operand order"):
+        derive_sib_operand_swaps(body, bytes.fromhex("8d04128b4c1804c3"), {}, None)
