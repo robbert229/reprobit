@@ -33,14 +33,17 @@ from .coff import (
 )
 from .commutative import apply_commutative_operand_form
 from .compiler_identity import Msvc420CompilerIdentity
-from .debug import parse_codeview_symbol_stream
+from .debug import (
+    CODEVIEW_BPREL_RECORD_TYPES,
+    CODEVIEW_REGISTER_RECORD_TYPES,
+    parse_codeview_symbol_stream,
+)
 from .floating import apply_fp_sum_reassociation, apply_x87_squared_addend_exchange
 from .foundation import (
     RelocationView,
     sha256_bytes,
 )
 from .register_bijection import (
-    CODEVIEW_REGISTER_RECORD_TYPE,
     REGISTER_BIJECTION_FPO_CLOSURE,
     _codeview_register_field,
     _codeview_register_name,
@@ -480,7 +483,7 @@ def produce_composed_rewriting_candidate(
     claimed: dict[int, int] = {}
     for index, item in enumerate(spec.get("register_bijections") or []):
         for record in parse_codeview_symbol_stream(debug_stream, "composed-rewriting debug$S"):
-            if record["type"] != CODEVIEW_REGISTER_RECORD_TYPE:
+            if record["type"] not in CODEVIEW_REGISTER_RECORD_TYPES:
                 continue
             field_at = _codeview_register_field(record, "composed-rewriting debug$S")
             try:
@@ -519,7 +522,7 @@ def produce_composed_rewriting_candidate(
         for record in parse_codeview_symbol_stream(
             debug_stream, "composed-rewriting debug$S bprel"
         ):
-            if record["type"] != 512:
+            if record["type"] not in CODEVIEW_BPREL_RECORD_TYPES:
                 continue
             field_at = record["offset"] + 4
             off_value = int.from_bytes(debug_stream[field_at : field_at + 4], "little", signed=True)

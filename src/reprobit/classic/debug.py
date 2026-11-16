@@ -20,8 +20,71 @@ from .foundation import (
 
 """Classic compiler algorithms: debug."""
 LOCAL_SET_DELTA_REFACTOR_KINDS = frozenset({"constructor_allocation_lift_v1"})
-CODEVIEW_SYMBOL_NAME_OFFSETS = {2: 4, 6: None, 512: 6, 513: 8, 516: 33, 517: 33, 521: 7}
+CODEVIEW_SYMBOL_NAME_OFFSETS = {
+    # CodeView 4 (MSVC 4.x): 16-bit type indices.
+    2: 4,  # S_REGISTER
+    6: None,  # S_END
+    512: 6,  # S_BPREL32
+    513: 8,  # S_LDATA32
+    516: 33,  # S_LPROC32
+    517: 33,  # S_GPROC32
+    519: 18,  # S_BLOCK32
+    521: 7,  # S_LABEL32
+    # The 32-bit type-index ("_ST") forms MSVC 5.0 emits.  Each widens its
+    # type index to four bytes; the procedure records also move it before the
+    # code offset.
+    0x1001: 6,  # S_REGISTER_ST: type u32, register u16
+    0x1003: 4,  # S_UDT_ST: type u32
+    0x1006: 8,  # S_BPREL32_ST: offset i32, type u32
+    0x1007: 10,  # S_LDATA32_ST: type u32, offset u32, segment u16
+    0x1008: 10,  # S_GDATA32_ST
+    0x100A: 35,  # S_LPROC32_ST: parent, end, next, length, debug start/end, type, offset, segment, flags
+    0x100B: 35,  # S_GPROC32_ST
+}
+# S_CONSTANT_ST: type u32, then a numeric leaf whose width decides where the name starts.
+CODEVIEW_CONSTANT_ST_RECORD_TYPE = 0x1002
 CODEVIEW_END_RECORD_TYPE = 6
+CODEVIEW_REGISTER_RECORD_TYPES = frozenset({2, 0x1001})
+CODEVIEW_BPREL_RECORD_TYPES = frozenset({512, 0x1006})
+_CODEVIEW_NUMERIC_LEAF_WIDTHS = {
+    0x8000: 1,  # LF_CHAR
+    0x8001: 2,  # LF_SHORT
+    0x8002: 2,  # LF_USHORT
+    0x8003: 4,  # LF_LONG
+    0x8004: 4,  # LF_ULONG
+    0x8009: 8,  # LF_QUADWORD
+    0x800A: 8,  # LF_UQUADWORD
+}
+
+
+def codeview_register_field_offset(record_type: int) -> int:
+    """Payload offset of an S_REGISTER record's two-byte register field."""
+    require(record_type in CODEVIEW_REGISTER_RECORD_TYPES, "record is not an S_REGISTER form")
+    return 2 if record_type == 2 else 4
+
+
+def codeview_procedure_identity(record_type: int, payload: bytes) -> bytes:
+    """A procedure record's bytes outside its extent (length, debug range) and type index.
+
+    CodeView 4 lays the record out as parent, end, next, length, debug start,
+    debug end, offset, segment, type (u16), flags, name; the MSVC 5.0 form
+    puts a u32 type index before the offset.
+    """
+    if record_type in (0x100A, 0x100B):
+        return payload[:12] + payload[28:34] + payload[34:]
+    return payload[:12] + payload[24:30] + payload[32:]
+
+
+def _codeview_name_offset(record_type: int, payload: bytes, context: str) -> int | None:
+    if record_type != CODEVIEW_CONSTANT_ST_RECORD_TYPE:
+        return CODEVIEW_SYMBOL_NAME_OFFSETS[record_type]
+    require(len(payload) >= 6, f"{context}: S_CONSTANT record is truncated")
+    leaf = int.from_bytes(payload[4:6], "little")
+    if leaf < 0x8000:
+        return 6
+    width = _CODEVIEW_NUMERIC_LEAF_WIDTHS.get(leaf)
+    require(width is not None, f"{context}: S_CONSTANT numeric leaf 0x{leaf:04x} is unsupported")
+    return 6 + cast(int, width)
 
 
 def parse_codeview_symbol_stream(data: bytes, context: str) -> list[dict[str, Any]]:
@@ -44,11 +107,12 @@ def parse_codeview_symbol_stream(data: bytes, context: str) -> list[dict[str, An
         )
         record_type = int.from_bytes(data[offset + 2 : offset + 4], "little")
         require(
-            record_type in CODEVIEW_SYMBOL_NAME_OFFSETS,
+            record_type in CODEVIEW_SYMBOL_NAME_OFFSETS
+            or record_type == CODEVIEW_CONSTANT_ST_RECORD_TYPE,
             f"{context}: symbol record type 0x{record_type:04x} is outside the closed table",
         )
         payload = data[offset + 4 : offset + total]
-        name_offset = CODEVIEW_SYMBOL_NAME_OFFSETS[record_type]
+        name_offset = _codeview_name_offset(record_type, payload, context)
         if name_offset is None:
             require(not payload, f"{context}: terminator record carries a payload")
             name = ""
@@ -82,21 +146,26 @@ def codeview_symbol_identity(record: dict[str, Any]) -> tuple[int, str]:
 DEBUG_REPRESENTATION_DELTA_KINDS = frozenset(
     {"procedure_extent", "compiler_label_number", "local_location", "inserted_donor_local"}
 )
-CODEVIEW_LOCAL_LOCATION_RECORD_TYPES = frozenset({2, 512})
+CODEVIEW_LOCAL_LOCATION_RECORD_TYPES = CODEVIEW_REGISTER_RECORD_TYPES | CODEVIEW_BPREL_RECORD_TYPES
 
 
 def _codeview_local_location(
     record_type: int, payload: bytes, context: str
 ) -> tuple[int, dict[str, Any]]:
     """One admitted local record's (type index, location encoding)."""
-    if record_type == 2:
+    if record_type in CODEVIEW_REGISTER_RECORD_TYPES:
+        field = codeview_register_field_offset(record_type)
         return (
-            int.from_bytes(payload[0:2], "little"),
-            {"register": int.from_bytes(payload[2:4], "little")},
+            int.from_bytes(payload[0:field], "little"),
+            {"register": int.from_bytes(payload[field : field + 2], "little")},
         )
-    require(record_type == 512, f"{context}: record is not a local-location record")
+    require(
+        record_type in CODEVIEW_BPREL_RECORD_TYPES,
+        f"{context}: record is not a local-location record",
+    )
+    type_end = 6 if record_type == 512 else 8
     return (
-        int.from_bytes(payload[4:6], "little"),
+        int.from_bytes(payload[4:type_end], "little"),
         {"bp_offset": int.from_bytes(payload[0:4], "little", signed=True)},
     )
 
@@ -249,9 +318,8 @@ def derive_debug_representation_delta(
             record_type == donor_record["type"]
             and record_type in CODEVIEW_PROCEDURE_RECORD_TYPES
             and len(seed_payload) == len(donor_payload) >= 24
-            and seed_payload[:12] == donor_payload[:12]
-            and seed_payload[24:30] == donor_payload[24:30]
-            and seed_payload[32:] == donor_payload[32:]
+            and codeview_procedure_identity(record_type, seed_payload)
+            == codeview_procedure_identity(record_type, donor_payload)
         ):
             derived.append({"kind": "procedure_extent", "record_index": index})
             continue
@@ -396,9 +464,8 @@ def require_debug_symbol_representation_delta(
                 f"{context}: record {index} is not a procedure pair",
             )
             require(
-                seed_payload[:12] == donor_payload[:12]
-                and seed_payload[24:30] == donor_payload[24:30]
-                and (seed_payload[32:] == donor_payload[32:]),
+                codeview_procedure_identity(seed_record["type"], seed_payload)
+                == codeview_procedure_identity(seed_record["type"], donor_payload),
                 f"{context}: record {index} moves more than the procedure extent",
             )
             seed_length = int.from_bytes(seed_payload[12:16], "little")
@@ -623,8 +690,35 @@ FPO_RECORD_KEYS = {
 }
 
 
-def parse_fpo_data(raw: bytes, *, expected_proc_size: int | None = None) -> dict[str, Any]:
-    """Decode and structurally validate one classic 16-byte FPO_DATA row."""
+MSVC50_FUNCTION_FILL_BYTE = 0x90
+
+
+def fpo_proc_size_fits(proc_size: int, section_size: int, body: bytes | None) -> bool:
+    """Whether an FPO procedure size names the code of its function section.
+
+    MSVC 4.20 sizes a function's COMDAT to its code. MSVC 5.0 pads it to a
+    16-byte multiple with NOP fill after the code, and the FPO record keeps
+    the code's own size; given the body, that fill (and only it) may follow.
+    """
+    if proc_size == section_size:
+        return True
+    return (
+        body is not None
+        and len(body) == section_size
+        and section_size % 16 == 0
+        and 0 < section_size - proc_size < 16
+        and all(byte == MSVC50_FUNCTION_FILL_BYTE for byte in body[proc_size:])
+    )
+
+
+def parse_fpo_data(
+    raw: bytes, *, expected_proc_size: int | None = None, body: bytes | None = None
+) -> dict[str, Any]:
+    """Decode and structurally validate one classic 16-byte FPO_DATA row.
+
+    ``body``, the function's code section, admits MSVC 5.0's alignment fill
+    after the procedure (:func:`fpo_proc_size_fits`).
+    """
     require(
         isinstance(raw, bytes) and len(raw) == 16, "associated FPO record is not exactly 16 bytes"
     )
@@ -650,7 +744,7 @@ def parse_fpo_data(raw: bytes, *, expected_proc_size: int | None = None) -> dict
         require(
             type(expected_proc_size) is int
             and expected_proc_size > 0
-            and (result["cbProcSize"] == expected_proc_size),
+            and fpo_proc_size_fits(result["cbProcSize"], expected_proc_size, body),
             "FPO cbProcSize differs from its function section",
         )
     require(result["cbProlog"] <= result["cbProcSize"], "FPO cbProlog exceeds cbProcSize")
@@ -702,4 +796,4 @@ SOURCE_FPO_EXTRA_RELOCATION_KEYS = {
 }
 
 
-CODEVIEW_PROCEDURE_RECORD_TYPES = (517, 516)
+CODEVIEW_PROCEDURE_RECORD_TYPES = (517, 516, 0x100B, 0x100A)

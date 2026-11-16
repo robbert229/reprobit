@@ -30,6 +30,7 @@ from .coff import (
 from .debug import (
     LOCAL_SET_DELTA_REFACTOR_KINDS,
     _apply_replacements,
+    fpo_proc_size_fits,
     parse_fpo_data,
     require_debug_symbol_representation_delta,
     require_removed_caller_locals_delta,
@@ -626,9 +627,11 @@ def compose_same_slot_resize(
             "debug$S representation delta",
         )
     if fpo_closure:
-        parse_fpo_data(coff_body(seed, sx), expected_proc_size=sp["raw_size"])
+        parse_fpo_data(
+            coff_body(seed, sx), expected_proc_size=sp["raw_size"], body=coff_body(seed, sp)
+        )
         donor_fpo = coff_body(donor, dx)
-        parse_fpo_data(donor_fpo, expected_proc_size=dp["raw_size"])
+        parse_fpo_data(donor_fpo, expected_proc_size=dp["raw_size"], body=coff_body(donor, dp))
     else:
         require(coff_body(seed, sx) == coff_body(donor, dx), "runtime xdata bytes differ")
     donor_code = coff_body(donor, dp)
@@ -739,17 +742,21 @@ def compose_same_slot_resize(
     donor_lines = bytes(donor_line_buffer)
     seed_debug_raw = coff_body(seed, sd)
     donor_debug_raw = coff_body(donor, dd)
+    # S_GPROC32 (MSVC 4.20) or its 32-bit type-index form S_GPROC32_ST (MSVC
+    # 5.0); both keep the length and debug range at payload offset 12.
+    global_procedure = (b"\x05\x02", b"\x0b\x10")
     require(
         len(seed_debug_raw) >= 28
-        and seed_debug_raw[2:4] == b"\x05\x02"
-        and (donor_debug_raw[2:4] == b"\x05\x02"),
+        and seed_debug_raw[2:4] in global_procedure
+        and (donor_debug_raw[2:4] == seed_debug_raw[2:4]),
         "debug$S is not an S_*PROC32 record",
     )
     donor_cbproc, donor_dbgstart, donor_dbgend = coff_unpack(
         "<III", donor_debug_raw, 16, "donor debug range"
     )
     require(
-        donor_cbproc == dp["raw_size"] and 0 <= donor_dbgstart <= donor_dbgend < donor_cbproc,
+        fpo_proc_size_fits(donor_cbproc, dp["raw_size"], donor_code)
+        and 0 <= donor_dbgstart <= donor_dbgend < donor_cbproc,
         "donor debug procedure range is stale",
     )
     expected_debug_raw = bytearray(
@@ -836,12 +843,13 @@ def compose_same_slot_resize(
         at = new_symbol_offset + seed_index * 18
         output[at + 8 : at + 12] = value.to_bytes(4, "little")
     donor_function_aux = coff_auxiliary(donor, donor_function_index, donor_function)
+    donor_total_size = int.from_bytes(donor_function_aux[4:8], "little")
     require(
-        int.from_bytes(donor_function_aux[4:8], "little") == dp["raw_size"],
+        fpo_proc_size_fits(donor_total_size, dp["raw_size"], donor_code),
         "donor Function Definition TotalSize is stale",
     )
     at = new_symbol_offset + (seed_function_index + 1) * 18
-    output[at + 4 : at + 8] = dp["raw_size"].to_bytes(4, "little")
+    output[at + 4 : at + 8] = donor_total_size.to_bytes(4, "little")
     seed_begin_index, seed_begin = _coff_marker(seed, ".bf", sp["number"])
     donor_begin_index, donor_begin = _coff_marker(donor, ".bf", dp["number"])
     seed_begin_aux = coff_auxiliary(seed, seed_begin_index, seed_begin)
@@ -854,7 +862,10 @@ def compose_same_slot_resize(
     )
     seed_end_index, seed_end = _coff_marker(seed, ".ef", sp["number"])
     donor_end_index, donor_end = _coff_marker(donor, ".ef", dp["number"])
-    require(donor_end["value"] == dp["raw_size"], "donor .ef value is stale")
+    require(
+        fpo_proc_size_fits(donor_end["value"], dp["raw_size"], donor_code),
+        "donor .ef value is stale",
+    )
     seed_end_aux = coff_auxiliary(seed, seed_end_index, seed_end)
     donor_end_aux = coff_auxiliary(donor, donor_end_index, donor_end)
     require(
