@@ -582,6 +582,8 @@ def decode_ia32_bijection_instruction(
     encoding = None
     flow_override = None
     frozen = set(form["implicit_frozen"])
+    byte_frozen: set[str] = set()
+    byte_fields: list[tuple[int, int]] = []
     memory = None
     reads = set(form["reads"])
     writes = set(form["writes"])
@@ -605,7 +607,7 @@ def decode_ia32_bijection_instruction(
         width = effective_width if field_width is None else field_width
         if width == 8:
             name = names[value & 3]
-            frozen.add(name)
+            byte_frozen.add(name)
             atoms = frozenset({name + (".l" if value < 4 else ".h")})
         else:
             name = names[value]
@@ -630,6 +632,8 @@ def decode_ia32_bijection_instruction(
     if form["opreg"] is not None:
         if width != 8:
             fields.append((opcode_at, 0))
+        else:
+            byte_fields.append((opcode_at, 0))
         _touch(
             opcode & 7,
             form["opreg"] in ("read", "readwrite"),
@@ -652,6 +656,8 @@ def decode_ia32_bijection_instruction(
         if form["reg"] == "gpr":
             if width != 8:
                 fields.append((modrm_at, 3))
+            else:
+                byte_fields.append((modrm_at, 3))
             _touch(register_field, form["reg_read"], form["reg_write"])
         else:
             require(form["reg"] == "ext", f"{context}: ModRM register field role is undeclared")
@@ -688,6 +694,8 @@ def decode_ia32_bijection_instruction(
                 rm_field_width = form["rm_width"] or width
                 if rm_field_width != 8:
                     fields.append((modrm_at, 0))
+                else:
+                    byte_fields.append((modrm_at, 0))
                 _touch(rm, form["rm_read"], rm_write, rm_field_width)
         else:
             base_name = None
@@ -824,7 +832,9 @@ def decode_ia32_bijection_instruction(
         "writes": frozenset(writes),
         "flow": flow,
         "target": target,
-        "frozen": frozenset(frozen),
+        "frozen": frozenset(frozen | byte_frozen),
+        "byte_frozen": frozenset(byte_frozen - frozen),
+        "byte_fields": byte_fields,
         "memory": memory,
         "encoding": encoding,
         "indirect": indirect,

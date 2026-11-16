@@ -359,3 +359,40 @@ def test_msvc50_code_end_stops_before_a_switch_table() -> None:
     assert msvc50_code_end(falls, rows, 3, len(code) + 8) == len(code) + 8
     # No table: the procedure length stands.
     assert msvc50_code_end(body, [], 3, len(code) + 8) == len(code) + 8
+
+
+def test_a_bijection_rewrites_byte_fields_within_eax_to_ebx() -> None:
+    from reprobit.classic.register_bijection import apply_register_bijection
+    from reprobit.classic.register_semantics import decode_ia32_bijection_body
+
+    # mov edx, [0] ; or dh, 2 ; mov [0], edx ; ret
+    body = bytes.fromhex("8b1500000000" "80ce02" "891500000000" "c3")
+    decoded = decode_ia32_bijection_body(body, "t")
+    assert decoded[1]["byte_fields"] == [(7, 0)]
+    assert decoded[1]["byte_frozen"] == frozenset({"edx"})
+    image, proof = apply_register_bijection(
+        body, {"ecx": "edx", "edx": "ecx"}, (0, 15), frozenset(), "t", {}
+    )
+    assert image == bytes.fromhex("8b0d00000000" "80cd02" "890d00000000" "c3")
+    assert proof["rewritten_offsets"] == [1, 7, 10]
+
+
+def test_a_bijection_refuses_to_move_a_byte_field_off_eax_to_ebx() -> None:
+    import pytest
+
+    from reprobit.binary import ByteIdentityError
+    from reprobit.classic.register_bijection import apply_register_bijection
+
+    body = bytes.fromhex("8b1500000000" "80ce02" "891500000000" "c3")
+    with pytest.raises(ByteIdentityError, match="off a byte register"):
+        apply_register_bijection(body, {"esi": "edx", "edx": "esi"}, (0, 15), frozenset(), "t", {})
+
+
+def test_the_regional_deriver_reads_byte_fields() -> None:
+    from reprobit.discovery_rewriting import derive_regional_bijections
+
+    donor = bytes.fromhex("8b1500000000" "80ce02" "891500000000" "c3")
+    target = bytes.fromhex("8b0d00000000" "80cd02" "890d00000000" "c3")
+    found = derive_regional_bijections(donor, target, {}, None, frozenset(), frozenset())
+    assert found and found[0]["mapping"] == {"ecx": "edx", "edx": "ecx"}
+
