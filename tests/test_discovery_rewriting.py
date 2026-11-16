@@ -396,3 +396,33 @@ def test_the_regional_deriver_reads_byte_fields() -> None:
     found = derive_regional_bijections(donor, target, {}, None, frozenset(), frozenset())
     assert found and found[0]["mapping"] == {"ecx": "edx", "edx": "ecx"}
 
+
+
+def test_msvc50_code_end_stops_before_a_jump_table_and_its_index_table() -> None:
+    from reprobit.discovery_rewriting import msvc50_code_end
+
+    code = bytes.fromhex("33c0" "c3" "90")
+    body = code + bytes(8) + bytes.fromhex("00010100") + b"\x90" * 4
+    rows = [
+        {"offset": len(code), "width": 4, "target_section": 3},
+        {"offset": len(code) + 4, "width": 4, "target_section": 3},
+    ]
+    assert msvc50_code_end(body, rows, 3, len(code) + 12) == 3
+
+
+def test_msvc50_code_end_stops_before_two_switch_tables() -> None:
+    from reprobit.discovery_rewriting import msvc50_code_end
+
+    code = bytes.fromhex("33c0" "c3" "90")
+    first = len(code)
+    second = first + 8 + 4
+    body = code + bytes(8) + bytes.fromhex("00010000") + bytes(4) + bytes.fromhex("0001") + b"\x90" * 2
+    rows = [
+        {"offset": first, "width": 4, "target_section": 3},
+        {"offset": first + 4, "width": 4, "target_section": 3},
+        {"offset": second, "width": 4, "target_section": 3},
+    ]
+    assert msvc50_code_end(body, rows, 3, second + 6) == 3
+    # A foreign relocation after the first table means it is not a table tail.
+    foreign = rows + [{"offset": second + 4, "width": 2, "target_section": 9}]
+    assert msvc50_code_end(body, foreign, 3, second + 6) == second + 6

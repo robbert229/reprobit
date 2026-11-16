@@ -129,26 +129,43 @@ _TERMINAL_OPCODES = frozenset({0xC3, 0xC2, 0xE9, 0xEB})
 def msvc50_code_end(
     body: bytes, rows: list[dict[str, Any]], section_number: int, procedure_length: int
 ) -> int:
-    """Where a function's code ends, when its procedure extent holds a switch table.
+    """Where a function's code ends, when its procedure extent holds switch tables.
 
-    MSVC 5.0's procedure length covers a switch table placed after the code
-    (and the alignment fill before it), where MSVC 4.20's ended at the code.
-    The table is a run of 4-byte relocations into this same section that ends
-    exactly at the procedure length.  The code then ends at the last
-    ``ret``/``jmp`` before it, provided everything between is alignment fill;
-    otherwise the procedure length stands unchanged.
+    MSVC 5.0's procedure length covers the switch tables placed after the
+    code (jump tables of 4-byte relocations into this same section, each
+    possibly followed by an unrelocated byte index table) and the alignment
+    fill before them, where MSVC 4.20's ended at the code.  The code ends at
+    the earliest table start after which the extent holds only such tables,
+    provided the code before it decodes to exactly that start and its last
+    instruction other than alignment fill is a ``ret`` or ``jmp``.  Otherwise
+    the procedure length stands unchanged.
     """
 
-    table = sorted(
-        row["offset"]
+    internal = sorted(
+        int(row["offset"])
         for row in rows
         if row.get("width") == 4 and row.get("target_section") == section_number
     )
-    start = procedure_length
-    while start - 4 in table:
-        start -= 4
-    if start == procedure_length:
-        return procedure_length
+    internal_set = set(internal)
+    foreign = {
+        offset
+        for row in rows
+        if not (row.get("width") == 4 and row.get("target_section") == section_number)
+        for offset in range(int(row["offset"]), int(row["offset"]) + int(row.get("width") or 0))
+    }
+    starts = [offset for offset in internal if offset - 4 not in internal_set]
+    for start in starts:
+        if start >= procedure_length or any(start <= o < procedure_length for o in foreign):
+            continue
+        end = _code_end_before(body, start)
+        if end is not None:
+            return end
+    return procedure_length
+
+
+def _code_end_before(body: bytes, start: int) -> int | None:
+    """The end of the last terminal instruction before ``start``, if fill follows it."""
+
     spans = []
     offset = 0
     try:
@@ -157,9 +174,9 @@ def msvc50_code_end(
             spans.append((offset, length))
             offset += length
     except ByteIdentityError:
-        return procedure_length
+        return None
     if offset != start:
-        return procedure_length
+        return None
     for index in range(len(spans) - 1, -1, -1):
         at, length = spans[index]
         piece = body[at : at + length]
@@ -169,8 +186,8 @@ def msvc50_code_end(
             piece[0] == 0xFF and length > 1 and piece[1] >> 3 & 7 == 4
         ):
             return at + length
-        return procedure_length
-    return procedure_length
+        return None
+    return None
 
 
 def derive_schedule_windows(
