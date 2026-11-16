@@ -33,6 +33,7 @@ def _ia32_schedule_flag_table() -> dict[int, tuple[bool, bool]]:
     for index in range(8):
         table[80 + index] = (False, False)
     table[0x6A] = (False, False)
+    table[0x68] = (False, False)
     # IMUL r32, r/m32: OF/CF written, the rest undefined -- all flags written.
     table[0xFAF] = (False, True)
     # The x87 escapes leave EFLAGS alone; ia32_schedule_instruction_facts
@@ -89,12 +90,27 @@ _IA32_X87_FLAG_WRITERS = frozenset({(0xDB, 5), (0xDB, 6), (0xDF, 5), (0xDF, 6)})
 
 
 _IA32_SCHEDULE_REGISTER_PUSH_OPCODES = frozenset(range(0x50, 0x58))
-_IA32_SCHEDULE_STACK_PUSH_OPCODES = _IA32_SCHEDULE_REGISTER_PUSH_OPCODES | frozenset({0x6A})
+# Unprefixed PUSH imm8 and PUSH imm32, each with its exact encoded length.
+_IA32_SCHEDULE_IMMEDIATE_PUSH_LENGTHS = {0x6A: 2, 0x68: 5}
+_IA32_SCHEDULE_STACK_PUSH_OPCODES = _IA32_SCHEDULE_REGISTER_PUSH_OPCODES | frozenset(
+    _IA32_SCHEDULE_IMMEDIATE_PUSH_LENGTHS
+)
 IA32_SCHEDULE_FLAG_EFFECTS = _ia32_schedule_flag_table()
 IA32_STACK_SLOT_BYTES = 4
 IA32_SCHEDULE_STACK_FRONTIER_THEOREM = "msvc-4.20-win32-register-push-stack-frontier-v1"
 IA32_SCHEDULE_PRIVATE_STACK_OBJECT_THEOREM = "msvc-4.20-win32-private-stack-object-frontier-v1"
+IA32_SCHEDULE_IMMEDIATE_PUSH_THEOREM = "ia32-win32-immediate-push-stack-rebase-v1"
 _IA32_SCHEDULE_STACK_FRONTIER_THEOREMS = frozenset(
+    {
+        IA32_SCHEDULE_STACK_FRONTIER_THEOREM,
+        IA32_SCHEDULE_PRIVATE_STACK_OBJECT_THEOREM,
+        IA32_SCHEDULE_IMMEDIATE_PUSH_THEOREM,
+    }
+)
+# The markers whose authority is a compiler-output fact and so needs the
+# canonical compiler identity.  The immediate-push marker states only IA-32
+# semantics (see `_ia32_schedule_immediate_push_projection`).
+_IA32_SCHEDULE_COMPILER_SCOPED_THEOREMS = frozenset(
     {
         IA32_SCHEDULE_STACK_FRONTIER_THEOREM,
         IA32_SCHEDULE_PRIVATE_STACK_OBJECT_THEOREM,
@@ -122,6 +138,47 @@ def ia32_schedule_stack_delta(body: bytes, item: dict[str, Any], context: str) -
     if len(raw) == 3 and raw[:2] == b"\x83\xc4":
         amount = int.from_bytes(raw[2:], "little", signed=True)
         return amount if amount > 0 and amount % IA32_STACK_SLOT_BYTES == 0 else None
+    return None
+
+
+def ia32_schedule_exact_immediate_push(body: bytes, item: dict[str, Any]) -> bool:
+    """Is this an unprefixed PUSH imm8 (6A ib) or PUSH imm32 (68 id), exactly?
+
+    Exactly one opcode byte followed by its immediate: no operand-size or
+    segment prefix, and the instruction's length is the opcode's own.
+    """
+
+    start = int(item["offset"])
+    length = int(item["length"])
+    opcode = int(item["opcode"])
+    return (
+        _IA32_SCHEDULE_IMMEDIATE_PUSH_LENGTHS.get(opcode) == length
+        and start >= 0
+        and start + length <= len(body)
+        and body[start] == opcode
+    )
+
+
+def _ia32_schedule_window_stack_delta(
+    body: bytes,
+    item: dict[str, Any],
+    context: str,
+    *,
+    private_stack_object: bool,
+    immediate_push: bool,
+) -> int | None:
+    """The closed ESP delta a window's declared scope lets this instruction carry.
+
+    Without a marker only an unprefixed register PUSH counts.  The
+    private-stack/object marker admits every `ia32_schedule_stack_delta`
+    spelling; the immediate-push marker adds exactly the unprefixed PUSH
+    imm8/imm32 encodings, each a -4 update.
+    """
+
+    if immediate_push and ia32_schedule_exact_immediate_push(body, item):
+        return -IA32_STACK_SLOT_BYTES
+    if private_stack_object or int(item["opcode"]) in _IA32_SCHEDULE_REGISTER_PUSH_OPCODES:
+        return ia32_schedule_stack_delta(body, item, context)
     return None
 
 
@@ -191,6 +248,7 @@ def ia32_schedule_stack_adjustments(
     context: str,
     *,
     private_stack_object: bool = False,
+    immediate_push: bool = False,
 ) -> list[list[Any]]:
     """Obligation 6c: rebase direct ESP operands across exact stack updates.
 
@@ -207,13 +265,24 @@ def ia32_schedule_stack_adjustments(
     encoded length, so a `disp8` that would overflow, or an ESP base with no
     displacement byte at all, REFUSES rather than growing an encoding.
 
+    `immediate_push` (the immediate-push marker's scope) also counts each
+    unprefixed PUSH imm8/imm32 as the -4 update it is.
+
     Returns `[[source index, byte offset, old value, new value], ...]`, sorted.
     """
     updates = [
         (index, delta)
         for index, item in enumerate(inside)
-        if (delta := ia32_schedule_stack_delta(body, item, context)) is not None
-        if private_stack_object or int(item["opcode"]) in _IA32_SCHEDULE_REGISTER_PUSH_OPCODES
+        if (
+            delta := _ia32_schedule_window_stack_delta(
+                body,
+                item,
+                context,
+                private_stack_object=private_stack_object,
+                immediate_push=immediate_push,
+            )
+        )
+        is not None
     ]
     if not updates:
         return []
@@ -679,6 +748,149 @@ def _ia32_schedule_private_stack_object_projection(
     }
 
 
+def _ia32_schedule_immediate_push_projection(
+    theorem_context: ScheduleTheoremContext,
+    stack_adjustments: list[list[int]],
+    relocated_offsets: frozenset[int],
+    context: str,
+) -> tuple[list[list[Any]], dict[str, Any]]:
+    """Bind the immediate-push stack-rebase theorem to one window.
+
+    Statement.  An unprefixed ``PUSH imm8`` (``6A ib``) or ``PUSH imm32``
+    (``68 id``) does exactly what an unprefixed register PUSH does to the
+    stack: ESP decreases by four and the four bytes at the new ESP receive a
+    value.  The value is the encoded constant, so it reads no register, no
+    flag and no memory, and nothing in the window can change it.  Its
+    implicit store therefore lands in the canonical window-entry ESP space at
+    ``-4 * (pushes before it + 1)``, which is below every nonnegative direct
+    ESP displacement the window names; and an operand moved across it keeps
+    naming the same address exactly when its displacement absorbs the -4,
+    as obligation 6c derives for a register PUSH.
+
+    This is IA-32 semantics, not a compiler-output fact, so it needs no
+    compiler identity.  It deliberately grants nothing else: it discharges
+    no PUSH/non-ESP memory edge (only the compiler-scoped register theorem
+    does that, and that theorem still refuses immediates), and the strict DAG
+    measured in its scope is returned unchanged.
+
+    Checks.  Every 0x6A/0x68 in the window is the exact unprefixed encoding
+    and holds no relocated byte (its immediate is a constant, never an
+    address this window could rebase); every other ESP writer is an
+    unprefixed one-byte register PUSH; every other ESP reader names ESP only
+    as a directly encoded, nonnegative, adjusted base or has no memory
+    operand; the register PUSH taint rules hold in both orders; and at least
+    one derived displacement rebase crosses an immediate PUSH, with every
+    rebase equal to the sum of the exact stack updates it crosses.
+    """
+
+    instructions = theorem_context.instructions
+    facts = theorem_context.facts
+    order = theorem_context.order
+    body = theorem_context.body
+    require(
+        theorem_context.theorem == IA32_SCHEDULE_IMMEDIATE_PUSH_THEOREM,
+        f"{context}: immediate-push theorem differs",
+    )
+    immediate = []
+    for index, (instruction, fact) in enumerate(zip(instructions, facts, strict=True)):
+        offset = int(fact["offset"])
+        require(
+            instruction["flow"] == "fall",
+            f"{context}: the immediate-push window contains a control transfer",
+        )
+        if fact["opcode"] in _IA32_SCHEDULE_IMMEDIATE_PUSH_LENGTHS:
+            require(
+                ia32_schedule_exact_immediate_push(body, instruction),
+                f"{context}: the immediate-push theorem only admits an unprefixed PUSH imm8 or PUSH imm32 at {offset}",
+            )
+            touched = sorted(
+                at for at in relocated_offsets if offset <= at < offset + instruction["length"]
+            )
+            require(
+                not touched,
+                f"{context}: the PUSH immediate at {offset} is relocated, so it is an address, not a constant",
+            )
+            immediate.append(index)
+            continue
+        if fact["opcode"] in _IA32_SCHEDULE_REGISTER_PUSH_OPCODES:
+            require(
+                instruction["length"] == 1 and body[offset] == fact["opcode"],
+                f"{context}: the immediate-push theorem only admits an unprefixed 32-bit register PUSH at {offset}",
+            )
+            continue
+        require(
+            "esp" not in fact["writes"],
+            f"{context}: the non-PUSH instruction at {offset} changes ESP inside an immediate-push window",
+        )
+        if "esp" not in fact["reads"]:
+            continue
+        if ia32_esp_used_only_as_a_base(body, instruction):
+            found = ia32_esp_relative_displacement(body, instruction)
+            require(
+                found is not None and found[0] != "no_displacement" and found[2] >= 0,
+                f"{context}: the ESP-derived address at {offset} is not a nonnegative directly encoded displacement",
+            )
+        else:
+            require(
+                fact["memory"] is None,
+                f"{context}: the explicit memory instruction at {offset} uses ESP as more than its directly adjusted base",
+            )
+    require(bool(immediate), f"{context}: the immediate-push theorem names no immediate PUSH")
+    _require_ia32_schedule_stack_frontier_taint(
+        instructions, facts, list(range(len(facts))), f"{context} source order"
+    )
+    _require_ia32_schedule_stack_frontier_taint(
+        instructions, facts, order, f"{context} target order"
+    )
+    position = {source: target for target, source in enumerate(order)}
+    rebases: list[dict[str, object]] = []
+    crosses_immediate = False
+    for adjustment in stack_adjustments:
+        operand, _at, old, new = adjustment
+        contribution = 0
+        for stack, instruction in enumerate(instructions):
+            delta = _ia32_schedule_window_stack_delta(
+                body, instruction, context, private_stack_object=False, immediate_push=True
+            )
+            if delta is None or stack == operand:
+                continue
+            if (stack < operand) == (position[stack] < position[operand]):
+                continue
+            contribution += delta if stack < operand else -delta
+            crosses_immediate = crosses_immediate or stack in immediate
+            rebases.append(
+                {
+                    "stack_instruction": stack,
+                    "stack_offset": facts[stack]["offset"],
+                    "immediate": stack in immediate,
+                    "operand_instruction": operand,
+                    "stack_delta": delta,
+                    "adjustment": list(adjustment),
+                }
+            )
+        require(
+            contribution == new - old,
+            f"{context}: exact stack crossings do not derive displacement rebase {adjustment}",
+        )
+    require(
+        crosses_immediate,
+        f"{context}: the immediate-push theorem has no ESP operand moved across an immediate PUSH",
+    )
+    return [[edge[0], edge[1], list(edge[2])] for edge in theorem_context.strict_edges], {
+        "theorem": IA32_SCHEDULE_IMMEDIATE_PUSH_THEOREM,
+        "immediate_pushes": [
+            {
+                "instruction": index,
+                "offset": facts[index]["offset"],
+                "opcode": facts[index]["opcode"],
+                "length": instructions[index]["length"],
+            }
+            for index in immediate
+        ],
+        "esp_rebases": rebases,
+    }
+
+
 def ia32_schedule_dependence_edges(
     instructions: list[dict[str, Any]],
     context: str,
@@ -686,6 +898,7 @@ def ia32_schedule_dependence_edges(
     stack_adjusted: bool = False,
     *,
     private_stack_object: bool = False,
+    immediate_push: bool = False,
     adjusted_instructions: frozenset[int] | None = None,
 ) -> tuple[list[dict[str, Any]], list[list[Any]]]:
     """The window's dependence DAG (obligation 4).
@@ -703,6 +916,11 @@ def ia32_schedule_dependence_edges(
     This always returns the strict DAG.  A compiler-scoped stack-frontier
     marker is projected later, once the target order is known, so only memory
     reasons for pairs that actually cross can ever be discharged.
+
+    `immediate_push` is the immediate-push marker's scope: an unprefixed PUSH
+    imm8/imm32 then counts as a closed -4 stack update exactly where a
+    register PUSH does (the ESP discharge against a directly adjusted operand
+    and the canonical window-entry ESP space).  It changes nothing else.
     """
     facts = [
         ia32_schedule_instruction_facts(item, f"{context} at {item['offset']}")
@@ -753,16 +971,37 @@ def ia32_schedule_dependence_edges(
     ]
     stack_deltas = [
         (
-            ia32_schedule_stack_delta(body, item, context)
-            if body is not None
-            and (
-                private_stack_object or int(item["opcode"]) in _IA32_SCHEDULE_REGISTER_PUSH_OPCODES
+            _ia32_schedule_window_stack_delta(
+                body,
+                item,
+                context,
+                private_stack_object=private_stack_object,
+                immediate_push=immediate_push,
             )
+            if body is not None
             else None
         )
         for item in instructions
     ]
     is_stack_operation = [delta is not None for delta in stack_deltas]
+    # The pushes the canonical window-entry ESP space counts: every admitted
+    # PUSH spelling under the private-stack/object marker, otherwise the
+    # register PUSHes plus, under the immediate-push marker, the exact
+    # immediate PUSHes.
+    canonical_push = [
+        int(fact["opcode"])
+        in (
+            _IA32_SCHEDULE_STACK_PUSH_OPCODES
+            if private_stack_object
+            else _IA32_SCHEDULE_REGISTER_PUSH_OPCODES
+        )
+        or (
+            immediate_push
+            and body is not None
+            and ia32_schedule_exact_immediate_push(body, instructions[index])
+        )
+        for index, fact in enumerate(facts)
+    ]
     if stack_adjusted:
         require(body is not None, f"{context}: a stack-adjusted window needs its body")
     edges = []
@@ -801,28 +1040,13 @@ def ia32_schedule_dependence_edges(
                     and body is not None
                     and (one["base"] == "esp" == two["base"])
                     and all(
-                        facts[k]["opcode"]
-                        in (
-                            _IA32_SCHEDULE_STACK_PUSH_OPCODES
-                            if private_stack_object
-                            else _IA32_SCHEDULE_REGISTER_PUSH_OPCODES
-                        )
-                        or "esp" not in facts[k]["writes"]
+                        canonical_push[k] or "esp" not in facts[k]["writes"]
                         for k in range(len(facts))
                     )
                 ):
 
                     def _canonical(mem: dict[str, Any], index: int) -> dict[str, Any]:
-                        depth = sum(
-                            1
-                            for k in range(index)
-                            if facts[k]["opcode"]
-                            in (
-                                _IA32_SCHEDULE_STACK_PUSH_OPCODES
-                                if private_stack_object
-                                else _IA32_SCHEDULE_REGISTER_PUSH_OPCODES
-                            )
-                        )
+                        depth = sum(1 for k in range(index) if canonical_push[k])
                         adjusted = dict(mem)
                         adjusted["displacement"] = mem["displacement"] - 4 * depth
                         return adjusted

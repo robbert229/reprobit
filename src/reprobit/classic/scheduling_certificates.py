@@ -38,7 +38,10 @@ from .register_semantics import (
     _IA32_STRUCTURAL_REGISTERS,
 )
 from .scheduling_apply import ia32_schedule_body_walk
-from .scheduling_dependence import _IA32_SCHEDULE_STACK_FRONTIER_THEOREMS
+from .scheduling_dependence import (
+    _IA32_SCHEDULE_STACK_FRONTIER_THEOREMS,
+    IA32_SCHEDULE_IMMEDIATE_PUSH_THEOREM,
+)
 from .scheduling_webs import _ia32_web_membership
 
 INSTRUCTION_SCHEDULE_KIND = "topological_window_reordering_v1"
@@ -336,6 +339,13 @@ def _validate_schedule_windows(
                 type(stack_frontier_theorem) is str
                 and stack_frontier_theorem in _IA32_SCHEDULE_STACK_FRONTIER_THEOREMS,
                 f"{window_context}.stack_frontier_theorem differs",
+            )
+            # The immediate-push theorem exists only to rebase an ESP operand
+            # across an immediate PUSH, so its window always declares one.
+            require(
+                stack_frontier_theorem != IA32_SCHEDULE_IMMEDIATE_PUSH_THEOREM
+                or normalized_stack is not None,
+                f"{window_context}: the immediate-push theorem declares no stack adjustment",
             )
         reseat = window.get("relocation_reseat")
         normalized_reseat = None
