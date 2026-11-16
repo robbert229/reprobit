@@ -30,10 +30,12 @@ from reprobit.producer_graph import (
     producer_graph_accepts_source,
     read_producer_graph,
 )
-from reprobit.project_loader import load_project, load_project_tree
+from reprobit.project_loader import _load_json_model, load_project, load_project_tree
 from reprobit.schema import (
     BuildPlanDocument,
+    InterventionDocument,
     ProjectSpec,
+    ProofDocument,
     SourceManifestDocument,
     source_manifest_digest,
 )
@@ -364,6 +366,11 @@ class SourceLockPlan:
     graph_present: bool
     graph_invalidation_required: bool
     checked_overlay_outputs: tuple[str, ...]
+    # Translation units whose source changed but whose records hold no
+    # intervention or expected observation: nothing reviewed depends on their
+    # bytes, so the lock re-pins them (record path -> new canonical bytes).
+    repinned_units: tuple[dict[str, Any], ...] = ()
+    repinned_documents: tuple[tuple[str, bytes], ...] = ()
     config_preimage: str | None = None
     control_preimages: dict[str, str | None] | None = None
     authority_snapshot: tuple[JsonAuthorityDirectorySnapshot, ...] | None = None
@@ -375,6 +382,71 @@ class SourceLockPlan:
     @property
     def source_changed(self) -> bool:
         return self.document_digest != self.current_digest
+
+
+def _repin_unprotected_units(
+    root: Path,
+    spec: ProjectSpec,
+    build_plan: BuildPlanDocument | None,
+    report: SourceAuthorityReport | None,
+) -> tuple[BuildPlanDocument | None, tuple[dict[str, Any], ...], tuple[tuple[str, bytes], ...]]:
+    """Re-pin stale translation units that no reviewed record depends on.
+
+    A unit is unprotected when its intervention shard holds no intervention and
+    its proof shard no expected observation. Its pinned digest then guards
+    nothing: the edit changes no saved adjustment, so refusing it would only
+    force a repair that has nothing to repair. Units with records stay stale.
+    """
+
+    if build_plan is None or report is None:
+        return build_plan, (), ()
+    repinned: dict[str, str] = {}
+    documents: list[tuple[str, bytes]] = []
+    for item in report.stale_translation_units:
+        if item.actual_digest is None:
+            continue
+        intervention_relative = f"{spec.layout.interventions}/{item.translation_unit_id}.json"
+        proof_relative = f"{spec.layout.proofs}/{item.translation_unit_id}.json"
+        intervention_path = safe_project_path(root, intervention_relative)
+        proof_path = safe_project_path(root, proof_relative)
+        if not intervention_path.is_file() or not proof_path.is_file():
+            continue
+        intervention = _load_json_model(intervention_path, InterventionDocument)
+        proof = _load_json_model(proof_path, ProofDocument)
+        if intervention.interventions or proof.expected_observations:
+            continue
+        if intervention.source != item.source:
+            continue
+        digest = Digest(algorithm="sha256", value=item.actual_digest)
+        documents.append(
+            (
+                intervention_relative,
+                canonical_json(intervention.model_copy(update={"source_digest": digest})),
+            )
+        )
+        repinned[item.translation_unit_id] = item.actual_digest
+    if not repinned:
+        return build_plan, (), ()
+    units = tuple(
+        unit.model_copy(
+            update={"source_digest": Digest(algorithm="sha256", value=repinned[unit.id])}
+        )
+        if unit.id in repinned
+        else unit
+        for unit in build_plan.translation_units
+    )
+    updated = build_plan.model_copy(update={"translation_units": units})
+    rows = tuple(
+        {
+            "translation_unit_id": item.translation_unit_id,
+            "source": item.source,
+            "expected_digest": item.expected_digest,
+            "actual_digest": item.actual_digest,
+        }
+        for item in report.stale_translation_units
+        if item.translation_unit_id in repinned
+    )
+    return updated, rows, tuple(documents)
 
 
 def plan_source_lock(
@@ -472,6 +544,18 @@ def plan_source_lock(
             overlay_outputs=checked_overlay_outputs,
         )
 
+    repinned_units: tuple[dict[str, Any], ...] = ()
+    repinned_documents: tuple[tuple[str, bytes], ...] = ()
+    stale_units = _stale_tu_fields(report)
+    if not reconcile_translation_units and authority_error is None:
+        build_plan, repinned_units, repinned_documents = _repin_unprotected_units(
+            project, spec, build_plan, report
+        )
+        repinned_ids = {item["translation_unit_id"] for item in repinned_units}
+        stale_units = tuple(
+            item for item in stale_units if item["translation_unit_id"] not in repinned_ids
+        )
+
     return SourceLockPlan(
         root=project,
         spec=spec,
@@ -486,7 +570,9 @@ def plan_source_lock(
         build_plan=build_plan,
         authority_report=report,
         authority_error=authority_error,
-        stale_units=_stale_tu_fields(report),
+        stale_units=stale_units,
+        repinned_units=repinned_units,
+        repinned_documents=repinned_documents,
         graph_present=graph_present,
         graph_invalidation_required=graph_invalidation_required,
         checked_overlay_outputs=checked_overlay_outputs,
@@ -600,7 +686,18 @@ def apply_source_lock(
         spec.toolchain.lock_file,
         expected_sha256=preimages[spec.toolchain.lock_file],
     )
-    assert_json_authority_unchanged(transaction, plan.authority_snapshot)
+    snapshot_digests = {
+        relative: digest
+        for directory in plan.authority_snapshot
+        for relative, digest in directory.file_digests
+    }
+    for relative, data in plan.repinned_documents:
+        transaction.write(relative, data, expected_sha256=snapshot_digests.get(relative))
+    assert_json_authority_unchanged(
+        transaction,
+        plan.authority_snapshot,
+        mutable_paths=frozenset(relative for relative, _data in plan.repinned_documents),
+    )
     claimed_paths = {
         "reprobit.toml",
         spec.toolchain.lock_file,
