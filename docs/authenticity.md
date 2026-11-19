@@ -113,6 +113,26 @@ concurrent mutation, and oracle-payload leakage. It does not claim to defend aga
 operating-system administrator or a deliberately modified ReproBit implementation; run receipts
 therefore record the exact package and adapter identities.
 
+## ReproBit-written weak-alias objects
+
+A `coff-weak-alias` graph node is the one linker input no toolchain program produces. ReproBit
+writes it in the current run from the node's declaration alone: nothing else is read, and the
+reference image is never consulted. Its provenance is a `producer` node with operation
+`coff_weak_alias` whose only parent is the sealed producer graph; it has no locked tool and no
+producer attestation. The auditor recomputes the bytes from the bundle's own graph and requires
+them, as a cold fresh output of that node, before admitting the object, so a clean verification
+can reach `byte_exact` with it. The report lists such objects under "Objects ReproBit wrote
+itself", and `rbit verify` discloses their count.
+
+The object adds no image bytes and no knowledge of the reference. The trust it adds is only that
+the linker resolves weak externals as the COFF specification describes. For LINK 5.0 that
+behavior is measured rather than assumed, and it is order-dependent: `alias` resolves to the
+default in every arrangement measured, while `nolibrary` resolves to it only when the reference
+comes from a library member and the default from a command-line object (the arrangement of lrr's
+matching build); otherwise LINK 5.0 searches libraries for the weak name.
+`tests/test_coff_weak_alias.py` links small programs with each characteristic, and the
+`CoffWeakSearch` documentation records the results.
+
 ## Trust boundary
 
 Trusted code consists of the reviewed ReproBit implementation, its closed adapter/recipe

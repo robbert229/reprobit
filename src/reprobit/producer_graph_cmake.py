@@ -49,6 +49,14 @@ from reprobit.cmake_makefile_metadata import (
 from reprobit.cmake_makefile_metadata import (
     split_command_line as _split_command_line,
 )
+from reprobit.coff_weak_alias import (
+    CoffWeakAliasDeclaration,
+    CoffWeakAliasError,
+    CoffWeakSearch,
+    declare_coff_weak_alias,
+    parse_alias_argument,
+    read_coff_weak_alias,
+)
 from reprobit.model import Digest
 from reprobit.producer_graph import (
     ProducerGraphDocument,
@@ -61,6 +69,13 @@ from reprobit.producer_graph import (
 )
 
 _LINK_RECIPE = re.compile(r'(?i)(?:^|[/\\"])(?:link|link\.exe|lib|lib\.exe)(?=(?:"|\s|$))')
+# The one project custom command the import maps to a ReproBit producer: lrr's
+# ``python3 <source>/tools/coff_weak_external.py OUT WEAK=DEFAULT...``.  The
+# import never runs that script; it reads the alias set from the argv and
+# ReproBit's own producer writes the object in each run.
+COFF_WEAK_ALIAS_SCRIPT = "source/tools/coff_weak_external.py"
+_PYTHON_PROGRAM = re.compile(r"(?i)python(?:3(?:\.[0-9]+)?)?(?:\.exe)?")
+_CMAKE_ECHO = re.compile(r"^@?\$\(CMAKE_COMMAND\) -E cmake_echo_color ")
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +86,7 @@ class _RawNode:
     outputs: tuple[str, ...]
     working_directory: Path
     inputs: tuple[str, ...] = ()
+    coff_weak_alias: CoffWeakAliasDeclaration | None = None
 
 
 def _nmake_inline_response(
@@ -420,6 +436,184 @@ def _link_nodes(
     return tuple(nodes)
 
 
+def _custom_command_rules(
+    build_root: Path,
+    *,
+    reader: MetadataReader,
+) -> dict[str, tuple[str, Path, tuple[str, ...], Path]]:
+    """Return each build.make rule target with its owner, directory and recipe.
+
+    Keys are case-folded absolute target paths.  A rule's recipe is its run of
+    tab-indented lines; CMake's own progress echo is dropped.
+    """
+
+    rules: dict[str, tuple[str, Path, tuple[str, ...], Path]] = {}
+    for makefile in _metadata_files(build_root, "build.make"):
+        owner = makefile.parent.name.removesuffix(".dir")
+        directory = _build_working_directory(
+            makefile.parent.parent.parent,
+            build_root=build_root,
+            label=f"custom command target {owner!r} working directory",
+        )
+        lines = reader.read_text(
+            makefile, label=f"custom command target {owner!r} build metadata"
+        ).splitlines()
+        offset = 0
+        while offset < len(lines):
+            line = lines[offset]
+            offset += 1
+            if not line or line[0].isspace() or line.startswith("#") or ":" not in line:
+                continue
+            head = line.split(": ", 1)[0] if ": " in line else line.rstrip(":")
+            if not head.casefold().endswith(".obj") or " " in head:
+                continue
+            recipe: list[str] = []
+            while offset < len(lines) and lines[offset].startswith("\t"):
+                command = lines[offset].strip()
+                offset += 1
+                if command and _CMAKE_ECHO.match(command) is None:
+                    recipe.append(command)
+            if not recipe:
+                # A dependency-only line (``x.obj: flags.make``) carries no command.
+                continue
+            target = Path(head)
+            if not target.is_absolute():
+                target = directory / target
+            key = os.fspath(target.resolve(strict=False)).casefold()
+            if key in rules:
+                raise ProducerGraphError(f"CMake custom command target {head!r} is ambiguous")
+            rules[key] = (owner, directory, tuple(recipe), makefile)
+    return rules
+
+
+def _coff_weak_alias_nodes(
+    nodes: Sequence[_RawNode],
+    *,
+    build_root: Path,
+    source_root: Path,
+    toolchain_root: Path,
+    reader: MetadataReader,
+) -> tuple[_RawNode, ...]:
+    """Map lrr's weak-alias custom command to ReproBit's in-run producer.
+
+    Only an object that a linker or librarian consumes and no toolchain node
+    produces is looked up, so ordinary projects see no change.  Its CMake rule
+    must be exactly ``<python> ${SOURCE}/tools/coff_weak_external.py
+    [--search=nolibrary|library|alias] OUT WEAK=DEFAULT...``; any other custom
+    command is refused rather than guessed at.  Without ``--search`` the
+    script's documented default, NOLIBRARY, is declared.  The script is never
+    run.  When the configured build already holds the object (the project's own
+    build wrote it), its bytes must be the ones ReproBit writes for the same
+    alias set.
+    """
+
+    produced = {output.casefold() for node in nodes for output in node.outputs}
+    wanted: dict[str, str] = {}
+    for node in nodes:
+        if node.role not in {ProducerRole.LINKER, ProducerRole.LIBRARIAN}:
+            continue
+        for reference in node.inputs:
+            if (
+                reference.startswith("build/")
+                and PurePosixPath(reference).suffix.casefold() == ".obj"
+                and reference.casefold() not in produced
+            ):
+                wanted.setdefault(reference.casefold(), reference)
+    if not wanted:
+        return ()
+    rules = _custom_command_rules(build_root, reader=reader)
+    result: list[_RawNode] = []
+    for reference in sorted(wanted.values(), key=str.casefold):
+        path = build_root.joinpath(*PurePosixPath(reference.removeprefix("build/")).parts)
+        rule = rules.get(os.fspath(path.resolve(strict=False)).casefold())
+        if rule is None:
+            # Left unproduced: the graph refuses it as an object without
+            # current-run ancestry.
+            continue
+        owner, declared_directory, recipe, makefile = rule
+        label = f"custom command for {reference!r} ({makefile.relative_to(build_root)})"
+        if len(recipe) != 1:
+            raise ProducerGraphError(f"{label} must be one command, found {len(recipe)}")
+        if "$" in recipe[0] or "`" in recipe[0]:
+            raise ProducerGraphError(f"{label} uses make or shell expansion")
+        directory, tokens = _command_recipe(
+            recipe[0],
+            declared_working_directory=declared_directory,
+            build_root=build_root,
+        )
+        if (
+            len(tokens) < 4
+            or _PYTHON_PROGRAM.fullmatch(Path(tokens[0]).name) is None
+            or any(token in {"&&", "||", ";", "|", ">", "<"} for token in tokens)
+        ):
+            raise ProducerGraphError(
+                f"{label} is not an importable command; ReproBit imports only "
+                "'python3 <project>/tools/coff_weak_external.py OUT WEAK=DEFAULT ...'"
+            )
+
+        def seat(value: str, *, current: Path = directory) -> str:
+            return _path_reference(
+                value,
+                working_directory=current,
+                source_root=source_root,
+                build_root=build_root,
+                toolchain_root=toolchain_root,
+            )
+
+        operands = list(tokens[2:])
+        search = CoffWeakSearch.NOLIBRARY
+        if operands and operands[0].startswith("--search="):
+            # The project names the characteristic itself; without it, the
+            # script's documented default (NOLIBRARY) applies.
+            try:
+                search = CoffWeakSearch(operands.pop(0).removeprefix("--search="))
+            except ValueError as error:
+                raise ProducerGraphError(
+                    f"{label} names an unknown search characteristic: {error}"
+                ) from error
+        if len(operands) < 2:
+            raise ProducerGraphError(f"{label} declares no output and alias set")
+        script = seat(tokens[1])
+        if script != COFF_WEAK_ALIAS_SCRIPT:
+            raise ProducerGraphError(
+                f"{label} runs an unknown script {script!r}; ReproBit imports only "
+                f"{COFF_WEAK_ALIAS_SCRIPT!r}, never running it"
+            )
+        if seat(operands[0]).casefold() != reference.casefold():
+            raise ProducerGraphError(f"{label} writes {operands[0]!r}, not its rule target")
+        try:
+            declaration = declare_coff_weak_alias(
+                tuple(parse_alias_argument(value) for value in operands[1:]),
+                search=search,
+            )
+        except (CoffWeakAliasError, ValueError) as error:
+            raise ProducerGraphError(f"{label} declares an invalid alias set: {error}") from error
+        if os.path.lexists(path):
+            if path.is_symlink() or not path.is_file():
+                raise ProducerGraphError(f"{label}: the project's output is redirected: {path}")
+            written = path.read_bytes()
+            if written != declaration.payload():
+                try:
+                    detail = f"it declares {read_coff_weak_alias(written)}"
+                except CoffWeakAliasError as error:
+                    detail = str(error)
+                raise ProducerGraphError(
+                    f"{label}: the project's build wrote different bytes from ReproBit's "
+                    f"producer for the same alias set ({detail})"
+                )
+        result.append(
+            _RawNode(
+                role=ProducerRole.COFF_WEAK_ALIAS,
+                owner=owner,
+                arguments=(),
+                outputs=(reference,),
+                working_directory=directory,
+                coff_weak_alias=declaration,
+            )
+        )
+    return tuple(result)
+
+
 def _normalize_node(
     node: _RawNode,
     *,
@@ -540,6 +734,7 @@ def _producer_nodes(
                 directive_inputs=directive_inputs.get(target_id, ()) if target_id else (),
                 outputs=node.outputs,
                 depends_on=tuple(sorted(dependencies, key=str.casefold)),
+                coff_weak_alias=node.coff_weak_alias,
             )
         )
     terminal_targets = {node.target_id for node in nodes if node.target_id is not None}
@@ -606,6 +801,16 @@ def extract_cmake_makefiles_graph(
             produced_relatives=produced_relatives,
         )
         for node in raw_nodes
+    )
+    normalized_nodes = (
+        *normalized_nodes,
+        *_coff_weak_alias_nodes(
+            normalized_nodes,
+            build_root=build_root,
+            source_root=source_root,
+            toolchain_root=toolchain,
+            reader=metadata_reader,
+        ),
     )
     nodes = _producer_nodes(
         normalized_nodes,

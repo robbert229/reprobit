@@ -83,7 +83,12 @@ from reprobit.process import (
     ProcessSupervisor,
     ProcessTimedOut,
 )
-from reprobit.producer_graph import ProducerGraphDocument, ProducerNode, ProducerRole
+from reprobit.producer_graph import (
+    TOOL_PRODUCER_ROLES,
+    ProducerGraphDocument,
+    ProducerNode,
+    ProducerRole,
+)
 from reprobit.schema import (
     BuildPlanDocument,
     ClassicDebugCompanionPaths,
@@ -1360,7 +1365,7 @@ def test_prepare_failure_releases_logical_drive_and_uses_stable_temporary(
         classic_runtime_preparation,
         "_graph_role_bindings",
         lambda *args, **kwargs: (
-            {role: role.value for role in ProducerRole},
+            {role: role.value for role in TOOL_PRODUCER_ROLES},
             {
                 ProducerRole.COMPILER: "bin/CL.EXE",
                 ProducerRole.RESOURCE: "bin/RC.EXE",
@@ -4164,7 +4169,7 @@ def test_parallel_wine_lanes_share_one_private_prefix_or_fail_together(
     alias.parent.mkdir()
     alias.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     alias.chmod(stat.S_IRUSR | stat.S_IXUSR)
-    role_commands = {role: Path(sys.executable) for role in ProducerRole}
+    role_commands = {role: Path(sys.executable) for role in TOOL_PRODUCER_ROLES}
     bundle = _prepare_bundle(tmp_path)
 
     def close_runtime(
@@ -4396,7 +4401,7 @@ def test_native_logical_role_commands_stay_in_projected_toolchain_authority(
         toolchain_root=toolchain_root,
         graph=graph,
         role_commands=role_commands,
-        role_tool_ids={role: role.value for role in ProducerRole},
+        role_tool_ids={role: role.value for role in TOOL_PRODUCER_ROLES},
         wrapper_runtime_files=(),
         authority_inputs=(),
         analysis_link_options=(),

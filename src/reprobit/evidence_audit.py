@@ -15,6 +15,7 @@ from reprobit.classic.semantic_contracts import (
     RegisteredSemanticContract,
     semantic_proof_matches,
 )
+from reprobit.coff_weak_alias import COFF_WEAK_ALIAS_OPERATION
 from reprobit.costs import calculate_intervention_cost, intervention_cost_row_digest
 from reprobit.execution import (
     BuildExecutionReceipt,
@@ -35,6 +36,7 @@ from reprobit.model import (
     ArtifactOrigin,
     ByteRange,
     Certificate,
+    Digest,
     ProvenanceKind,
     ProvenanceNode,
     Quarantine,
@@ -43,6 +45,7 @@ from reprobit.model import (
 from reprobit.msvc50_authorities import Msvc50FileAuthority
 from reprobit.msvc50_link_runtime import locked_link_runtime_authorities
 from reprobit.paths import normalize_logical_path
+from reprobit.producer_graph import ProducerRole
 from reprobit.schema import (
     ClassicRecipeIntervention,
     LegacyOracleInstallIntervention,
@@ -496,6 +499,7 @@ class EvidenceAuditor:
             issue,
         )
         self._validate_object_transforms(build, runtime, artifacts, nodes, issue)
+        self._validate_coff_weak_alias_objects(bundle, build, artifacts, nodes, issue)
 
         nodes_by_artifact: dict[str, list[ProvenanceNode]] = defaultdict(list)
         for node in nodes.values():
@@ -1160,6 +1164,84 @@ class EvidenceAuditor:
                         "unattested-composed-producer",
                         f"composed producer {node.id!r} is not a byte-preserving publication",
                     )
+
+    @staticmethod
+    def _validate_coff_weak_alias_objects(
+        bundle: ProjectBundle,
+        build: BuildExecutionReceipt,
+        artifacts: Mapping[str, Artifact],
+        nodes: Mapping[str, ProvenanceNode],
+        issue: _IssueSink,
+    ) -> None:
+        """Re-derive every ReproBit-written weak-alias object from the reviewed graph.
+
+        Such an object has no toolchain producer.  It is admitted only as the
+        exact bytes the bundle's own producer graph declares, written fresh in
+        this cold run by that graph node's step, with the sealed graph as its
+        one parent.  The auditor recomputes those bytes itself.
+        """
+
+        graph = bundle.producer_graph
+        declared: dict[tuple[str, int], str] = {}
+        if graph is not None:
+            for graph_node in graph.nodes:
+                declaration = graph_node.coff_weak_alias
+                if graph_node.role is not ProducerRole.COFF_WEAK_ALIAS or declaration is None:
+                    continue
+                payload = declaration.payload()
+                declared[(Digest.from_bytes(payload).value, len(payload))] = graph_node.id
+        graph_layout = _logical_path(bundle.spec.layout.producer_graph)
+        output_receipts = {item.path.resolve(strict=False): item for item in build.outputs}
+        for node in nodes.values():
+            if node.operation != COFF_WEAK_ALIAS_OPERATION:
+                continue
+            artifact = artifacts.get(node.artifact_id)
+            parent = nodes.get(node.parents[0]) if len(node.parents) == 1 else None
+            parent_artifact = artifacts.get(parent.artifact_id) if parent is not None else None
+            if (
+                artifact is None
+                or parent_artifact is None
+                or node.kind is not ProvenanceKind.PRODUCER
+                or node.origin is not ArtifactOrigin.FRESH_SEED
+                or artifact.kind is not ArtifactKind.OBJECT
+                or artifact.producer is not None
+                or artifact.inputs != (parent_artifact.id,)
+                or parent_artifact.kind is not ArtifactKind.SOURCE
+                or _logical_path(parent_artifact.logical_path) != graph_layout
+            ):
+                issue(
+                    EvidenceClaim.ORIGIN,
+                    "weak-alias-provenance",
+                    f"weak-alias object {node.id!r} does not descend only from the producer graph",
+                )
+                continue
+            graph_node_id = declared.get((artifact.digest.value, artifact.size))
+            if graph_node_id is None:
+                issue(
+                    EvidenceClaim.ORIGIN,
+                    "weak-alias-content",
+                    f"weak-alias object {artifact.id!r} is not the bytes of any declared alias set",
+                )
+                continue
+            receipt = (
+                output_receipts.get(Path(artifact.receipt_path).resolve(strict=False))
+                if artifact.receipt_path is not None
+                else None
+            )
+            if (
+                receipt is None
+                or receipt.digest != artifact.digest
+                or receipt.size != artifact.size
+                or receipt.producer_step != graph_node_id
+                or not receipt.fresh
+                or not build.cold
+            ):
+                issue(
+                    EvidenceClaim.ORIGIN,
+                    "weak-alias-receipt",
+                    f"weak-alias object {artifact.id!r} is not a cold fresh output of "
+                    f"{graph_node_id!r}",
+                )
 
     @staticmethod
     def _validate_terminal_coverage(

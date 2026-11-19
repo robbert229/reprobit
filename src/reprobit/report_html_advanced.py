@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from reprobit.report import Report
+from reprobit.model import Artifact
+from reprobit.report import Report, reprobit_written_objects
 from reprobit.report_html_components import (
     Content,
     code,
@@ -342,6 +343,26 @@ def _render_evidence_details(report: Report) -> str:
     return counts + component_table + issue_table
 
 
+def _render_reprobit_object_details(written: tuple[Artifact, ...]) -> str:
+    rows = tuple(
+        (code(item.logical_path), format_integer(item.size), code(item.digest.value))
+        for item in written
+    )
+    return (
+        "<p>No toolchain program produced these linker inputs. Each is a section-less "
+        "COFF object holding only weak externals, which ReproBit wrote in this run from "
+        "a <code>coff-weak-alias</code> declaration in the reviewed producer graph; the "
+        "graph pins its digest and the auditor re-derives its bytes from that declaration. "
+        "It adds no image bytes and no knowledge of the reference: the only trust it adds "
+        "is that the linker resolves weak externals as the COFF specification describes.</p>"
+        + table(
+            ("Object", "Bytes", "SHA-256"),
+            rows,
+            caption="ReproBit-written objects",
+        )
+    )
+
+
 def _render_cost_details(report: Report) -> str:
     attributed = report.costs.project_total - report.costs.unallocated_shared_cost
     unallocated_percent = (
@@ -530,6 +551,16 @@ def render_advanced(report: Report, *, canonical_json_href: str | None) -> str:
                     f"{count_phrase(changed_bytes, 'changed byte')}"
                 ),
                 body=_render_debug_companion_details(report),
+            )
+        )
+    written = reprobit_written_objects(report)
+    if written:
+        sections.append(
+            details(
+                identity="reprobit-object-details",
+                title="Objects ReproBit wrote itself",
+                meta=count_phrase(len(written), "COFF weak-alias object"),
+                body=_render_reprobit_object_details(written),
             )
         )
     if report.verdict.quarantines:

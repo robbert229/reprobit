@@ -59,6 +59,33 @@ The generated files are ordinary JSON that can be reviewed and committed. A
 failed first import removes only its new scaffold and retains the temporary
 workspace for diagnosis. ReproBit builds use only the committed graph.
 
+## Weak-alias objects
+
+LINK 5.0 has no `/ALTERNATENAME`, so a project that needs one function under
+two link names can link a section-less object of COFF weak externals. CMake
+builds that object with a custom command, which an import never runs. The
+import recognizes exactly one form, for an object that a linker or librarian
+consumes and no compiler produces:
+
+```cmake
+add_custom_command(OUTPUT "${out}"
+  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/coff_weak_external.py"
+    [--search=nolibrary|library|alias] "${out}" "WEAK=DEFAULT" ...
+  VERBATIM)
+set_source_files_properties("${out}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+```
+
+The import reads the alias set (and the optional characteristic, `nolibrary`
+by default) from that argv and records a `coff-weak-alias` producer node
+whose declaration pins the object's digest. ReproBit's own producer writes
+the object in every run. Any other custom command for such an object is
+refused: another script, more than one command, make or shell expansion, an
+output that is not the rule's target, or an unparsable or duplicate alias.
+When the configured build tree already holds the object, written by the
+project's own build, the import requires its bytes to equal ReproBit's for
+the same declaration, so a disagreement between the project's tool and
+ReproBit's producer is refused rather than recorded.
+
 ## Refresh after adding or removing source files
 
 Start with a read-only preview whenever the reviewed source list changes:

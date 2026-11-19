@@ -572,6 +572,9 @@ def node_arguments(
     plan: ClassicIncrementalPlan,
     node: ProducerNode,
 ) -> tuple[str, ...]:
+    if node.role is ProducerRole.COFF_WEAK_ALIAS:
+        # ReproBit writes this object itself; no program or argv runs.
+        return ()
     return (
         plan.role_logical[node.role],
         *(

@@ -11,6 +11,7 @@ import struct
 from dataclasses import dataclass
 
 from reprobit.classic.semantic_errors import ClassicSemanticError
+from reprobit.coff_weak_alias import CoffWeakAliasError, read_coff_weak_alias
 from reprobit.model import Digest
 
 _DEFAULTLIB = re.compile(r"(?i)^[/-]defaultlib:([a-z0-9_.+@-]+)$")
@@ -642,12 +643,23 @@ def _coff_directive_receipt(coff: _CoffObject) -> CoffDirectiveReceipt:
 
 
 def parse_classic_coff_directives(payload: bytes, *, label: str) -> CoffDirectiveReceipt:
-    """Parse the complete closed `.drectve` language of one i386 COFF object."""
+    """Parse the complete closed `.drectve` language of one i386 COFF object.
+
+    A section-less ReproBit weak-alias object (:mod:`reprobit.coff_weak_alias`)
+    has no ``.drectve`` section and so no linker controls; it is admitted only
+    in exactly the canonical form that producer writes.
+    """
 
     if type(payload) is not bytes or not payload:
         raise ClassicSemanticError(f"{label} is not immutable COFF bytes")
     if not label or "\x00" in label:
         raise ClassicSemanticError("COFF directive label is malformed")
+    if len(payload) >= 4 and payload[2:4] == b"\0\0":
+        try:
+            read_coff_weak_alias(payload)
+        except CoffWeakAliasError as exc:
+            raise ClassicSemanticError(f"{label} is not a supported i386 COFF object") from exc
+        return CoffDirectiveReceipt((), (), (), ())
     return _coff_directive_receipt(_parse_coff(payload, label))
 
 
