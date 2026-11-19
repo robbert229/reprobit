@@ -431,3 +431,194 @@ def test_discovery_pairs_relocated_fields_by_symbol() -> None:
         PAIRED_IMAGE,
     )
     assert region["replacement_relocations"] == [[2, 18], [8, 12]]
+
+
+# --- the accumulator moffs forms ------------------------------------------------------
+
+
+def test_a_moffs_load_is_a_shorter_absolute_load() -> None:
+    body = bytes.fromhex(HEAD + "8b0500000000" + "8903" + TAIL)
+    image, proof = apply_region_resize(
+        body,
+        [
+            {
+                "region_start": 10,
+                "region_end": 16,
+                "replacement_instructions": ["a100000000"],
+                "replacement_relocations": [[1, 12]],
+            }
+        ],
+        _rows((6, 12)),
+        1,
+        "fixture",
+        prologue_length=4,
+    )
+    assert image == bytes.fromhex(HEAD + "a100000000" + "8903" + TAIL)
+    assert proof["growth"] == -1
+
+
+@pytest.mark.parametrize(
+    ("encoding", "relocations", "why"),
+    [
+        ("a100000000", {}, "without a relocation"),
+        ("66a100000000", {2: "_g"}, "operand-size-prefixed"),
+    ],
+)
+def test_a_moffs_form_outside_the_closed_set_is_refused(
+    encoding: str, relocations: dict[int, str], why: str
+) -> None:
+    code = bytes.fromhex(encoding)
+    with pytest.raises(ByteIdentityError, match=why):
+        simulate_region(code, 0, len(code), relocations, "t", "moffs")
+
+
+def test_the_moffs_forms_move_the_accumulator_exactly() -> None:
+    code = bytes.fromhex("a100000000" + "a204000000")
+    (path,) = simulate_region(code, 0, len(code), {1: "_g", 6: "_g"}, "t", "moffs")
+    loaded = path.regs["eax"]
+    assert loaded[2][0][0][0] == "ld" and loaded[2][0][0][2] == 4
+    ((address, width, value),) = path.stores
+    assert width == 1 and address == ("lin", 4, ((("sym", "_g"), 1),))
+    assert value[0] == "b" and value[1] == 8
+
+
+# --- regions with several exits and entries ---------------------------------------------
+
+LEAVING_DONOR = bytes.fromhex(HEAD + "8b4304" + "85c0" + "7402" + "8903" + TAIL)
+LEAVING_IMAGE = bytes.fromhex(HEAD + "8b4304" + "83f800" + "7402" + "8903" + TAIL)
+
+
+def _leaving(replacement):
+    return apply_region_resize(
+        LEAVING_DONOR,
+        [
+            {
+                "region_start": 10,
+                "region_end": 17,
+                "replacement_instructions": replacement,
+                "replacement_relocations": [],
+            }
+        ],
+        _rows((6,)),
+        1,
+        "fixture",
+        prologue_length=4,
+    )
+
+
+def test_a_region_may_leave_by_a_branch_and_is_compared_where_it_leaves() -> None:
+    # je 19 leaves the region [10, 17); the replacement's je, one byte later,
+    # must land on M(19) = 20.
+    image, proof = _leaving(["8b4304", "83f800", "7402"])
+    assert image == LEAVING_IMAGE
+    (region,) = proof["regions"]
+    assert region["exits"] == [[19, 20]]
+    assert region["path_pairs"] == 2
+    assert region["compared_registers"] == ["eax", "ebx"]
+
+
+def test_a_replacement_that_leaves_elsewhere_is_refused() -> None:
+    with pytest.raises(ByteIdentityError, match="leave the region at different places"):
+        _leaving(["8b4304", "83f800", "7400"])
+
+
+def test_a_branch_backward_inside_a_region_is_still_refused() -> None:
+    body = bytes.fromhex(HEAD + "8b4304" + "85c0" + "75f9" + "8903" + TAIL)
+    with pytest.raises(ByteIdentityError, match="backward"):
+        apply_region_resize(
+            body,
+            [
+                {
+                    "region_start": 10,
+                    "region_end": 17,
+                    "replacement_instructions": ["8b4304", "85c0", "75f9"],
+                    "replacement_relocations": [],
+                }
+            ],
+            _rows((6,)),
+            1,
+            "fixture",
+            prologue_length=4,
+        )
+
+
+ENTERED_DONOR = bytes.fromhex(HEAD + "85db" + "7403" + "8b4304" + "8bc8894b08" + "8903" + TAIL)
+ENTERED_IMAGE = bytes.fromhex(HEAD + "85db" + "7403" + "8b4304" + "894308" + "8903" + TAIL)
+ENTERED_REGION = {
+    "region_start": 14,
+    "region_end": 22,
+    "replacement_instructions": ["8b4304", "894308"],
+    "replacement_relocations": [],
+    "replacement_entries": [[17, 3]],
+}
+
+
+def _entered(**changes):
+    return apply_region_resize(
+        ENTERED_DONOR,
+        [{**ENTERED_REGION, **changes}],
+        _rows((6,)),
+        1,
+        "fixture",
+        prologue_length=4,
+    )
+
+
+def test_a_declared_entry_admits_a_branch_into_the_region_interior() -> None:
+    # je 17 enters the region [14, 22) between its two instructions; from
+    # there both versions store the entry EAX.
+    image, proof = _entered()
+    assert image == ENTERED_IMAGE
+    (region,) = proof["regions"]
+    assert region["entries"] == [[17, 17]]
+    assert region["donor_paths"] == 2 and region["replacement_paths"] == 2
+
+
+def test_an_undeclared_entry_into_the_interior_is_refused() -> None:
+    region = {key: value for key, value in ENTERED_REGION.items() if key != "replacement_entries"}
+    with pytest.raises(ByteIdentityError, match="targets the region interior"):
+        apply_region_resize(ENTERED_DONOR, [region], _rows((6,)), 1, "fixture", prologue_length=4)
+
+
+def test_an_entry_mapped_to_the_wrong_replacement_instruction_is_refused() -> None:
+    with pytest.raises(ByteIdentityError, match="entry 17"):
+        _entered(replacement_entries=[[17, 0]])
+
+
+@pytest.mark.parametrize(
+    "entries", [[[17, 4]], [[14, 0]], [[22, 3]], [[17, 3], [17, 3]], [], [[17, 3, 0]]]
+)
+def test_a_malformed_entry_is_refused(entries: list) -> None:
+    with pytest.raises(ByteIdentityError, match="replacement entries"):
+        _entered(replacement_entries=entries)
+
+
+def test_discovery_maps_a_branch_into_a_run_through_the_aligned_branch() -> None:
+    from reprobit.discovery_region_resize import (
+        _aligned_offsets,
+        _branch_targets,
+        _instruction_keys,
+        _regions_for,
+    )
+
+    rows = [{**row, "target_type": 0, "target_storage": 2} for row in _rows((6,))]
+    donor_keys = _instruction_keys(ENTERED_DONOR, rows, len(ENTERED_DONOR), "d")
+    reference_keys = _instruction_keys(ENTERED_IMAGE, rows, len(ENTERED_IMAGE), "r")
+    branches = (
+        _branch_targets(ENTERED_DONOR, rows, len(ENTERED_DONOR), "d"),
+        _branch_targets(ENTERED_IMAGE, rows, len(ENTERED_IMAGE), "r"),
+        _aligned_offsets(donor_keys, reference_keys),
+    )
+    # The run [14, 22) of the donor against [14, 20) of the reference.
+    (region,) = _regions_for(
+        [(7, 10, 7, 9)],
+        donor_keys,
+        reference_keys,
+        rows,
+        rows,
+        len(ENTERED_DONOR),
+        len(ENTERED_IMAGE),
+        ENTERED_IMAGE,
+        branches,
+    )
+    assert region["replacement_entries"] == [[17, 3]]

@@ -28,30 +28,36 @@ register and flag live at this point in D or in I" is preserved by each of
 them: a live set computed by backward liveness satisfies
 ``L(p) >= use(p) | (L(succ) - def(p))`` on its own control-flow graph, the two
 graphs are equal outside the regions under M, and so is the union of the two
-live sets.  At a region entry the states agree on the union live set there,
-and every entry value a region reads before writing it is in that set
-(check 8f).  Check 8 then shows, for every pair of paths through R_i and P_i
-that the same entry state can take, that the two exit states agree on
-memory, ESP, and every register and flag live at the exit in D or in I.  So
-the invariant holds again after the region, and at every return it covers
-EAX, the callee-saved registers and ESP, which the liveness treats as read by
-``ret``.
+live sets.  At a region entry (its start or a declared interior entry, which
+every edge into the region reaches by check 2) the states agree on the union
+live set there, and every entry value a region reads before writing it is in
+that set (check 8f).  Check 8 then shows, for every pair of paths through
+R_i and P_i that the same entry state can take from that entry, that both
+leave at corresponding points x and M(x) and the two states there agree on
+memory, ESP, and every register and flag live at x in D or at M(x) in I.  So
+the invariant holds again wherever control leaves the region, and at every
+return it covers EAX, the callee-saved registers and ESP, which the liveness
+treats as read by ``ret``.
 
 Checks (each is a refusal):
 
 1. Shape.  Every region lies on instruction boundaries of D's code, inside
    the code (before any switch table or fill), after the FPO prologue, and
    does not reach the code end; regions are sorted and disjoint.
-2. Single entry.  No branch outside a region targets its interior, no
-   external entry (an entry the flow walk finds, or an in-body relocated
-   target) lies in its interior, and no symbol of the function's section,
+2. Entries.  A region is entered at its start and at the interior points
+   it declares, each paired with an instruction of P_i (M maps the point
+   there).  No branch outside a region targets any other interior offset,
+   no external entry (an entry the flow walk finds, or an in-body relocated
+   target) lies on one, and no symbol of the function's section,
    line-independent debug offset (the CodeView procedure range) or
    closure-child code reference names an interior offset.
-3. Single exit, forward CFG.  Inside R_i and P_i every instruction falls
-   through or branches strictly forward to an instruction of the same region
-   or to its end; there is no call, return, indirect transfer or
-   relocated branch.  The CFG is therefore a DAG with one entry (the start)
-   and one exit (the end), and its paths are enumerated (at most 64).
+3. Forward CFG, any exits.  Inside R_i and P_i every instruction falls
+   through, branches strictly forward to an instruction of the same region
+   or to its end, or leaves for a point outside every region interior (or a
+   declared entry of another region) in the code; there is no call, return,
+   indirect transfer or relocated branch.  The CFG is therefore a DAG; its
+   paths from each entry are enumerated (at most 64) and each ends at the
+   region's end or at the point a branch leaves for.
 4. Decoding.  P_i decodes, instruction by instruction, to exactly the
    declared encodings, and I re-decodes to exhaustion with each P_i on its
    own boundaries.
@@ -78,9 +84,11 @@ Checks (each is a refusal):
    outside instruction's length, opcode, flow class and mapped target.
 7. Liveness.  Register and per-flag liveness are computed on D and on I.
 8. Simulation (`region_simulation`).  R_i and P_i are executed from one
-   symbolic entry state.  For every pair of paths whose conditions do not
-   contradict each other (two paths of a deterministic run from one entry
-   state never do):
+   symbolic entry state, once from each entry (the start, and each declared
+   entry and its P_i instruction).  For every pair of paths whose conditions
+   do not contradict each other (two paths of a deterministic run from one
+   entry state never do), the donor's path leaves at some x and the
+   replacement's at M(x), and at that exit (its liveness, its mapping):
    a. ESP is equal;
    b. every register with an atom live at the exit in D or in I is equal;
    c. every flag live at the exit in D or in I is equal (ZF compared by its
@@ -606,12 +614,19 @@ def _validate_regions(regions: object, context: str) -> list[dict[str, Any]]:
         item_context = f"{context} region {ordinal}"
         require(isinstance(item, dict), f"{item_context}: the region is not an object")
         require(
-            set(item)
-            == {
+            {
                 "region_start",
                 "region_end",
                 "replacement_instructions",
                 "replacement_relocations",
+            }
+            <= set(item)
+            <= {
+                "region_start",
+                "region_end",
+                "replacement_instructions",
+                "replacement_relocations",
+                "replacement_entries",
             },
             f"{item_context}: the region names an unknown or missing field",
         )
@@ -637,13 +652,31 @@ def _validate_regions(regions: object, context: str) -> list[dict[str, Any]]:
             ),
             f"{item_context}: the replacement relocations are invalid",
         )
+        boundaries = [sum(len(piece) for piece in pieces[:k]) for k in range(len(pieces))]
+        entries = item.get("replacement_entries", [])
+        require(
+            isinstance(entries, list)
+            and bool(entries) == ("replacement_entries" in item)
+            and all(
+                isinstance(pair, list)
+                and len(pair) == 2
+                and all(type(value) is int for value in pair)
+                and start < pair[0] < end
+                and pair[1] in boundaries
+                for pair in entries
+            )
+            and [pair[0] for pair in entries] == sorted({pair[0] for pair in entries}),
+            f"{item_context}: the replacement entries are not sorted interior points mapped to "
+            "replacement instructions",
+        )
         validated.append(
             {
                 "start": start,
                 "end": end,
                 "replacement": b"".join(pieces),
-                "boundaries": [sum(len(piece) for piece in pieces[:k]) for k in range(len(pieces))],
+                "boundaries": boundaries,
                 "relocations": [tuple(pair) for pair in pairs],
+                "entries": {int(pair[0]): int(pair[1]) for pair in entries},
             }
         )
     for left, right in itertools.pairwise(validated):
@@ -733,9 +766,19 @@ def apply_region_resize(
                 start >= prologue_length, f"{region_context}: the region overlaps the FPO prologue"
             )
 
-            def interior(offset: int, start: int = start, end: int = end) -> bool:
-                return start < offset < end
+            declared_entries = region["entries"]
 
+            def interior(
+                offset: int, start: int = start, end: int = end, entries: Any = declared_entries
+            ) -> bool:
+                """An interior offset that is not a declared entry."""
+                return start < offset < end and offset not in entries
+
+            for offset in declared_entries:
+                require(
+                    offset in index_of,
+                    f"{region_context}: the declared entry {offset} is not an instruction boundary",
+                )
             for item in instructions:
                 if item["target"] is not None and not start <= item["offset"] < end:
                     require(
@@ -763,10 +806,13 @@ def apply_region_resize(
                     f"{region_context}: the region holds a {item['flow']} at {item['offset']}",
                 )
                 if item["flow"] in ("jcc", "jmp"):
+                    target = item["target"]
                     require(
-                        item["target"] is not None and item["offset"] < item["target"] <= end,
-                        f"{region_context}: the branch at {item['offset']} leaves the region or "
-                        "goes backward",
+                        target is not None
+                        and (item["offset"] < target <= end or not start <= target <= end)
+                        and target < limit,
+                        f"{region_context}: the branch at {item['offset']} goes backward inside "
+                        "the region or leaves the code",
                     )
             region_rows = [row for row in rows if start <= row["offset"] < end]
             for row in region_rows:
@@ -808,6 +854,31 @@ def apply_region_resize(
     def outside_regions(offset: int) -> bool:
         return not any(region["start"] <= offset < region["end"] for region in declared)
 
+    def a_point(offset: int) -> bool:
+        """Outside every region interior, or a declared entry of one."""
+        return not any(
+            region["start"] < offset < region["end"] and offset not in region["entries"]
+            for region in declared
+        )
+
+    for ordinal, region in enumerate(declared):
+        with _region_refusals(ordinal):
+            exits = set()
+            for item in instructions:
+                if region["start"] <= item["offset"] < region["end"] and item["flow"] in (
+                    "jcc",
+                    "jmp",
+                ):
+                    target = item["target"]
+                    if not region["start"] <= target <= region["end"]:
+                        require(
+                            a_point(target),
+                            f"{context} region {ordinal}: the branch at {item['offset']} leaves "
+                            f"for {target}, inside another region",
+                        )
+                        exits.add(target)
+            region["exits"] = exits
+
     base = bytearray(donor_body)
     sigma_bytes: set[int] = set()
     for item in instructions:
@@ -826,12 +897,14 @@ def apply_region_resize(
         shifts.append((region["start"], region["end"], delta))
 
     def mapped(offset: int) -> int:
-        """M on every offset outside a region interior (and region starts)."""
+        """M on every offset outside a region interior (and region starts and entries)."""
         moved = 0
-        for start, end, accumulated in shifts:
+        for (start, end, accumulated), region in zip(shifts, declared, strict=True):
             if offset >= end:
                 moved = accumulated
             elif offset > start:
+                if offset in region["entries"]:
+                    return cast(int, region["image_start"] + region["entries"][offset])
                 raise ByteIdentityError(f"{context}: offset {offset} lies inside a region")
         return offset + moved
 
@@ -904,9 +977,7 @@ def apply_region_resize(
         base = symbol_values[row["target"]]
         target = base + addend
         require(
-            0 <= target < proc
-            and (target in index_of or target >= limit)
-            and not any(region["start"] < target < region["end"] for region in declared),
+            0 <= target < proc and (target in index_of or target >= limit) and a_point(target),
             f"{context}: the in-body relocation at {row['offset']} names {target}, not an "
             "instruction or table offset outside every region",
         )
@@ -1081,137 +1152,55 @@ def apply_region_resize(
             start, end = region["start"], region["end"]
             image_start = region["image_start"]
             image_end = image_start + len(region["replacement"])
-            donor_paths = simulate_region(
-                donor_body,
-                start,
-                end,
-                {row["offset"]: row["target"] for row in region["rows"]},
-                "donor",
-                f"{region_context} donor",
-            )
+            donor_relocations = {row["offset"]: row["target"] for row in region["rows"]}
+            pairs = 0
+            donor_count = 0
+            image_count = 0
+            compared_union: set[str] = set()
+            flags_union: set[str] = set()
             entry_sigma = sigma if scoped(start) else {}
             exit_sigma = sigma if scoped(end) else {}
-            image_paths = simulate_region(
-                region["replacement"],
-                0,
-                len(region["replacement"]),
-                region_maps[ordinal],
-                "replacement",
-                f"{region_context} replacement",
-                entry_names={
-                    entry_sigma.get(name, name): name for name in IA32_GENERAL_REGISTER_NAMES
-                },
-            )
-            entry_live = live_at(start)
-            exit_live = live_at(end)
-
-            def entry_cover(
-                name: str, sigma_in: dict[str, str] = entry_sigma, live: Any = entry_live
-            ) -> frozenset[str]:
-                return _cover(name, sigma_in, live)
-
-            def exit_cover(
-                name: str, sigma_out: dict[str, str] = exit_sigma, live: Any = exit_live
-            ) -> frozenset[str]:
-                return _cover(name, sigma_out, live)
-
-            exit_flags = (
-                donor_flag_live[donor_item_index[end]]
-                | image_flag_live[image_item_index[image_end]]
-            )
-            entry_flags = (
-                donor_flag_live[donor_item_index[start]]
-                | image_flag_live[image_item_index[image_start]]
-            )
-            compared_registers = sorted(
-                name for name in IA32_GENERAL_REGISTER_NAMES if name != "esp" and exit_cover(name)
-            )
-            compared_flags = sorted(name for name in FLAG_NAMES if name in exit_flags)
-            pairs = 0
-            mentioned: set[Any] = set()
-            passed_through: set[str] = set()
-            for left in donor_paths:
-                for right in image_paths:
-                    if contradictory(left.conditions, right.conditions):
-                        continue
-                    pairs += 1
-                    require(
-                        left.regs["esp"] == right.regs["esp"],
-                        f"{region_context}: the two versions leave a different stack pointer",
-                    )
-                    for name in compared_registers:
-                        require(
-                            left.regs[name] == right.regs[exit_sigma.get(name, name)],
-                            f"{region_context}: {name} is live at the exit and the two versions "
-                            "leave it different"
-                            + (
-                                f" (the replacement's {exit_sigma[name]})"
-                                if name in exit_sigma
-                                else ""
-                            ),
-                        )
-                    for name in compared_flags:
-                        require(
-                            canonical_flag(name, left.flags[name])
-                            == canonical_flag(name, right.flags[name]),
-                            f"{region_context}: the flag {name} is live at the exit and the two "
-                            "versions leave it different",
-                        )
-                    why = stores_equivalent(left.stores, right.stores)
-                    require(
-                        why is None,
-                        f"{region_context}: the two versions leave different memory: {why}",
-                    )
-                    require(
-                        left.footprint == right.footprint,
-                        f"{region_context}: the two versions access different memory",
-                    )
-                    for path, names in ((left, {}), (right, exit_sigma)):
-                        for name in ["esp", *compared_registers]:
-                            value = path.regs[names.get(name, name)]
-                            if name != "esp" and value == lin_atom(("reg0", name)):
-                                # A register both versions leave at its entry
-                                # value needs only its exit-live atoms shared.
-                                passed_through.add(name)
-                                continue
-                            term_atoms(value, mentioned)
-                        for name in compared_flags:
-                            term_atoms(path.flags[name], mentioned)
-                        term_atoms(path.stores, mentioned)
-                        term_atoms(path.footprint, mentioned)
-                        term_atoms(path.conditions, mentioned)
-            require(pairs > 0, f"{region_context}: no pair of paths is consistent")
-            for name in sorted(passed_through):
-                missing = exit_cover(name) - entry_cover(name)
-                require(
-                    not missing,
-                    f"{region_context}: {name} passes through the region but {sorted(missing)} is "
-                    "live only at its exit",
+            for donor_entry, image_local in [(start, 0), *sorted(region["entries"].items())]:
+                proof_context = (
+                    region_context
+                    if donor_entry == start
+                    else f"{region_context} entry {donor_entry}"
                 )
-            for kind, name in sorted(mentioned):
-                if kind == "reg0":
-                    if name == "esp":
-                        continue
-                    missing = _IA32_ATOMS_OF[name] - entry_cover(name)
-                    require(
-                        not missing,
-                        f"{region_context}: the entry value of {name} is read but "
-                        f"{sorted(missing)} is dead at the region entry",
-                    )
-                else:
-                    require(
-                        name in entry_flags,
-                        f"{region_context}: the entry flag {name} is read but dead at the region "
-                        "entry",
-                    )
+                pairs_here, compared, flags, counts = _prove_region_entry(
+                    donor_body,
+                    region,
+                    region_maps[ordinal],
+                    donor_relocations,
+                    donor_entry,
+                    image_local,
+                    sigma if scoped(donor_entry) else {},
+                    {
+                        exit_point: sigma if scoped(exit_point) else {}
+                        for exit_point in {end, *region["exits"]}
+                    },
+                    mapped,
+                    live_at,
+                    lambda offset: (
+                        donor_flag_live[donor_item_index[offset]]
+                        | image_flag_live[image_item_index[mapped(offset)]]
+                    ),
+                    proof_context,
+                )
+                pairs += pairs_here
+                donor_count += counts[0]
+                image_count += counts[1]
+                compared_union |= compared
+                flags_union |= flags
+            compared_registers = sorted(compared_union)
+            compared_flags = sorted(flags_union)
             record = {
                 "region_start": start,
                 "region_end": end,
                 "image_start": image_start,
                 "image_end": image_end,
                 "growth": region["growth"],
-                "donor_paths": len(donor_paths),
-                "replacement_paths": len(image_paths),
+                "donor_paths": donor_count,
+                "replacement_paths": image_count,
                 "path_pairs": pairs,
                 "compared_registers": compared_registers,
                 "compared_flags": compared_flags,
@@ -1219,10 +1208,17 @@ def apply_region_resize(
             if sigma:
                 record["entry_mapped"] = bool(entry_sigma)
                 record["exit_mapped"] = bool(exit_sigma)
+            if region["entries"]:
+                record["entries"] = [
+                    [offset, image_start + local]
+                    for offset, local in sorted(region["entries"].items())
+                ]
+            if region["exits"]:
+                record["exits"] = [[offset, mapped(offset)] for offset in sorted(region["exits"])]
             proved.append(record)
     offset_map: dict[int, int] = {}
     for item in instructions:
-        if not any(region["start"] < item["offset"] < region["end"] for region in declared):
+        if a_point(item["offset"]):
             offset_map[item["offset"]] = mapped(item["offset"])
     for offset in range(limit, len(body) + 1):
         offset_map[offset] = offset + delta
@@ -1247,6 +1243,154 @@ def apply_region_resize(
         proof["bijection_rewrites"] = sorted(mapped(at) for at in sigma_bytes)
         proof["bijection_mode_changes"] = sorted(mapped(at) for at in mode_changes)
     return image_bytes, proof
+
+
+def _prove_region_entry(
+    donor_body: bytes,
+    region: dict[str, Any],
+    image_relocations: dict[int, str],
+    donor_relocations: dict[int, str],
+    donor_entry: int,
+    image_local: int,
+    entry_sigma: dict[str, str],
+    exit_sigmas: dict[int, dict[str, str]],
+    mapped: Any,
+    live_at: Any,
+    flags_live: Any,
+    context: str,
+) -> tuple[int, set[str], set[str], tuple[int, int]]:
+    """Check 8 for the run of one region from one of its entries.
+
+    Both versions are executed from ``donor_entry`` and ``image_local`` (the
+    region's start and 0, or a declared interior entry and its replacement
+    instruction) to wherever they leave the region.  Every pair of paths
+    whose conditions do not contradict each other must leave at
+    corresponding points (the donor's exit ``x`` and the image's ``M(x)``),
+    and is compared there under that exit's liveness and mapping.  Returns
+    the pair count, the registers and flags compared, and the path counts.
+    """
+    start, end = region["start"], region["end"]
+    image_start = region["image_start"]
+    replacement = region["replacement"]
+    donor_paths = simulate_region(
+        donor_body,
+        start,
+        end,
+        donor_relocations,
+        "donor",
+        f"{context} donor",
+        begin=donor_entry,
+        leave=True,
+    )
+    image_paths = simulate_region(
+        replacement,
+        0,
+        len(replacement),
+        image_relocations,
+        "replacement",
+        f"{context} replacement",
+        entry_names={entry_sigma.get(name, name): name for name in IA32_GENERAL_REGISTER_NAMES},
+        begin=image_local,
+        leave=True,
+    )
+    entry_live = live_at(donor_entry)
+    entry_flags = flags_live(donor_entry)
+
+    def entry_cover(name: str) -> frozenset[str]:
+        return _cover(name, entry_sigma, entry_live)
+
+    pairs = 0
+    mentioned: set[Any] = set()
+    compared_union: set[str] = set()
+    flags_union: set[str] = set()
+    for left in donor_paths:
+        require(
+            left.exit in exit_sigmas,
+            f"{context}: the donor leaves the region for {left.exit}, which no branch names",
+        )
+        exit_sigma = exit_sigmas[left.exit]
+        exit_live = live_at(left.exit)
+        exit_flags = flags_live(left.exit)
+
+        def exit_cover(
+            name: str, sigma_out: dict[str, str] = exit_sigma, live: Any = exit_live
+        ) -> frozenset[str]:
+            return _cover(name, sigma_out, live)
+
+        compared_registers = sorted(
+            name for name in IA32_GENERAL_REGISTER_NAMES if name != "esp" and exit_cover(name)
+        )
+        compared_flags = sorted(name for name in FLAG_NAMES if name in exit_flags)
+        for right in image_paths:
+            if contradictory(left.conditions, right.conditions):
+                continue
+            pairs += 1
+            require(
+                image_start + right.exit == mapped(left.exit),
+                f"{context}: the two versions leave the region at different places "
+                f"(the donor for {left.exit}, the replacement for {image_start + right.exit})",
+            )
+            compared_union |= set(compared_registers)
+            flags_union |= set(compared_flags)
+            require(
+                left.regs["esp"] == right.regs["esp"],
+                f"{context}: the two versions leave a different stack pointer",
+            )
+            for name in compared_registers:
+                require(
+                    left.regs[name] == right.regs[exit_sigma.get(name, name)],
+                    f"{context}: {name} is live at the exit and the two versions leave it different"
+                    + (f" (the replacement's {exit_sigma[name]})" if name in exit_sigma else ""),
+                )
+            for name in compared_flags:
+                require(
+                    canonical_flag(name, left.flags[name])
+                    == canonical_flag(name, right.flags[name]),
+                    f"{context}: the flag {name} is live at the exit and the two versions leave it "
+                    "different",
+                )
+            why = stores_equivalent(left.stores, right.stores)
+            require(why is None, f"{context}: the two versions leave different memory: {why}")
+            require(
+                left.footprint == right.footprint,
+                f"{context}: the two versions access different memory",
+            )
+            for path, names in ((left, {}), (right, exit_sigma)):
+                for name in ["esp", *compared_registers]:
+                    value = path.regs[names.get(name, name)]
+                    if name != "esp" and value == lin_atom(("reg0", name)):
+                        # A register both versions leave at its entry value
+                        # needs only its exit-live atoms shared.
+                        missing = exit_cover(name) - entry_cover(name)
+                        require(
+                            not missing,
+                            f"{context}: {name} passes through the region but {sorted(missing)} is "
+                            "live only at its exit",
+                        )
+                        continue
+                    term_atoms(value, mentioned)
+                for name in compared_flags:
+                    term_atoms(path.flags[name], mentioned)
+                term_atoms(path.stores, mentioned)
+                term_atoms(path.footprint, mentioned)
+                term_atoms(path.conditions, mentioned)
+    require(pairs > 0, f"{context}: no pair of paths is consistent")
+    for kind, name in sorted(mentioned):
+        if kind == "reg0":
+            if name == "esp":
+                continue
+            missing = _IA32_ATOMS_OF[name] - entry_cover(name)
+            require(
+                not missing,
+                f"{context}: the entry value of {name} is read but {sorted(missing)} is dead at "
+                "the region entry",
+            )
+        else:
+            require(
+                name in entry_flags,
+                f"{context}: the entry flag {name} is read but dead at the region entry",
+            )
+    return pairs, compared_union, flags_union, (len(donor_paths), len(image_paths))
 
 
 def _padded_length(proc_size: int, fill_alignment: int) -> int:

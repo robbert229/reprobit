@@ -66,7 +66,8 @@ immediate, any absolute address without a relocation, any prefix but the
 operand-size prefix on the forms that admit it, and any branch that is not
 strictly forward to an instruction boundary of the region or to its exit.
 
-Closed set: ``mov`` (8/16/32-bit register, memory and immediate forms),
+Closed set: ``mov`` (8/16/32-bit register, memory and immediate forms, and
+the 8/32-bit accumulator ``moffs`` forms A0-A3),
 ``lea``, ``movzx``/``movsx``, ``add or and sub xor cmp`` in every ModR/M and
 accumulator form (8/16/32-bit), ``test``, ``inc``/``dec``, ``neg``/``not``,
 ``shl shr sar`` by an immediate or by one, ``imul`` (one, two and three
@@ -82,7 +83,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, TypeAlias
+from typing import Any, TypeAlias, cast
 
 from reprobit.binary import require
 from reprobit.ia32_decode import supported_ia32_instruction_length
@@ -397,6 +398,7 @@ class PathResult:
     stores: tuple[tuple[Term, int, Term], ...]
     footprint: frozenset[Term]
     relocations_read: frozenset[int]
+    exit: int = 0
 
 
 def entry_state(entry_names: Mapping[str, str] | None = None) -> PathState:
@@ -741,6 +743,26 @@ def _step(state: PathState, item: _Instruction, undefined: _Undefined) -> tuple[
         else:
             _set(state, reg, width, _read_rm(state, item, width))
         return ("fall", None)
+    if 0xA0 <= op <= 0xA3:
+        # mov al/eax, [moffs32] and mov [moffs32], al/eax: an absolute address
+        # that must carry a relocation, exactly as a mod-00 disp32 operand.
+        require(not item.operand16, f"{context}: a 16-bit moffs move is outside the closed set")
+        symbol = item.reloc(item.cursor)
+        require(
+            symbol is not None,
+            f"{context}: an absolute address without a relocation is outside the simulator's "
+            "closed set",
+        )
+        address = lin_add(
+            cast(Term, symbol),
+            lin(int.from_bytes(item.raw[item.cursor : item.cursor + 4], "little", signed=True)),
+        )
+        width = 8 if op in (0xA0, 0xA2) else 32
+        if op in (0xA0, 0xA1):
+            _set(state, 0, width, _load(state, address, width // 8))
+        else:
+            _store(state, address, width // 8, _get(state, 0, width))
+        return ("fall", None)
     if op == 0x8D:
         _mod, reg, _rm = item.modrm()
         require(not item.operand16, f"{context}: a 16-bit lea is outside the closed set")
@@ -980,7 +1002,9 @@ def _step(state: PathState, item: _Instruction, undefined: _Undefined) -> tuple[
             item.raw[item.cursor : item.cursor + size], "little", signed=True
         )
         return ("jump", end + displacement)
-    require(False, f"{context}: the instruction is outside the simulator's closed set")
+    require(
+        False, f"{context}: the instruction {item.raw.hex()} is outside the simulator's closed set"
+    )
     raise AssertionError("unreachable")
 
 
@@ -1003,25 +1027,45 @@ def simulate_region(
     tag: str,
     context: str,
     entry_names: Mapping[str, str] | None = None,
+    *,
+    begin: int | None = None,
+    leave: bool = False,
 ) -> list[PathResult]:
     """Every path of [start, end) from the symbolic entry state.
 
     ``relocations`` maps the offset of each relocated 32-bit field (in
-    ``code``'s own coordinates) to its target symbol.  A path ends when it
-    reaches ``end``; every branch must go strictly forward to an instruction
-    start of the region or to ``end``.  ``entry_names`` is passed to
-    :func:`entry_state`.
+    ``code``'s own coordinates) to its target symbol.  A path starts at
+    ``begin`` (an instruction start of the region; ``start`` by default) and
+    ends when it reaches ``end``; every branch inside the region must go
+    strictly forward to an instruction start of the region or to ``end``.
+    With ``leave`` a branch may also leave the region for any offset outside
+    [start, end], which ends the path there; each result's ``exit`` names
+    where it ended.  ``entry_names`` is passed to :func:`entry_state`.  Every
+    relocated field of the region must be read on some path of the main
+    entry; a run from a later ``begin`` is not asked to read the fields
+    before it.
     """
     starts = region_boundaries(code, start, end, context)
     boundaries = set(starts) | {end}
+    first = start if begin is None else begin
+    require(first in starts, f"{context}: the entry {first} is not an instruction of the region")
     instructions = {offset: _Instruction(code, offset, relocations, context) for offset in starts}
     undefined = _Undefined(tag)
     results: list[PathResult] = []
-    pending: list[tuple[int, PathState]] = [(start, entry_state(entry_names))]
+    pending: list[tuple[int, PathState]] = [(first, entry_state(entry_names))]
     steps = 0
+
+    def inside(target: int) -> bool:
+        return start <= target < end
+
+    def admitted(offset: int, target: int, strict: bool) -> bool:
+        if inside(target):
+            return (target > offset if strict else target >= offset) and target in boundaries
+        return target == end or (leave and not start < target < end)
+
     while pending:
         offset, state = pending.pop()
-        while offset != end:
+        while inside(offset):
             steps += 1
             require(steps <= MAX_STEPS, f"{context}: the region's paths exceed the step bound")
             item = instructions[offset]
@@ -1033,7 +1077,7 @@ def simulate_region(
             if action == "jump":
                 target = detail
                 require(
-                    following <= target <= end and target in boundaries,
+                    admitted(following, target, strict=False),
                     f"{context}: the jump at {offset} does not go forward to an instruction of "
                     "the region or its exit",
                 )
@@ -1041,7 +1085,7 @@ def simulate_region(
                 continue
             code_value, target = detail
             require(
-                following < target <= end and target in boundaries,
+                admitted(following, target, strict=True),
                 f"{context}: the branch at {offset} does not go forward to an instruction of the "
                 "region or its exit",
             )
@@ -1075,17 +1119,19 @@ def simulate_region(
                 tuple(state.stores),
                 frozenset(state.footprint),
                 frozenset(state.relocations_read),
+                offset,
             )
         )
-    unread = sorted(
-        at
-        for at in relocations
-        if start <= at < end and not any(at in r.relocations_read for r in results)
-    )
-    require(
-        not unread,
-        f"{context}: the relocated fields at {unread} are not read as an address or immediate",
-    )
+    if first == start:
+        unread = sorted(
+            at
+            for at in relocations
+            if start <= at < end and not any(at in r.relocations_read for r in results)
+        )
+        require(
+            not unread,
+            f"{context}: the relocated fields at {unread} are not read as an address or immediate",
+        )
     return results
 
 

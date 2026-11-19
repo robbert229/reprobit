@@ -201,6 +201,36 @@ def _symbol_identity(row: dict[str, Any]) -> tuple[Any, ...]:
     return ("named", row["target"], row["target_type"], row["target_storage"])
 
 
+def _branch_targets(
+    body: bytes, rows: list[dict[str, Any]], code_end: int, context: str
+) -> dict[int, int]:
+    """Each relative branch's offset and its target."""
+    return {
+        item["offset"]: item["target"]
+        for item in decode_ia32_bijection_body(
+            body, context, relocation_symbol_map(rows), None if code_end == len(body) else code_end
+        )
+        if item["flow"] in ("jcc", "jmp") and item["target"] is not None
+    }
+
+
+def _aligned_offsets(
+    donor_keys: list[tuple[int, int, tuple[Any, ...]]],
+    reference_keys: list[tuple[int, int, tuple[Any, ...]]],
+) -> dict[int, int]:
+    """Donor offset to reference offset of every instruction the alignment calls equal."""
+    matcher = difflib.SequenceMatcher(
+        a=[key for _o, _l, key in donor_keys],
+        b=[key for _o, _l, key in reference_keys],
+        autojunk=False,
+    )
+    return {
+        donor_keys[block.a + k][0]: reference_keys[block.b + k][0]
+        for block in matcher.get_matching_blocks()
+        for k in range(block.size)
+    }
+
+
 def derive_region_candidates(
     donor_keys: list[tuple[int, int, tuple[Any, ...]]],
     reference_keys: list[tuple[int, int, tuple[Any, ...]]],
@@ -258,7 +288,16 @@ def _regions_for(
     donor_code_end: int,
     reference_code_end: int,
     reference_body: bytes,
+    branches: tuple[dict[int, int], dict[int, int], dict[int, int]] | None = None,
 ) -> list[dict[str, Any]]:
+    """The declared regions for index ranges of the two instruction lists.
+
+    ``branches`` is (donor branch targets, reference branch targets, donor to
+    reference offsets of the aligned equal instructions); with it, a donor
+    branch from outside a region into its interior names a replacement entry
+    wherever the aligned reference branch lands inside the reference's run.
+    """
+
     def start_of(keys: list[tuple[int, int, Any]], index: int, end: int) -> int:
         return keys[index][0] if index < len(keys) else end
 
@@ -297,20 +336,39 @@ def _regions_for(
             )
             refusal.region = position  # type: ignore[attr-defined]
             raise refusal
-        regions.append(
-            {
-                "region_start": start,
-                "region_end": end,
-                "replacement_instructions": [
-                    reference_body[offset : offset + length].hex()
-                    for offset, length, _key in reference_keys[j1:j2]
-                ],
-                "replacement_relocations": [
-                    [reference_row["offset"] - reference_start, donor_row["offset"]]
-                    for donor_row, reference_row in paired
-                ],
+        region: dict[str, Any] = {
+            "region_start": start,
+            "region_end": end,
+            "replacement_instructions": [
+                reference_body[offset : offset + length].hex()
+                for offset, length, _key in reference_keys[j1:j2]
+            ],
+            "replacement_relocations": [
+                [reference_row["offset"] - reference_start, donor_row["offset"]]
+                for donor_row, reference_row in paired
+            ],
+        }
+        if branches is not None:
+            donor_targets, reference_targets, aligned = branches
+            replacement_starts = {
+                offset - reference_start for offset, _l, _k in reference_keys[j1:j2]
             }
-        )
+            entries: dict[int, int] = {}
+            for source, target in donor_targets.items():
+                if start <= source < end or not start < target < end:
+                    continue
+                partner = reference_targets.get(aligned.get(source, -1))
+                if partner is None or not reference_start < partner < reference_end:
+                    continue
+                local = partner - reference_start
+                if local in replacement_starts and entries.setdefault(target, local) == local:
+                    continue
+                entries.pop(target, None)
+            if entries:
+                region["replacement_entries"] = [
+                    [target, local] for target, local in sorted(entries.items())
+                ]
+        regions.append(region)
     return regions
 
 
@@ -515,16 +573,22 @@ def build_region_resize_rewriting(
                 body=donor_body,
             )["cbProlog"]
         protected = protected_code_offsets(donor_coff, dp, context)
+        donor_targets = _branch_targets(donor_body, donor_rows, code_end, f"{context} donor")
+        reference_targets = _branch_targets(
+            reference_body, reference_rows, reference_code_end, f"{context} reference"
+        )
 
         def search(
             keys: list[tuple[int, int, tuple[Any, ...]]],
             bijection: dict[str, Any] | None,
         ) -> tuple[list[dict[str, Any]], bytes, dict[str, Any]]:
             runs = derive_region_candidates(keys, reference_keys)
+            aligned = _aligned_offsets(keys, reference_keys)
             if not runs:
                 raise DiscoveryAuthoringError("the donor and reference instructions do not differ")
             groups = [_Group(index, index) for index in range(len(runs))]
             first_refusals: dict[int, str] = {}
+            last_refusals: dict[int, str] = {}
             varied: int | None = None
             scope_bound: int | None = None
             attempt: tuple[list[dict[str, Any]], bytes, dict[str, Any]] | None = None
@@ -563,6 +627,7 @@ def build_region_resize_rewriting(
                             code_end,
                             reference_code_end,
                             reference_body,
+                            (donor_targets, reference_targets, aligned),
                         )
                         image, proof = apply_region_resize(
                             donor_body,
@@ -602,6 +667,7 @@ def build_region_resize_rewriting(
                 label = keys[first_index][0] if first_index < len(keys) else code_end
                 if message is not None:
                     first_refusals.setdefault(label, message)
+                    last_refusals[label] = message
                 group.shape += 1
                 if group.shape == len(CONTEXT_EXTENTS):
                     # Every shape refuses: the region absorbs a neighbouring run,
@@ -630,6 +696,12 @@ def build_region_resize_rewriting(
                             f"the region at {label} refuses in every shape it can take; "
                             "first refusal: "
                             + first_refusals.get(label, "every context meets a neighbour")
+                            + (
+                                f"; last refusal: {last_refusals[label]}"
+                                if label in last_refusals
+                                and last_refusals[label] != first_refusals.get(label)
+                                else ""
+                            )
                         )
                         break
             else:
