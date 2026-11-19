@@ -552,13 +552,22 @@ class TableIntegrityTests(unittest.TestCase):
     def test_the_admitted_table_matches_its_hardware_verified_digest(self):
         self.assertEqual(
             self.digest(),
-            # Re-pinned 2026-08-29 after an MSVC 4.20/Wine hardware probe of
+            # Re-pinned 2026-11-18 after an MSVC 5.0/Wine hardware probe of
+            # `A0 moffs32` and `A2 moffs32` (mov al, [g] / mov [g], al) in an
+            # inline-asm object disassembled to require those exact
+            # encodings.  Four register files and four memory cells
+            # confirmed: A0 replaces AL only (EAX's upper 24 bits, the other
+            # GPRs, EBP, ESP, EFLAGS and memory unchanged); A2 replaces the
+            # cell's low byte only (every register and EFLAGS unchanged).
+            # The table models A0 as reading and writing all of EAX and A2 as
+            # reading it, with EAX frozen.
+            # Earlier: re-pinned 2026-08-29 after an MSVC 4.20/Wine hardware probe of
             # TestTimer's exact `0F AF 44 24 14` form.  Four independent
             # register files and multiply inputs confirmed destination
             # read/write, memory-source/base read, unchanged unrelated GPRs,
             # unchanged ESP and unchanged source memory.  The emitted object
             # was disassembled to require those exact five bytes.
-            "e9619e167fca3eebd2e25f31c4409860be719fe6687ee899376eac041c302800",
+            "30cf97615709dc3b51a13eb53ca84278cee561c2842c5ca2a14f08b348433ffa",
         )
 
     def test_the_corpus_covers_every_admitted_opcode(self):

@@ -55,6 +55,10 @@ values on every execution that reaches them from the same entry state):
   ``cmp r, 0; je`` both read ``eqz(r)``.  Every other condition is a raw atom
   over the exact flag terms it reads.  An atom decided by constants does not
   fork the path.
+- A region proved under a register bijection starts the replacement from a
+  renamed entry state (:func:`entry_state`): its register ``x`` holds the
+  donor's entry atom ``("reg0", sigma^-1(x))``, so the two versions' terms
+  are written over one set of entry atoms.
 
 Every instruction outside the closed set below is refused, as is any
 relocated field the simulator does not consume as a displacement or
@@ -62,23 +66,25 @@ immediate, any absolute address without a relocation, any prefix but the
 operand-size prefix on the forms that admit it, and any branch that is not
 strictly forward to an instruction boundary of the region or to its exit.
 
-Closed set: ``mov`` (8/16/32-bit register, memory and immediate forms),
+Closed set: ``mov`` (8/16/32-bit register, memory and immediate forms, and
+the 8/32-bit accumulator ``moffs`` forms A0-A3),
 ``lea``, ``movzx``/``movsx``, ``add or and sub xor cmp`` in every ModR/M and
 accumulator form (8/16/32-bit), ``test``, ``inc``/``dec``, ``neg``/``not``,
 ``shl shr sar`` by an immediate or by one, ``imul`` (one, two and three
 operand), ``mul``, ``div`` and ``idiv`` (32-bit; a division is an event both
 versions must perform on the same operands), ``setcc``, ``push`` (register,
 immediate, memory), ``pop`` (register), ``nop``, ``jcc`` and ``jmp``
-(rel8/rel32).  No call, return, string
-instruction, x87 instruction or indirect transfer is admitted: a call's
-register inputs and its effect on memory cannot be bounded from the bytes.
+(rel8/rel32), and a direct call (``call rel32``, ``call [abs32]``) to a
+callee whose MSVC C decoration fixes a register-free convention
+(:func:`_call` states its exact model).  No other call, no return, string
+instruction, x87 instruction or indirect transfer is admitted.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, TypeAlias
+from typing import Any, TypeAlias, cast
 
 from reprobit.binary import require
 from reprobit.ia32_decode import supported_ia32_instruction_length
@@ -100,6 +106,9 @@ MAX_PATHS = 64
 MAX_STEPS = 4096
 
 Term: TypeAlias = Any
+# A relocated field's target: a symbol read as an absolute value (DIR32), or
+# ``("rel32", symbol)`` for a call's PC-relative field.
+RelocationTarget: TypeAlias = str | tuple[str, str]
 
 
 def lin(const: int = 0, terms: Iterable[tuple[Term, int]] = ()) -> Term:
@@ -339,6 +348,25 @@ def condition(code: int, flags: Mapping[str, Term]) -> tuple[Term, bool] | bool:
     return (atom, value != inverted)
 
 
+def canonical_flag(name: str, term: Term) -> Term:
+    """A flag's value as a canonical term, for comparing two versions' exit flags.
+
+    ZF is the only flag given a semantic normal form: after ``sub``/``cmp``
+    of ``a`` and ``b`` it is ``a == b`` (an equality, symmetric in its
+    operands), after a logical operation it is ``result == 0``, and the two
+    meet (``cmp r, 0`` and ``test r, r``).  Both forms are exact functions of
+    the operands, so equal canonical terms denote equal flags.  Every other
+    flag, and ZF of any other producer, is its exact producer term.
+    """
+    if name == "zf" and term[0] == "flag" and term[1] == "zf":
+        kind, width = term[2], term[3]
+        if kind == "sub":
+            return ("zf=", _eq(width, term[4], term[5]))
+        if kind == "logic":
+            return ("zf=", _eqz(width, term[5]))
+    return term
+
+
 # --- execution state ------------------------------------------------------------
 
 
@@ -352,6 +380,8 @@ class PathState:
     footprint: set[Term] = field(default_factory=set)
     conditions: list[tuple[Term, bool]] = field(default_factory=list)
     relocations_read: set[int] = field(default_factory=set)
+    epoch: Term = None
+    events: list[Term] = field(default_factory=list)
 
     def fork(self) -> PathState:
         return PathState(
@@ -361,6 +391,8 @@ class PathState:
             set(self.footprint),
             list(self.conditions),
             set(self.relocations_read),
+            self.epoch,
+            list(self.events),
         )
 
 
@@ -374,11 +406,28 @@ class PathResult:
     stores: tuple[tuple[Term, int, Term], ...]
     footprint: frozenset[Term]
     relocations_read: frozenset[int]
+    exit: int = 0
+    events: tuple[Term, ...] = ()
 
 
-def entry_state() -> PathState:
+def entry_state(entry_names: Mapping[str, str] | None = None) -> PathState:
+    """The symbolic entry state; ``entry_names`` renames which entry value a register holds.
+
+    By default register ``r`` holds the atom ``("reg0", r)``.  Under a
+    register bijection the replacement's register ``x`` holds the value the
+    donor keeps in ``entry_names[x]``, so both versions start from one set of
+    entry atoms named in the donor's registers.
+    """
+    names = dict(entry_names or {})
+    require(
+        set(names) <= set(_REGS)
+        and set(names.values()) <= set(_REGS)
+        and sorted(names) == sorted(names.values())
+        and names.get("esp", "esp") == "esp",
+        "a region entry renaming is not a permutation of the general registers fixing ESP",
+    )
     return PathState(
-        {name: lin_atom(("reg0", name)) for name in _REGS},
+        {name: lin_atom(("reg0", names.get(name, name))) for name in _REGS},
         {name: ("flag0", name) for name in FLAG_NAMES},
     )
 
@@ -395,7 +444,10 @@ def _load(state: PathState, address: Term, width: int) -> Term:
         deps.append(entry)
         if relation == "same":
             break
-    term = ("ld", address, width, tuple(reversed(deps)))
+    term: Term = ("ld", address, width, tuple(reversed(deps)))
+    if state.epoch is not None:
+        # Memory since the last call is that call's result: the load names it.
+        term = (*term, state.epoch)
     return lin_atom(term) if width == 4 else ("b", width * 8, term)
 
 
@@ -411,7 +463,7 @@ class _Instruction:
         self,
         code: bytes,
         offset: int,
-        relocations: Mapping[int, str],
+        relocations: Mapping[int, RelocationTarget],
         context: str,
     ) -> None:
         self.offset = offset
@@ -449,8 +501,24 @@ class _Instruction:
         symbol = self.relocations.get(at)
         if symbol is None:
             return None
+        require(
+            isinstance(symbol, str),
+            f"{self.context}: a PC-relative relocated field is read as an absolute value",
+        )
         self.consumed.add(at)
         return lin_atom(("sym", symbol))
+
+    def call_target(self, local: int) -> str:
+        """The symbol of a ``call rel32``'s PC-relative relocated field."""
+        at = self.offset + local
+        symbol = self.relocations.get(at)
+        require(
+            isinstance(symbol, tuple) and symbol[0] == "rel32",
+            f"{self.context}: a relative call without a PC-relative relocation is outside the "
+            "simulator's closed set",
+        )
+        self.consumed.add(at)
+        return cast(tuple[str, str], symbol)[1]
 
     def immediate(self, local: int, size: int, signed: bool = True) -> Term:
         raw = self.raw[local : local + size]
@@ -678,6 +746,106 @@ def _wide(state: PathState, digit: int, source: Term, undefined: _Undefined) -> 
         state.flags[name] = undefined(name)
 
 
+_C_IDENTIFIER = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
+
+
+def callee_stack_pop(symbol: object) -> int | None:
+    """The bytes a register-free callee pops on return, or None when the name does not say.
+
+    MSVC decorates a C ``__cdecl`` function ``_name`` (the caller pops) and a
+    ``__stdcall`` one ``_name@N`` (the callee pops N bytes); the import
+    thunk's slot of either is ``__imp_`` before it.  Only ``__fastcall``
+    (``@name@N``) and C++ member functions (``?...``) receive arguments in
+    registers.  A name whose identifier itself starts with an underscore
+    (``__chkstk``, ``__aullshr``, ``__ftol``) is a compiler or runtime helper
+    with its own register convention and is not admitted.
+    """
+    if not isinstance(symbol, str):
+        return None
+    name = symbol[len("__imp_") :] if symbol.startswith("__imp_") else symbol
+    if not name.startswith("_") or name.startswith("__"):
+        return None
+    core, pop = name[1:], 0
+    if "@" in core:
+        core, _at, size = core.rpartition("@")
+        if not size.isdigit() or "@" in core or int(size) % 4:
+            return None
+        pop = int(size)
+    if not core or core.startswith("_") or not set(core) <= _C_IDENTIFIER:
+        return None
+    return pop
+
+
+def register_free_callee(symbol: object) -> bool:
+    """Whether a callee's MSVC C decoration says it takes no argument in a register."""
+    return callee_stack_pop(symbol) is not None
+
+
+def store_normal_form(stores: Iterable[tuple[Term, int, Term]]) -> tuple[Any, ...]:
+    """The canonical order of a store log up to swapping provably disjoint stores.
+
+    Two logs leave the same memory under :func:`stores_equivalent` exactly
+    when they are the same trace over the independence relation "the two
+    byte ranges are disjoint" (symmetric and irreflexive), and the
+    lexicographically least linearisation of a trace is unique: repeatedly
+    take the least store (by its representation) that is disjoint from every
+    store still before it.
+    """
+    remaining = list(stores)
+    ordered = []
+    while remaining:
+        best = None
+        for index, item in enumerate(remaining):
+            if all(
+                address_relation(item[0], item[1], other[0], other[1]) == "disjoint"
+                for other in remaining[:index]
+            ) and (best is None or repr(item) < repr(remaining[best])):
+                best = index
+        ordered.append(remaining.pop(cast(int, best)))
+    return tuple(ordered)
+
+
+def _call(
+    state: PathState, callee: Term, symbol: object, undefined: _Undefined, context: str
+) -> None:
+    """A call to a register-free callee: one event named by everything it can read.
+
+    Under the model every classic rewriting uses (callees honour the
+    convention their decoration names), the callee reads memory and the
+    stack pointer and no general register, may write any memory, returns in
+    EDX:EAX, clobbers ECX and the flags, preserves EBX, ESI, EDI and EBP, and
+    pops the bytes its decoration states.  The event's term is the callee,
+    ESP, the canonical form of every store since the previous event, and
+    that event, so two versions' events are equal terms exactly when they
+    call the same function from the same state.  Memory after the call is
+    unknown: the store log restarts and every later load names the event.
+    The pushed return address is part of the call, as for every call the
+    layout moves.
+    """
+    pop = callee_stack_pop(symbol)
+    require(
+        pop is not None,
+        f"{context}: a call to {symbol!r}, whose decoration does not fix a register-free "
+        "convention, is outside the simulator's closed set",
+    )
+    identity = (
+        "call",
+        callee,
+        state.regs["esp"],
+        store_normal_form(state.stores),
+        state.epoch,
+    )
+    state.events.append(identity)
+    state.footprint.add(("event", identity))
+    state.stores = []
+    state.epoch = identity
+    for name in ("eax", "ecx", "edx"):
+        state.regs[name] = lin_atom(("callret", name, identity))
+    state.regs["esp"] = lin_add(state.regs["esp"], lin(cast(int, pop)))
+    for name in FLAG_NAMES:
+        state.flags[name] = undefined(name)
+
+
 def _push(state: PathState, value: Term) -> None:
     state.regs["esp"] = lin_add(state.regs["esp"], lin(-4))
     _store(state, state.regs["esp"], 4, value)
@@ -702,6 +870,26 @@ def _step(state: PathState, item: _Instruction, undefined: _Undefined) -> tuple[
             _write_rm(state, item, width, _get(state, reg, width))
         else:
             _set(state, reg, width, _read_rm(state, item, width))
+        return ("fall", None)
+    if 0xA0 <= op <= 0xA3:
+        # mov al/eax, [moffs32] and mov [moffs32], al/eax: an absolute address
+        # that must carry a relocation, exactly as a mod-00 disp32 operand.
+        require(not item.operand16, f"{context}: a 16-bit moffs move is outside the closed set")
+        symbol = item.reloc(item.cursor)
+        require(
+            symbol is not None,
+            f"{context}: an absolute address without a relocation is outside the simulator's "
+            "closed set",
+        )
+        address = lin_add(
+            cast(Term, symbol),
+            lin(int.from_bytes(item.raw[item.cursor : item.cursor + 4], "little", signed=True)),
+        )
+        width = 8 if op in (0xA0, 0xA2) else 32
+        if op in (0xA0, 0xA1):
+            _set(state, 0, width, _load(state, address, width // 8))
+        else:
+            _store(state, address, width // 8, _get(state, 0, width))
         return ("fall", None)
     if op == 0x8D:
         _mod, reg, _rm = item.modrm()
@@ -854,11 +1042,25 @@ def _step(state: PathState, item: _Instruction, undefined: _Undefined) -> tuple[
                     state.flags[name] = ("flag", name, kind, width, value, "")
             _write_rm(state, item, width, result)
             return ("fall", None)
+        if op == 0xFF and digit == 2 and mod == 0 and _rm == 5:
+            # call [abs32]: an import thunk's slot, read like any operand.
+            callee = _read_rm(state, item, 32)
+            symbol = item.relocations.get(item.modrm_at + 1 + item.offset)
+            _call(state, ("indirect", callee), symbol, undefined, context)
+            return ("fall", None)
         require(
             op == 0xFF and digit == 6,
             f"{context}: an indirect call or jump is outside the simulator's closed set",
         )
         _push(state, _read_rm(state, item, 32))
+        return ("fall", None)
+    if op == 0xE8:
+        symbol = item.call_target(item.cursor)
+        addend = int.from_bytes(item.raw[item.cursor : item.cursor + 4], "little", signed=True)
+        require(
+            addend == 0, f"{context}: a call into the middle of a symbol is outside the closed set"
+        )
+        _call(state, ("direct", symbol), symbol, undefined, context)
         return ("fall", None)
     if op in (0xC1, 0xD1):
         mod, digit, _rm = item.modrm()
@@ -942,7 +1144,9 @@ def _step(state: PathState, item: _Instruction, undefined: _Undefined) -> tuple[
             item.raw[item.cursor : item.cursor + size], "little", signed=True
         )
         return ("jump", end + displacement)
-    require(False, f"{context}: the instruction is outside the simulator's closed set")
+    require(
+        False, f"{context}: the instruction {item.raw.hex()} is outside the simulator's closed set"
+    )
     raise AssertionError("unreachable")
 
 
@@ -961,27 +1165,52 @@ def simulate_region(
     code: bytes,
     start: int,
     end: int,
-    relocations: Mapping[int, str],
+    relocations: Mapping[int, RelocationTarget],
     tag: str,
     context: str,
+    entry_names: Mapping[str, str] | None = None,
+    *,
+    begin: int | None = None,
+    leave: bool = False,
 ) -> list[PathResult]:
     """Every path of [start, end) from the symbolic entry state.
 
     ``relocations`` maps the offset of each relocated 32-bit field (in
-    ``code``'s own coordinates) to its target symbol.  A path ends when it
-    reaches ``end``; every branch must go strictly forward to an instruction
-    start of the region or to ``end``.
+    ``code``'s own coordinates) to its target symbol.  A path starts at
+    ``begin`` (an instruction start of the region; ``start`` by default) and
+    ends when it reaches ``end``; every branch inside the region must go
+    strictly forward to an instruction start of the region or to ``end``.
+    With ``leave`` a branch may also leave the region for any offset outside
+    [start, end], which ends the path there; each result's ``exit`` names
+    where it ended.  ``entry_names`` is passed to :func:`entry_state`.  Every
+    relocated field of the region must be read on some path of the main
+    entry; a run from a later ``begin`` is not asked to read the fields
+    before it.
     """
     starts = region_boundaries(code, start, end, context)
     boundaries = set(starts) | {end}
+    first = start if begin is None else begin
+    require(
+        first in starts or first == start == end,
+        f"{context}: the entry {first} is not an instruction of the region",
+    )
     instructions = {offset: _Instruction(code, offset, relocations, context) for offset in starts}
     undefined = _Undefined(tag)
     results: list[PathResult] = []
-    pending: list[tuple[int, PathState]] = [(start, entry_state())]
+    pending: list[tuple[int, PathState]] = [(first, entry_state(entry_names))]
     steps = 0
+
+    def inside(target: int) -> bool:
+        return start <= target < end
+
+    def admitted(offset: int, target: int, strict: bool) -> bool:
+        if inside(target):
+            return (target > offset if strict else target >= offset) and target in boundaries
+        return target == end or (leave and not start < target < end)
+
     while pending:
         offset, state = pending.pop()
-        while offset != end:
+        while inside(offset):
             steps += 1
             require(steps <= MAX_STEPS, f"{context}: the region's paths exceed the step bound")
             item = instructions[offset]
@@ -993,7 +1222,7 @@ def simulate_region(
             if action == "jump":
                 target = detail
                 require(
-                    following <= target <= end and target in boundaries,
+                    admitted(following, target, strict=False),
                     f"{context}: the jump at {offset} does not go forward to an instruction of "
                     "the region or its exit",
                 )
@@ -1001,7 +1230,7 @@ def simulate_region(
                 continue
             code_value, target = detail
             require(
-                following < target <= end and target in boundaries,
+                admitted(following, target, strict=True),
                 f"{context}: the branch at {offset} does not go forward to an instruction of the "
                 "region or its exit",
             )
@@ -1035,17 +1264,20 @@ def simulate_region(
                 tuple(state.stores),
                 frozenset(state.footprint),
                 frozenset(state.relocations_read),
+                offset,
+                tuple(state.events),
             )
         )
-    unread = sorted(
-        at
-        for at in relocations
-        if start <= at < end and not any(at in r.relocations_read for r in results)
-    )
-    require(
-        not unread,
-        f"{context}: the relocated fields at {unread} are not read as an address or immediate",
-    )
+    if first == start:
+        unread = sorted(
+            at
+            for at in relocations
+            if start <= at < end and not any(at in r.relocations_read for r in results)
+        )
+        require(
+            not unread,
+            f"{context}: the relocated fields at {unread} are not read as an address or immediate",
+        )
     return results
 
 
@@ -1106,11 +1338,17 @@ __all__ = [
     "FLAG_NAMES",
     "MAX_PATHS",
     "PathResult",
+    "RelocationTarget",
     "address_relation",
+    "callee_stack_pop",
+    "canonical_flag",
     "condition",
     "contradictory",
+    "entry_state",
     "region_boundaries",
+    "register_free_callee",
     "simulate_region",
+    "store_normal_form",
     "stores_equivalent",
     "term_atoms",
 ]

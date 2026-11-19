@@ -18,6 +18,7 @@ image, and the producer re-proves every replacement against the donor.
 from __future__ import annotations
 
 import difflib
+import itertools
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -34,13 +35,26 @@ from reprobit.classic.coff import (
 from reprobit.classic.composition_mosaic import instruction_mosaic_metadata_sha256
 from reprobit.classic.debug import parse_fpo_data
 from reprobit.classic.foundation import sha256_bytes
-from reprobit.classic.register_semantics import decode_ia32_bijection_body
+from reprobit.classic.register_reencoding import require_frame_pointer_free_frame
+from reprobit.classic.register_semantics import (
+    IA32_GENERAL_REGISTER_NAMES,
+    _register_bijection_live_sets,
+    decode_ia32_bijection_body,
+    ia32_register_atoms,
+)
 from reprobit.classic.relational import relational_form_external_entries
 from reprobit.classic.rewriting_region_resize import (
     REGION_RESIZE_KIND,
+    ScopeBoundRefusal,
+    _implicit_support,
     _padded_length,
+    _register_level_live,
+    _sigma_rewrite,
     apply_region_resize,
+    donor_void_return,
     protected_code_offsets,
+    refine_call_reads,
+    release_void_return,
     resized_donor_object,
 )
 from reprobit.classic.scheduling_certificates import measure_instruction_schedule_debug_envelope
@@ -107,6 +121,14 @@ CONTEXT_EXTENTS = (
 MAX_ATTEMPTS = 400
 # A region never grows past this many donor instructions by absorbing runs.
 MAX_REGION_INSTRUCTIONS = 64
+# When no plain search reaches the reference, this many register bijections
+# are tried, drawn from at most this many registers that differ in aligned
+# fields.
+MAX_BIJECTION_CANDIDATES = 6
+MAX_BIJECTION_REGISTERS = 6
+# A bijection's scopes are chosen again at most this many times after the
+# producer refuses one of their bounds on the image's liveness.
+MAX_SCOPE_ROUNDS = 8
 
 
 def _procedure(coff: CoffObject, section: dict[str, Any], context: str) -> tuple[int, int, int]:
@@ -132,20 +154,32 @@ def _instruction_keys(
     rows: list[dict[str, Any]],
     code_end: int,
     context: str,
+    *,
+    mask_registers: bool = False,
+    unique: frozenset[int] = frozenset(),
 ) -> list[tuple[int, int, tuple[Any, ...]]]:
     """(offset, length, comparison key) for each instruction of the code.
 
     A relocated field compares by its target symbol and addend; a relative
-    branch by its opcode alone, since a layout change re-encodes it.
+    branch by its opcode alone, since a layout change re-encodes it.  With
+    ``mask_registers`` every rewritable register field is zeroed, so two
+    instructions that differ only in their registers compare equal; an
+    instruction at an offset in ``unique`` equals nothing.
     """
     view = relocation_symbol_map(rows)
     by_offset = {row["offset"]: row for row in rows}
     instructions = decode_ia32_bijection_body(
         body, context, view, None if code_end == len(body) else code_end
     )
-    keys = []
+    keys: list[tuple[int, int, tuple[Any, ...]]] = []
     for item in instructions:
+        if item["offset"] in unique:
+            keys.append((item["offset"], item["length"], ("unique", item["offset"])))
+            continue
         raw = bytearray(body[item["offset"] : item["offset"] + item["length"]])
+        if mask_registers:
+            for at, shift in [*item["fields"], *item.get("byte_fields", ())]:
+                raw[at - item["offset"]] &= ~(7 << shift) & 0xFF
         fields = []
         for at in range(item["offset"], item["offset"] + item["length"]):
             row = by_offset.get(at)
@@ -167,6 +201,36 @@ def _symbol_identity(row: dict[str, Any]) -> tuple[Any, ...]:
     if row["target_storage"] == 3 and separator and base and serial.isdigit():
         return ("static", base, row["target_type"])
     return ("named", row["target"], row["target_type"], row["target_storage"])
+
+
+def _branch_targets(
+    body: bytes, rows: list[dict[str, Any]], code_end: int, context: str
+) -> dict[int, int]:
+    """Each relative branch's offset and its target."""
+    return {
+        item["offset"]: item["target"]
+        for item in decode_ia32_bijection_body(
+            body, context, relocation_symbol_map(rows), None if code_end == len(body) else code_end
+        )
+        if item["flow"] in ("jcc", "jmp") and item["target"] is not None
+    }
+
+
+def _aligned_offsets(
+    donor_keys: list[tuple[int, int, tuple[Any, ...]]],
+    reference_keys: list[tuple[int, int, tuple[Any, ...]]],
+) -> dict[int, int]:
+    """Donor offset to reference offset of every instruction the alignment calls equal."""
+    matcher = difflib.SequenceMatcher(
+        a=[key for _o, _l, key in donor_keys],
+        b=[key for _o, _l, key in reference_keys],
+        autojunk=False,
+    )
+    return {
+        donor_keys[block.a + k][0]: reference_keys[block.b + k][0]
+        for block in matcher.get_matching_blocks()
+        for k in range(block.size)
+    }
 
 
 def derive_region_candidates(
@@ -226,7 +290,16 @@ def _regions_for(
     donor_code_end: int,
     reference_code_end: int,
     reference_body: bytes,
+    branches: tuple[dict[int, int], dict[int, int], dict[int, int]] | None = None,
 ) -> list[dict[str, Any]]:
+    """The declared regions for index ranges of the two instruction lists.
+
+    ``branches`` is (donor branch targets, reference branch targets, donor to
+    reference offsets of the aligned equal instructions); with it, a donor
+    branch from outside a region into its interior names a replacement entry
+    wherever the aligned reference branch lands inside the reference's run.
+    """
+
     def start_of(keys: list[tuple[int, int, Any]], index: int, end: int) -> int:
         return keys[index][0] if index < len(keys) else end
 
@@ -240,30 +313,212 @@ def _regions_for(
         reference_fields = [
             row for row in reference_rows if reference_start <= row["offset"] < reference_end
         ]
-        if [_symbol_identity(row) for row in donor_fields] != [
-            _symbol_identity(row) for row in reference_fields
-        ]:
+        # Each reference field takes the first unused donor record that names
+        # the same symbol; the two regions must relocate the same multiset.
+        unused = list(donor_fields)
+        paired = []
+        for reference_row in reference_fields:
+            match = next(
+                (
+                    row
+                    for row in unused
+                    if _symbol_identity(row) == _symbol_identity(reference_row)
+                    and row["type"] == reference_row["type"]
+                ),
+                None,
+            )
+            if match is None:
+                break
+            unused.remove(match)
+            paired.append((match, reference_row))
+        if unused or len(paired) != len(reference_fields):
             refusal = DiscoveryAuthoringError(
                 f"the region at {start} relocates other symbols than the reference's at "
                 f"{reference_start}"
             )
             refusal.region = position  # type: ignore[attr-defined]
             raise refusal
-        regions.append(
-            {
-                "region_start": start,
-                "region_end": end,
-                "replacement_instructions": [
-                    reference_body[offset : offset + length].hex()
-                    for offset, length, _key in reference_keys[j1:j2]
-                ],
-                "replacement_relocations": [
-                    [reference_row["offset"] - reference_start, donor_row["offset"]]
-                    for donor_row, reference_row in zip(donor_fields, reference_fields, strict=True)
-                ],
+        region: dict[str, Any] = {
+            "region_start": start,
+            "region_end": end,
+            "replacement_instructions": [
+                reference_body[offset : offset + length].hex()
+                for offset, length, _key in reference_keys[j1:j2]
+            ],
+            "replacement_relocations": [
+                [reference_row["offset"] - reference_start, donor_row["offset"]]
+                for donor_row, reference_row in paired
+            ],
+        }
+        if branches is not None:
+            donor_targets, reference_targets, aligned = branches
+            replacement_starts = {
+                offset - reference_start for offset, _l, _k in reference_keys[j1:j2]
             }
-        )
+            entries: dict[int, int] = {}
+            for source, target in donor_targets.items():
+                if start <= source < end or not start < target < end:
+                    continue
+                partner = reference_targets.get(aligned.get(source, -1))
+                if partner is None or not reference_start < partner < reference_end:
+                    continue
+                local = partner - reference_start
+                if local in replacement_starts and entries.setdefault(target, local) == local:
+                    continue
+                entries.pop(target, None)
+            if entries:
+                region["replacement_entries"] = [
+                    [target, local] for target, local in sorted(entries.items())
+                ]
+        regions.append(region)
     return regions
+
+
+def _field_values(body: bytes, item: dict[str, Any]) -> list[tuple[str, bool]]:
+    """Each register field's register, in encoding order, and whether it is a byte field."""
+    names = IA32_GENERAL_REGISTER_NAMES
+    fields = [(at, shift, False) for at, shift in item["fields"]]
+    fields += [(at, shift, True) for at, shift in item.get("byte_fields", ())]
+    fields.sort()
+    return [(names[body[at] >> shift & (3 if byte else 7)], byte) for at, shift, byte in fields]
+
+
+def _register_pairs(
+    donor_body: bytes,
+    donor_items: list[dict[str, Any]],
+    reference_body: bytes,
+    reference_items: list[dict[str, Any]],
+    donor_masked: list[tuple[int, int, tuple[Any, ...]]],
+    reference_masked: list[tuple[int, int, tuple[Any, ...]]],
+) -> dict[int, list[tuple[str, str]]]:
+    """For each donor instruction aligned with an equal-shaped reference instruction,
+    the (donor register, reference register) pair of every field."""
+    matcher = difflib.SequenceMatcher(
+        a=[key for _o, _l, key in donor_masked],
+        b=[key for _o, _l, key in reference_masked],
+        autojunk=False,
+    )
+    pairs: dict[int, list[tuple[str, str]]] = {}
+    for block in matcher.get_matching_blocks():
+        for k in range(block.size):
+            left, right = donor_items[block.a + k], reference_items[block.b + k]
+            ours = _field_values(donor_body, left)
+            theirs = _field_values(reference_body, right)
+            if len(ours) == len(theirs):
+                pairs[block.a + k] = [(x, y) for (x, _b), (y, _c) in zip(ours, theirs, strict=True)]
+    return pairs
+
+
+def _bijection_candidates(pairs: dict[int, list[tuple[str, str]]]) -> list[dict[str, str]]:
+    """Register permutations the aligned fields suggest, best explained first.
+
+    A candidate is a transposition, a 3-cycle or two disjoint transpositions
+    over the registers that appear in a differing field pair; its score is the
+    number of aligned instructions it turns from differing into equal.
+    """
+    involved = sorted(
+        {name for fields in pairs.values() for x, y in fields if x != y for name in (x, y)}
+        - {"esp"}
+    )
+    if len(involved) > MAX_BIJECTION_REGISTERS:
+        return []
+    candidates: list[dict[str, str]] = []
+    for left, right in itertools.combinations(involved, 2):
+        candidates.append({left: right, right: left})
+    for a, b, c in itertools.permutations(involved, 3):
+        if a == min(a, b, c):
+            candidates.append({a: b, b: c, c: a})
+    for (a, b), (c, d) in itertools.combinations(itertools.combinations(involved, 2), 2):
+        if len({a, b, c, d}) == 4 and (a, b) < (c, d):
+            candidates.append({a: b, b: a, c: d, d: c})
+    scored = []
+    for sigma in candidates:
+        score = sum(
+            1
+            for fields in pairs.values()
+            if any(x != y for x, y in fields) and all(sigma.get(x, x) == y for x, y in fields)
+        )
+        if score:
+            scored.append((-score, sorted(sigma.items()), sigma))
+    scored.sort()
+    return [sigma for _score, _key, sigma in scored[:MAX_BIJECTION_CANDIDATES]]
+
+
+def _bijection_scopes(
+    sigma: dict[str, str],
+    donor_body: bytes,
+    items: list[dict[str, Any]],
+    pairs: dict[int, list[tuple[str, str]]],
+    code_end: int,
+    context: str,
+    forced_live: frozenset[int] = frozenset(),
+) -> list[list[int]]:
+    """Scopes that cover the instructions the bijection explains and none it breaks.
+
+    The producer re-checks every bound against both versions.
+    """
+    support = set(sigma)
+    atoms = ia32_register_atoms(support)
+    live, successors = _register_bijection_live_sets(items, f"{context} liveness")
+    registers = _register_level_live(items, successors, f"{context} register liveness")
+
+    def dead(index: int) -> bool:
+        if index == len(items):
+            return True
+        if items[index]["offset"] in forced_live:
+            return False
+        return not (live[index] & atoms) and not (registers[index] & support)
+
+    prefer: list[str | None] = []
+    for index, item in enumerate(items):
+        if _implicit_support(donor_body, item, support):
+            prefer.append("implicit")
+            continue
+        fields = pairs.get(index)
+        if not fields or not any(x in support or y in support for x, y in fields):
+            prefer.append(None)
+            continue
+        mapped = all(sigma.get(x, x) == y for x, y in fields)
+        plain = all(x == y for x, y in fields)
+        prefer.append(
+            "mapped" if mapped and not plain else "plain" if plain and not mapped else None
+        )
+    # The correspondence can change only on an edge into a point where the
+    # support is dead, so the instructions joined by edges into live points
+    # share one mode.  Each such component takes the bijection when it
+    # explains more of its instructions than it breaks; one holding an
+    # instruction that touches a support register implicitly stays plain.
+    parent = list(range(len(items)))
+
+    def root(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    for index in range(len(items)):
+        for edge in successors[index]:
+            if not dead(edge):
+                parent[root(edge)] = root(index)
+    members: dict[int, list[int]] = {}
+    for index in range(len(items)):
+        members.setdefault(root(index), []).append(index)
+    chosen: set[int] = set()
+    for group in members.values():
+        votes = [prefer[index] for index in group]
+        if "implicit" not in votes and votes.count("mapped") > votes.count("plain"):
+            chosen |= set(group)
+    scopes: list[list[int]] = []
+    for index in sorted(chosen):
+        bounds = [
+            items[index]["offset"],
+            items[index + 1]["offset"] if index + 1 < len(items) else code_end,
+        ]
+        if scopes and scopes[-1][1] == bounds[0]:
+            scopes[-1][1] = bounds[1]
+        else:
+            scopes.append(bounds)
+    return scopes
 
 
 def build_region_resize_rewriting(
@@ -320,111 +575,295 @@ def build_region_resize_rewriting(
                 body=donor_body,
             )["cbProlog"]
         protected = protected_code_offsets(donor_coff, dp, context)
-        runs = derive_region_candidates(donor_keys, reference_keys)
-        if not runs:
-            raise DiscoveryAuthoringError("the donor and reference instructions do not differ")
-        groups = [_Group(index, index) for index in range(len(runs))]
-        first_refusals: dict[int, str] = {}
-        attempt: tuple[list[dict[str, Any]], bytes, dict[str, Any]] | None = None
-        failure: str | None = None
-        for _ in range(MAX_ATTEMPTS):
-            ranges = _group_ranges(groups, runs, len(donor_keys), len(reference_keys))
-            refused: int | None = None
-            if ranges is None:
-                # Two regions' contexts meet: they are one region.
-                position = next(
-                    position
-                    for position in range(1, len(groups))
-                    if _group_ranges(
-                        groups[: position + 1], runs, len(donor_keys), len(reference_keys)
-                    )
-                    is None
-                )
-                groups[position - 1].last = groups[position].last
-                groups[position - 1].shape = max(groups[position - 1].shape, groups[position].shape)
-                del groups[position]
-                continue
-            else:
-                try:
-                    regions = _regions_for(
-                        ranges,
-                        donor_keys,
-                        reference_keys,
-                        donor_rows,
-                        reference_rows,
-                        code_end,
-                        reference_code_end,
-                        reference_body,
-                    )
-                    image, proof = apply_region_resize(
-                        donor_body,
-                        regions,
-                        donor_rows,
-                        dp["number"],
-                        f"{context} image",
-                        code_length=None if code_end == proc else code_end,
-                        proc_size=proc,
-                        external_entries=frozenset(external_entries),
-                        protected_offsets=protected,
-                        prologue_length=prologue,
-                    )
-                except (ByteIdentityError, DiscoveryAuthoringError) as exc:
-                    refused = getattr(exc, "region", None)
-                    message = str(exc)
-                    if refused is None:
-                        failure = message
-                        break
-                else:
-                    image = image + b"\x90" * (
-                        _padded_length(len(image), fill_alignment) - len(image)
-                    )
-                    if image != reference_body:
-                        failure = "the proved layout differs from the reference body"
-                        break
-                    attempt = (regions, image, proof)
-                    break
-            group = groups[refused]
-            first_index = runs[group.first][0]
-            label = donor_keys[first_index][0] if first_index < len(donor_keys) else code_end
-            first_refusals.setdefault(label, message)
-            group.shape += 1
-            if group.shape == len(CONTEXT_EXTENTS):
-                # Every shape refuses: the region absorbs a neighbouring run,
-                # while it stays a bounded region.
-                def span(first: int, last: int) -> int:
-                    return runs[last][1] - runs[first][0]
+        donor_targets = _branch_targets(donor_body, donor_rows, code_end, f"{context} donor")
+        reference_targets = _branch_targets(
+            reference_body, reference_rows, reference_code_end, f"{context} reference"
+        )
 
-                if (
-                    refused + 1 < len(groups)
-                    and span(group.first, groups[refused + 1].last) <= MAX_REGION_INSTRUCTIONS
-                ):
-                    group.last = groups[refused + 1].last
-                    group.shape = 0
-                    del groups[refused + 1]
-                elif (
-                    refused > 0
-                    and span(groups[refused - 1].first, group.last) <= MAX_REGION_INSTRUCTIONS
-                ):
-                    groups[refused - 1].last = group.last
-                    groups[refused - 1].shape = 0
-                    del groups[refused]
-                else:
-                    failure = (
-                        f"the region at {label} refuses in every shape it can take; "
-                        f"first refusal: {first_refusals[label]}"
+        def search(
+            keys: list[tuple[int, int, tuple[Any, ...]]],
+            bijection: dict[str, Any] | None,
+        ) -> tuple[list[dict[str, Any]], bytes, dict[str, Any]]:
+            runs = derive_region_candidates(keys, reference_keys)
+            aligned = _aligned_offsets(keys, reference_keys)
+            if not runs:
+                raise DiscoveryAuthoringError("the donor and reference instructions do not differ")
+            groups = [_Group(index, index) for index in range(len(runs))]
+            first_refusals: dict[int, str] = {}
+            last_refusals: dict[int, str] = {}
+            varied: int | None = None
+            scope_bound: int | None = None
+            attempt: tuple[list[dict[str, Any]], bytes, dict[str, Any]] | None = None
+            failure: str | None = None
+            for _ in range(MAX_ATTEMPTS):
+                ranges = _group_ranges(groups, runs, len(keys), len(reference_keys))
+                refused: int | None = None
+                message: str | None = None
+                if ranges is None and varied is not None:
+                    # The shape just taken runs into a neighbour: take the next one.
+                    refused = varied
+                elif ranges is None:
+                    # Two regions' contexts meet: they are one region.
+                    position = next(
+                        position
+                        for position in range(1, len(groups))
+                        if _group_ranges(
+                            groups[: position + 1], runs, len(keys), len(reference_keys)
+                        )
+                        is None
                     )
-                    break
-        else:
-            failure = "the region search exceeded its attempt bound"
-        if attempt is None:
-            detail = "; ".join(
-                f"at {key}: {value}" for key, value in sorted(first_refusals.items())
-            )
-            raise DiscoveryAuthoringError(
-                f"no region replacement reaches the reference: {failure}"
-                + (f" (first refusals: {detail})" if detail else "")
-            )
-        regions, image, proof = attempt
+                    # The merged region is tried again from its own plain shape.
+                    groups[position - 1].last = groups[position].last
+                    groups[position - 1].shape = 0
+                    del groups[position]
+                    varied = position - 1
+                    continue
+                else:
+                    try:
+                        regions = _regions_for(
+                            ranges,
+                            keys,
+                            reference_keys,
+                            donor_rows,
+                            reference_rows,
+                            code_end,
+                            reference_code_end,
+                            reference_body,
+                            (donor_targets, reference_targets, aligned),
+                        )
+                        image, proof = apply_region_resize(
+                            donor_body,
+                            regions,
+                            donor_rows,
+                            dp["number"],
+                            f"{context} image",
+                            code_length=None if code_end == proc else code_end,
+                            proc_size=proc,
+                            external_entries=frozenset(external_entries),
+                            protected_offsets=protected,
+                            prologue_length=prologue,
+                            bijection=bijection,
+                            frame_pointer_free=frame_pointer_free,
+                            void_return=void_pin is not None,
+                        )
+                    except (ByteIdentityError, DiscoveryAuthoringError) as exc:
+                        refused = getattr(exc, "region", None)
+                        message = str(exc)
+                        if refused is None:
+                            failure = message
+                            bound = getattr(exc, "offset", None)
+                            if isinstance(exc, ScopeBoundRefusal):
+                                scope_bound = bound
+                            break
+                    else:
+                        image = image + b"\x90" * (
+                            _padded_length(len(image), fill_alignment) - len(image)
+                        )
+                        if image != reference_body:
+                            failure = "the proved layout differs from the reference body"
+                            break
+                        attempt = (regions, image, proof)
+                        break
+                group = groups[refused]
+                varied = refused
+                first_index = runs[group.first][0]
+                label = keys[first_index][0] if first_index < len(keys) else code_end
+                if message is not None:
+                    first_refusals.setdefault(label, message)
+                    last_refusals[label] = message
+                group.shape += 1
+                if group.shape == len(CONTEXT_EXTENTS):
+                    # Every shape refuses: the region absorbs a neighbouring run,
+                    # while it stays a bounded region.
+                    def span(first: int, last: int) -> int:
+                        return runs[last][1] - runs[first][0]
+
+                    if (
+                        refused + 1 < len(groups)
+                        and span(group.first, groups[refused + 1].last) <= MAX_REGION_INSTRUCTIONS
+                    ):
+                        group.last = groups[refused + 1].last
+                        group.shape = 0
+                        del groups[refused + 1]
+                        varied = refused
+                    elif (
+                        refused > 0
+                        and span(groups[refused - 1].first, group.last) <= MAX_REGION_INSTRUCTIONS
+                    ):
+                        groups[refused - 1].last = group.last
+                        groups[refused - 1].shape = 0
+                        del groups[refused]
+                        varied = refused - 1
+                    else:
+                        failure = (
+                            f"the region at {label} refuses in every shape it can take; "
+                            "first refusal: "
+                            + first_refusals.get(label, "every context meets a neighbour")
+                            + (
+                                f"; last refusal: {last_refusals[label]}"
+                                if label in last_refusals
+                                and last_refusals[label] != first_refusals.get(label)
+                                else ""
+                            )
+                        )
+                        break
+            else:
+                failure = "the region search exceeded its attempt bound"
+            if attempt is None:
+                detail = "; ".join(
+                    f"at {key}: {value}" for key, value in sorted(first_refusals.items())
+                )
+                refusal = DiscoveryAuthoringError(
+                    f"no region replacement reaches the reference: {failure}"
+                    + (f" (first refusals: {detail})" if detail else "")
+                )
+                refusal.scope_bound = scope_bound  # type: ignore[attr-defined]
+                raise refusal
+            return attempt
+
+        frame_pointer_free = False
+        void_pin: dict[str, Any] | None = None
+
+        def prove() -> tuple[list[dict[str, Any]], bytes, dict[str, Any], dict[str, Any] | None]:
+            nonlocal frame_pointer_free
+            try:
+                regions, image, proof = search(donor_keys, None)
+            except DiscoveryAuthoringError as plain_refusal:
+                found = None
+                donor_items = refine_call_reads(
+                    decode_ia32_bijection_body(
+                        donor_body,
+                        f"{context} donor",
+                        relocation_symbol_map(donor_rows),
+                        None if code_end == len(donor_body) else code_end,
+                    ),
+                    relocation_symbol_map(donor_rows),
+                )
+                if void_pin is not None:
+                    donor_items = release_void_return(donor_items)
+                reference_items = decode_ia32_bijection_body(
+                    reference_body,
+                    f"{context} reference",
+                    relocation_symbol_map(reference_rows),
+                    None if reference_code_end == len(reference_body) else reference_code_end,
+                )
+                pairs = _register_pairs(
+                    donor_body,
+                    donor_items,
+                    reference_body,
+                    reference_items,
+                    _instruction_keys(
+                        donor_body, donor_rows, code_end, f"{context} donor", mask_registers=True
+                    ),
+                    _instruction_keys(
+                        reference_body,
+                        reference_rows,
+                        reference_code_end,
+                        f"{context} reference",
+                        mask_registers=True,
+                    ),
+                )
+                tried = []
+                for sigma in _bijection_candidates(pairs):
+                    frame_pointer_free = False
+                    if "ebp" in sigma:
+                        try:
+                            require_frame_pointer_free_frame(
+                                donor_coff, dp, donor_body, donor_items, f"{context} frame proof"
+                            )
+                        except ByteIdentityError:
+                            continue
+                        frame_pointer_free = True
+                    forced: set[int] = set()
+                    seen: list[list[list[int]]] = []
+                    for _round in range(MAX_SCOPE_ROUNDS):
+                        scopes = _bijection_scopes(
+                            sigma,
+                            donor_body,
+                            donor_items,
+                            pairs,
+                            code_end,
+                            f"{context} bijection",
+                            frozenset(forced),
+                        )
+                        if not scopes or scopes in seen:
+                            break
+                        seen.append(scopes)
+                        declared = {"mapping": dict(sorted(sigma.items())), "scopes": scopes}
+                        rewritten = bytearray(donor_body)
+                        unique = set()
+                        for item in donor_items:
+                            if not any(left <= item["offset"] < right for left, right in scopes):
+                                continue
+                            saved = bytes(rewritten)
+                            try:
+                                _sigma_rewrite(
+                                    rewritten,
+                                    item,
+                                    sigma,
+                                    {
+                                        row["offset"] + k
+                                        for row in donor_rows
+                                        for k in range(row["width"])
+                                    },
+                                    f"{context} bijection",
+                                )
+                            except ByteIdentityError:
+                                rewritten[:] = saved
+                                unique.add(item["offset"])
+                        try:
+                            mapped_keys = _instruction_keys(
+                                bytes(rewritten),
+                                donor_rows,
+                                code_end,
+                                f"{context} donor under the bijection",
+                                unique=frozenset(unique),
+                            )
+                        except ByteIdentityError:
+                            break
+                        if [key[:2] for key in mapped_keys] != [key[:2] for key in donor_keys]:
+                            break
+                        try:
+                            regions, image, proof = search(mapped_keys, declared)
+                        except DiscoveryAuthoringError as exc:
+                            bound = getattr(exc, "scope_bound", None)
+                            if bound is not None and bound not in forced:
+                                # A bound the image's liveness refuses: treat it as live
+                                # and choose the scopes again.
+                                forced.add(bound)
+                                continue
+                            tried.append(f"{declared['mapping']}: {exc}")
+                            break
+                        found = (regions, image, proof, declared)
+                        break
+                    if found is not None:
+                        break
+                if found is None:
+                    if tried:
+                        raise DiscoveryAuthoringError(
+                            f"{plain_refusal}; under a register bijection: {tried[0]}"
+                        ) from plain_refusal
+                    raise
+                return found
+            return regions, image, proof, None
+
+        try:
+            regions, image, proof, bijection = prove()
+        except DiscoveryAuthoringError as live_refusal:
+            # EAX is live at every return unless the donor's own type records
+            # say the function returns void; only then is it tried dead there.
+            try:
+                void_pin = donor_void_return(donor_coff, dp, f"{context} void return")
+            except ByteIdentityError as exc:
+                raise DiscoveryAuthoringError(
+                    f"{live_refusal}; EAX stays live at ret: {exc}"
+                ) from live_refusal
+            try:
+                regions, image, proof, bijection = prove()
+            except DiscoveryAuthoringError as exc:
+                raise DiscoveryAuthoringError(
+                    f"{exc} (with EAX dead at ret: the donor's type returns void)"
+                ) from exc
         if proof["image_proc_size"] != reference_proc:
             raise DiscoveryAuthoringError("the image's procedure size differs from the reference's")
         derived, derived_detail = resized_donor_object(
@@ -480,6 +919,13 @@ def build_region_resize_rewriting(
         }
         if code_end != proc:
             expected["region_resize.expected_code_length"] = code_end
+        if void_pin is not None:
+            expected["region_resize.expected_void_return"] = void_pin
+        if bijection is not None:
+            expected["region_resize.expected_bijection_rewrites"] = proof["bijection_rewrites"]
+            expected["region_resize.expected_bijection_mode_changes"] = proof[
+                "bijection_mode_changes"
+            ]
         if extras:
             expected["expected_donor_extra_functions"] = extras
         if dp["number"] != sp["number"]:
@@ -491,7 +937,11 @@ def build_region_resize_rewriting(
         parameters = (
             ClassicField(
                 name="region_resize",
-                value=cast(JsonValue, {"kind": REGION_RESIZE_KIND, "regions": regions}),
+                value=cast(
+                    JsonValue,
+                    {"kind": REGION_RESIZE_KIND, "regions": regions}
+                    | ({} if bijection is None else {"bijection": bijection}),
+                ),
             ),
         )
         intervention_id = _stable_id(

@@ -134,9 +134,11 @@ simulation-proved region rewrites.
 
 `retail_exact_region_resize_rewriting` is the length-changing counterpart of
 the simulation-proved region rewrite. Its record carries each replacement as
-a list of instruction encodings (hex text, the bytes it installs) and an
-order-preserving pairing of the replacement's relocated fields with the
-region's; nothing about the replacement is trusted. The producer proves it
+a list of instruction encodings (hex text, the bytes it installs) and a
+pairing of the replacement's relocated fields with the region's relocation
+records, each record taken once and keeping its type and target (the
+simulator names a relocated value by its target, so the order is free);
+nothing about the replacement is trusted. The producer proves it
 against the donor compiled from source: no branch or external entry enters a
 region's interior, its control flow is a forward DAG with one exit, the two
 versions agree on every path pair on the stack pointer, on every register and
@@ -146,8 +148,30 @@ entry value either version reads is live on entry. The function is then laid
 out again: every branch keeps its encoding width (a short branch that no
 longer reaches is refused), relocations and switch-table addends move with
 their code, and the COFF line rows, CodeView procedure range, FPO size and
-symbol values follow the same offset map. The module docstring of
-`reprobit.classic.rewriting_region_resize` states the theorem and its nine
+symbol values follow the same offset map. A record may also declare a
+register permutation and scopes in which it holds (check 10): instructions
+outside the regions in a scope are re-encoded field by field under the
+permutation (an implicit use of a moved register, a call's clobbers or a
+return's live set, is refused), each region whose start or end lies in a
+scope is proved with the replacement's registers renamed, and the
+correspondence changes only where every moved register is dead in both
+bodies. EBP may move only with the frame-pointer-free proof; ESP never
+moves. A region may also declare interior entries (each paired with a
+replacement instruction, so branches into it are re-encoded), leave by any
+forward branch for a point outside every region (both versions must leave at
+corresponding points and are compared there), and hold direct calls to
+callees whose C decoration fixes a register-free convention: a call is an
+event named by the callee, ESP, the canonical store log before it and the
+previous call, both versions must make the same events, and memory after a
+call is that call's result. EAX counts as live at every `ret` unless the
+record declares `expected_void_return`: the donor object's own CodeView
+records (its MSVC 5.0 procedure record and the LF_PROCEDURE record in the
+object's one `.debug$T`, so a `/Z7` compile) type the function as returning
+exactly `void`. A caller of a void function cannot read EAX, so EAX is dead
+at its returns. The type index and the record's digest are pinned. A missing
+type stream, a PDB type server (`/Zi`) or any other return type keeps EAX
+live, and the reference object is never consulted. The module docstring of
+`reprobit.classic.rewriting_region_resize` states the theorem and its ten
 checks.
 
 #### Project-level families (role `project`)

@@ -129,9 +129,17 @@ def codeview_stream(body_length=SIZE, debug_start=DEBUG_START, debug_end=DEBUG_E
 
 
 def make_coff(
-    *, body=BODY, relocations=RELOCATIONS, lines=LINE_ROWS, fpo_packed=0x14, debug_stream=None
+    *,
+    body=BODY,
+    relocations=RELOCATIONS,
+    lines=LINE_ROWS,
+    fpo_packed=0x14,
+    debug_stream=None,
+    types=None,
 ):
     """One classic-i386 COFF with an ordinary FPO COMDAT closure.
+
+    `types`, when given, is the body of a `.debug$T` section appended last.
 
     `fpo_packed` is the FPO record's bitfield byte: 0x14 is cbRegs=4,
     fHasSEH=0, fUseBP=1, cbFrame=FRAME_FPO -- exactly what MSVC 4.2 emits for
@@ -184,6 +192,16 @@ def make_coff(
             "characteristics": 0x00100A00,
         },
     ]
+    if types is not None:
+        section_inputs.append(
+            {
+                "name": ".debug$T",
+                "raw": bytes(types),
+                "relocations": [],
+                "lines": b"",
+                "characteristics": 0x42100048,
+            }
+        )
     cursor = 20 + len(section_inputs) * 40
     payload = bytearray()
     sections = []
@@ -221,6 +239,8 @@ def make_coff(
         (".ef", 8, 4, 0, 101, _marker_aux(71)),
         (".drectve", 0, 5, 0, 3, _section_aux(len(DIRECTIVE), 0, 0, 0)),
     ]
+    if types is not None:
+        symbols.append((".debug$T", 0, 6, 0, 3, _section_aux(len(types), 0, 0, 0)))
     string_offsets = {}
     strings = bytearray(b"\0\0\0\0")
 
