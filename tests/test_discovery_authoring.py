@@ -20,7 +20,9 @@ from reprobit.discovery_authoring import (
     build_declaration_shape_donor,
     build_declaration_shape_equal_body,
     build_extern_run_donor,
+    donor_compiler_seat,
     merge_authored_records,
+    saved_donor_seats,
 )
 from reprobit.model import Digest, Scope
 from reprobit.schema import (
@@ -377,3 +379,32 @@ def test_extern_run_donor_default_placement_keeps_record_identity() -> None:
     assert ("header_placement", "prefix") in {
         (field.name, field.value) for field in prefix.intervention.parameters
     }
+
+
+def test_one_extern_run_in_two_placements_takes_one_compiler_seat() -> None:
+    after_includes = _extern_run_donor()
+    prefix = _extern_run_donor(header_placement="prefix")
+    interventions, proofs = merge_authored_records(
+        InterventionDocument(
+            schema_version=3,
+            target_id="program",
+            translation_unit_id="tu.unit",
+            build_target="program",
+            interventions=(),
+        ),
+        ProofDocument(
+            schema_version=3,
+            target_id="program",
+            translation_unit_id="tu.unit",
+            expected_observations=(),
+        ),
+        (prefix,),
+    )
+
+    seat = donor_compiler_seat(after_includes.intervention, after_includes.receipt)
+    saved = saved_donor_seats(interventions, proofs)
+
+    # The seat derives from the declarations alone, never from their placement.
+    assert seat == donor_compiler_seat(prefix.intervention, prefix.receipt)
+    assert saved == {seat: prefix.intervention}
+    assert after_includes.intervention.id != prefix.intervention.id

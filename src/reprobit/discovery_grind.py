@@ -19,8 +19,6 @@ from reprobit.authority_snapshot import (
     assert_json_authority_unchanged,
 )
 from reprobit.classic_donors import (
-    generate_declaration_shape,
-    generate_extern_run,
     merge_candidate_constraints,
 )
 from reprobit.classic_project import ClassicDispatchMaterials, ClassicFamilyDispatcher
@@ -35,7 +33,9 @@ from reprobit.discovery_authoring import (
     build_donor_reloc_layout_equal_body,
     build_extern_run_donor,
     build_measured_function_record,
+    donor_compiler_seat,
     merge_authored_records,
+    saved_donor_seats,
 )
 from reprobit.discovery_contracts import (
     DeclarationFamily,
@@ -55,9 +55,7 @@ from reprobit.discovery_rewriting import build_donor_schedule_rewriting
 from reprobit.execution import classic_semantic_obligation_name
 from reprobit.intervention_metadata import (
     ClassicRecipeFamily,
-    ClassicRecipeRole,
 )
-from reprobit.model import Digest
 from reprobit.msvc_discovery_coff import qualify_msvc_reference_object
 from reprobit.progress import ProgressKind
 from reprobit.project_loader import load_project_tree
@@ -235,22 +233,6 @@ _DEFAULT_HEADER_PLACEMENT = "after_includes"
 def _header_placement(context: ProjectGrindContext) -> str:
     runs = context.config.extern_runs
     return runs.placement if runs is not None else _DEFAULT_HEADER_PLACEMENT
-
-
-def _state_digest(state: DeclarationState, context: ProjectGrindContext) -> tuple[str, str]:
-    """The generated-header digest and placement the state's donor would carry."""
-
-    _require_grind_family(state)
-    if state.family is DeclarationFamily.DECLARATION_SHAPE:
-        generated = generate_declaration_shape(*_state_shape(state))
-        return Digest.from_bytes(generated).value, _DEFAULT_HEADER_PLACEMENT
-    run = _extern_run(state)
-    generated = b""
-    if run.header_count:
-        generated += generate_extern_run(run.header_prefix, run.header_count, run.width)
-    if run.seat_count:
-        generated += generate_extern_run(run.seat_prefix, run.seat_count, run.width)
-    return Digest.from_bytes(generated).value, _header_placement(context)
 
 
 def _state_donor(state: DeclarationState, context: ProjectGrindContext) -> AuthoredClassicRecord:
@@ -584,22 +566,70 @@ def require_single_acceptance(
         raise error(message)
 
 
-def _saved_donor_digests(document: InterventionDocument) -> frozenset[tuple[str, str]]:
-    """Generated-header digests and placements of the unit's saved grind-family donors."""
+def _differing_parameters(left: ClassicRecipeIntervention, right: ClassicRecipeIntervention) -> str:
+    left_values = {field.name: field.value for field in left.parameters}
+    right_values = {field.name: field.value for field in right.parameters}
+    names = sorted(
+        name
+        for name in left_values.keys() | right_values.keys()
+        if left_values.get(name) != right_values.get(name)
+    )
+    if not names:
+        return "its recipe differs outside its parameters"
+    return "its " + ", ".join(
+        f"{name} is {left_values.get(name, '(default)')!r} there and "
+        f"{right_values.get(name, '(default)')!r} here"
+        for name in names
+    )
 
-    digests: set[tuple[str, str]] = set()
-    for intervention in document.interventions:
-        if (
-            isinstance(intervention, ClassicRecipeIntervention)
-            and intervention.role is ClassicRecipeRole.DONOR
-            and intervention.family in _GRIND_DONOR_FAMILIES
-        ):
-            values = {field.name: field.value for field in intervention.parameters}
-            digest = values.get("generated_header_sha256")
-            placement = values.get("header_placement", _DEFAULT_HEADER_PLACEMENT)
-            if isinstance(digest, str) and isinstance(placement, str):
-                digests.add((digest, placement))
-    return frozenset(digests)
+
+def _admit_against_saved_seats(
+    states: tuple[DeclarationState, ...],
+    context: ProjectGrindContext,
+) -> tuple[list[tuple[DeclarationState, AuthoredClassicRecord]], list[GrindRejection]]:
+    """Pair each state with its provisional donor, or skip it beside a saved donor.
+
+    A donor's compiler seat derives from its declarations alone. A state whose
+    donor takes a saved donor's seat either is that donor, and reuses it with a
+    widened beneficiary set, or renders those declarations under another recipe
+    (another placement, say) and would share the saved donor's private arena.
+    That state cannot compile in this unit, so it is skipped with its reason;
+    it never reaches the orchestrator, which would refuse the whole campaign.
+    """
+
+    saved = saved_donor_seats(context.intervention_document, context.proof_document)
+    admitted: list[tuple[DeclarationState, AuthoredClassicRecord]] = []
+    skipped: list[GrindRejection] = []
+    for state in states:
+        record = _state_donor(state, context)
+        seat = donor_compiler_seat(record.intervention, record.receipt)
+        holder = saved.get(seat)
+        reason: str | None = None
+        if holder is not None and holder.id != record.intervention.id:
+            reason = (
+                f"its donor would share compiler seat {seat!r} with saved donor "
+                f"{holder.id!r}, which renders the same declarations but "
+                f"{_differing_parameters(holder, record.intervention)}; one seat "
+                "holds one donor, so this state cannot compile in this unit"
+            )
+        elif holder is not None:
+            try:
+                merge_authored_records(
+                    context.intervention_document, context.proof_document, (record,)
+                )
+            except DiscoveryAuthoringError as exc:
+                reason = f"its donor is saved donor {holder.id!r} but cannot reuse it: {exc}"
+        if reason is None:
+            admitted.append((state, record))
+        else:
+            skipped.append(
+                GrindRejection(
+                    state_id=declaration_state_id(state),
+                    stage="qualification",
+                    reason=reason,
+                )
+            )
+    return admitted, skipped
 
 
 def run_project_grind(
@@ -664,12 +694,11 @@ def run_project_grind(
             states = enumerate_declaration_states(context.config.plan)
         except DiscoveryError as exc:
             raise GrindError(f"invalid bounded grind plan: {exc}") from exc
-        # A state one of the unit's saved donors already renders would share
-        # that donor's compiler arena; it is that donor's, not a fresh cell.
-        saved_digests = _saved_donor_digests(context.intervention_document)
-        states = tuple(
-            state for state in states if _state_digest(state, context) not in saved_digests
-        )
+        # A state whose donor is a saved donor reuses it; one that would only
+        # share a saved donor's compiler seat is skipped here with its reason.
+        provisional, seat_rejections = _admit_against_saved_seats(states, context)
+        rejections.extend(seat_rejections)
+        states = tuple(state for state, _record in provisional)
         # Each state has one compatibility disposition and one cold-trial
         # disposition. States that cannot qualify consume the latter as an
         # explicit skip, keeping one honest and monotonic progress total.
@@ -690,16 +719,14 @@ def run_project_grind(
         completed += 1
         _advance(progress, completed, total, "grind-seed", context.compiler_node.id)
 
-        provisional: list[tuple[DeclarationState, AuthoredClassicRecord]] = []
-        for state in states:
-            provisional.append((state, _state_donor(state, context)))
-        provisional_documents = merge_authored_records(
-            context.intervention_document,
-            context.proof_document,
-            tuple(record for _state, record in provisional),
-        )
-        _write_staged_documents(context, staged_root, *provisional_documents)
-        load_project_tree(staged_root)
+        if provisional:
+            provisional_documents = merge_authored_records(
+                context.intervention_document,
+                context.proof_document,
+                tuple(record for _state, record in provisional),
+            )
+            _write_staged_documents(context, staged_root, *provisional_documents)
+            load_project_tree(staged_root)
         donor_ids = tuple(record.intervention.id for _state, record in provisional)
         _advance(
             progress,
@@ -719,7 +746,11 @@ def run_project_grind(
             completed += 1
             _advance(progress, completed, total, "grind-donors", donor_id)
 
-        donor_objects = dict(callbacks.probe_donors(staged_root, donor_ids, donor_progress))
+        donor_objects = (
+            dict(callbacks.probe_donors(staged_root, donor_ids, donor_progress))
+            if donor_ids
+            else {}
+        )
         if donor_completed != len(donor_ids):
             raise GrindError("donor compiler probe omitted completion progress")
         if set(donor_objects) != set(donor_ids) or any(
