@@ -685,6 +685,9 @@ class PathState:
     epoch: Term = None
     events: list[Term] = field(default_factory=list)
     fpu: X87State = field(default_factory=X87State)
+    # A whole-function proof's stack-frame model (see
+    # :mod:`reprobit.classic.function_validation`); None in every region proof.
+    frame: Any = None
 
     def fork(self) -> PathState:
         return PathState(
@@ -697,6 +700,7 @@ class PathState:
             self.epoch,
             list(self.events),
             self.fpu.fork(),
+            None if self.frame is None else self.frame.fork(),
         )
 
 
@@ -739,6 +743,12 @@ def entry_state(entry_names: Mapping[str, str] | None = None) -> PathState:
 
 
 def _load(state: PathState, address: Term, width: int) -> Term:
+    if state.frame is not None:
+        # A whole-function proof's frame model may own the address (a
+        # private stack slot); it returns None for ordinary memory.
+        routed = state.frame.load(state, address, width)
+        if routed is not None:
+            return routed
     state.footprint.add((address, width))
     deps: list[tuple[Term, int, Term]] = []
     for entry in reversed(state.stores):
@@ -750,7 +760,12 @@ def _load(state: PathState, address: Term, width: int) -> Term:
         deps.append(entry)
         if relation == "same":
             break
-    term: Term = ("ld", address, width, tuple(reversed(deps)))
+    named: Term = tuple(reversed(deps))
+    if state.frame is not None and named:
+        # A whole-function proof names the stores a load depends on by a
+        # digest of their terms (as it names call events).
+        named = state.frame.digest("deps", named)
+    term: Term = ("ld", address, width, named)
     if state.epoch is not None:
         # Memory since the last call is that call's result: the load names it.
         term = (*term, state.epoch)
@@ -758,8 +773,15 @@ def _load(state: PathState, address: Term, width: int) -> Term:
 
 
 def _store(state: PathState, address: Term, width: int, value: Term) -> None:
+    if state.frame is not None and state.frame.store(state, address, width, value):
+        return
     state.footprint.add((address, width))
     state.stores.append((address, width, value))
+
+
+# movsb, movsd, stosb, stosd, scasb (the string forms MSVC 5.0 emits inline).
+_STRING_OPCODES = frozenset({0xA4, 0xA5, 0xAA, 0xAB, 0xAE})
+MAX_STRING_COUNT = 1024
 
 
 class _Instruction:
@@ -771,6 +793,8 @@ class _Instruction:
         offset: int,
         relocations: Mapping[int, RelocationTarget],
         context: str,
+        *,
+        extended: bool = False,
     ) -> None:
         self.offset = offset
         self.context = f"{context} at {offset}"
@@ -779,10 +803,25 @@ class _Instruction:
         require(len(self.raw) == self.length, f"{self.context}: the instruction is truncated")
         self.relocations = relocations
         self.consumed: set[int] = set()
+        # A whole-function proof (``extended``) admits ``lea r, [index*scale +
+        # disp32]`` with an unrelocated displacement -- arithmetic on a
+        # constant, not an address -- and the string instructions of
+        # :func:`_string_step`.
+        self.extended = extended
+        self.scaled_lea_constants = extended
         cursor = 0
         self.operand16 = False
+        self.repeat: int | None = None
         while self.raw[cursor] in (0x66,):
             self.operand16 = True
+            cursor += 1
+        if (
+            extended
+            and self.raw[cursor] in (0xF2, 0xF3)
+            and cursor + 1 < self.length
+            and self.raw[cursor + 1] in _STRING_OPCODES
+        ):
+            self.repeat = self.raw[cursor]
             cursor += 1
         require(
             self.raw[cursor] not in (0x26, 0x2E, 0x36, 0x3E, 0x64, 0x65, 0xF0, 0xF2, 0xF3, 0x67),
@@ -865,11 +904,13 @@ class _Instruction:
         cursor = self.modrm_at + 1
         total = lin(0)
         has_base = True
+        has_index = False
         if rm == 4:
             sib = self.raw[cursor]
             cursor += 1
             scale, index, base = 1 << (sib >> 6), (sib >> 3) & 7, sib & 7
             if index != 4:
+                has_index = True
                 total = lin_add(total, lin_scale(regs[_REGS[index]], scale))
             if mod == 0 and base == 5:
                 has_base = False
@@ -884,7 +925,8 @@ class _Instruction:
             displacement = int.from_bytes(self.raw[cursor : cursor + 4], "little", signed=True)
             if not has_base:
                 require(
-                    symbol is not None,
+                    symbol is not None
+                    or (self.scaled_lea_constants and has_index and self.opcode == 0x8D),
                     f"{self.context}: an absolute address without a relocation is outside the "
                     "simulator's closed set",
                 )
@@ -1097,17 +1139,28 @@ def store_normal_form(stores: Iterable[tuple[Term, int, Term]]) -> tuple[Any, ..
     take the least store (by its representation) that is disjoint from every
     store still before it.
     """
-    remaining = list(stores)
+    items = list(stores)
+    keys = [repr(item) for item in items]
+    count = len(items)
+    # blocked[j] holds every earlier store that may overlap store j.
+    blocked = [
+        {
+            i
+            for i in range(j)
+            if address_relation(items[j][0], items[j][1], items[i][0], items[i][1]) != "disjoint"
+        }
+        for j in range(count)
+    ]
+    remaining = list(range(count))
     ordered = []
     while remaining:
-        best = None
-        for index, item in enumerate(remaining):
-            if all(
-                address_relation(item[0], item[1], other[0], other[1]) == "disjoint"
-                for other in remaining[:index]
-            ) and (best is None or repr(item) < repr(remaining[best])):
-                best = index
-        ordered.append(remaining.pop(cast(int, best)))
+        live = set(remaining)
+        best = min(
+            (index for index in remaining if not blocked[index] & live),
+            key=lambda index: keys[index],
+        )
+        ordered.append(items[best])
+        remaining.remove(best)
     return tuple(ordered)
 
 
@@ -1191,10 +1244,22 @@ def _call(
             (fpu.base, fpu.push, fpu.view().slots),
             tuple(sorted(set(fpu.events), key=repr)),
         )
+    if state.frame is not None:
+        # A private frame: the stack words the callee may read as its
+        # arguments are named here (the store log holds no frame store).
+        identity = (*identity, ("args", state.frame.arguments(state, context)))
     state.events.append(identity)
     state.footprint.add(("event", identity))
+    if state.frame is not None:
+        # A whole-function proof names the event by a digest of its term
+        # wherever later terms refer to it: equal terms give equal names
+        # (SHA-256), and a chain of calls no longer nests each event in the
+        # next several times over.
+        identity = state.frame.event_name(identity)
     state.stores = []
     state.epoch = identity
+    if state.frame is not None:
+        state.frame.after_call(state, identity)
     # The x87 state after the call is the callee's function of the state
     # before it (named by the event).  With a known return count the frame
     # is absolute (depth ``push``); otherwise how many values the callee
@@ -1461,6 +1526,71 @@ def _x87_step(state: PathState, item: _Instruction, undefined: _Undefined) -> No
     require(False, refused)
 
 
+def _string_step(state: PathState, item: _Instruction, undefined: _Undefined) -> None:
+    """``stos``/``movs`` (once, or ``rep`` with a constant ECX) and ``repne scasb``.
+
+    The direction flag is clear (the calling convention's state at every
+    entry and call; no instruction of the closed set sets it).  A ``rep
+    stos``/``rep movs`` of a constant count n <= MAX_STRING_COUNT is exactly
+    its n element moves, each a load and a store of the memory model, then
+    ECX = 0; flags are unchanged.  ``repne scasb`` scans memory from EDI for
+    AL, at most ECX bytes: its result is the opaque term ``("scan", AL, EDI,
+    ECX, store log, epoch)`` -- the scan is a function of exactly those --
+    recorded in the footprint (its accesses and faults are that function's
+    too); ECX becomes the term's count and EDI advances by the bytes
+    scanned, ECX_in - ECX_out; the flags are the term's.
+    """
+    op = item.opcode
+    context = item.context
+    require(not item.operand16, f"{context}: a 16-bit string instruction is outside the closed set")
+    width = 1 if op in (0xA4, 0xAA, 0xAE) else 4
+    if op == 0xAE:
+        require(
+            item.repeat == 0xF2,
+            f"{context}: a scas other than repne scasb is outside the closed set",
+        )
+        scan = (
+            "scan",
+            _get(state, 0, 8),
+            state.regs["edi"],
+            state.regs["ecx"],
+            store_normal_form(state.stores),
+            state.epoch,
+        )
+        if state.frame is not None:
+            scan = state.frame.digest("scan", scan)
+        state.footprint.add(("scan", scan))
+        remaining = lin_atom(("scanleft", scan))
+        state.regs["edi"] = lin_add(state.regs["edi"], lin_sub(state.regs["ecx"], remaining))
+        state.regs["ecx"] = remaining
+        for name in FLAG_NAMES:
+            state.flags[name] = ("flag", name, "scan", 8, scan, "")
+        return
+    count = 1
+    if item.repeat is not None:
+        require(
+            item.repeat == 0xF3,
+            f"{context}: a repne stos or movs is outside the closed set",
+        )
+        known = const_of(state.regs["ecx"])
+        require(
+            known is not None and known <= MAX_STRING_COUNT,
+            f"{context}: a rep {'movs' if op in (0xA4, 0xA5) else 'stos'} whose count is not a "
+            f"constant of at most {MAX_STRING_COUNT} is outside the closed set",
+        )
+        count = cast(int, known)
+    for _index in range(count):
+        if op in (0xAA, 0xAB):
+            value = _get(state, 0, width * 8)
+        else:
+            value = _load(state, state.regs["esi"], width)
+            state.regs["esi"] = lin_add(state.regs["esi"], lin(width))
+        _store(state, state.regs["edi"], width, value)
+        state.regs["edi"] = lin_add(state.regs["edi"], lin(width))
+    if item.repeat is not None:
+        state.regs["ecx"] = lin(0)
+
+
 def _step(
     state: PathState,
     item: _Instruction,
@@ -1478,6 +1608,9 @@ def _step(
             "set",
         )
     width32 = 16 if item.operand16 else 32
+    if item.extended and op in _STRING_OPCODES:
+        _string_step(state, item, undefined)
+        return ("fall", None)
     if 0xD8 <= op <= 0xDF:
         _x87_step(state, item, undefined)
         return ("fall", None)
