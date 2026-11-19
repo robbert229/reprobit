@@ -204,6 +204,21 @@ states the theorem, its nine checks and its three assumptions beyond the
 region kinds' (a callee owns its argument words; the donor's call arguments
 lie below its saved registers and locals; own-frame accesses do not fault).
 
+Both this kind and the region rewrite run a call to a compiler helper
+(`__ftol`, `__chkstk`) from the helper's own bytes. The bytes come from the
+toolchain's `lib/libc.lib`, admitted only when they match the profile's
+reviewed authority (`MSVC50_LIBRARY_AUTHORITIES`). The member is the one the
+library's symbol index names, in a code section with no relocation. The
+record pins the library digest and the body digest
+(`expected_helper_callees`). A helper that calls out or names a global
+(`__CIacos`, `__isctype`) is refused. Translation validation also admits a
+COM vtable call, `call [reg+disp]` through a slot of a vtable loaded from
+memory, as an event named by the slot's word and the bytes its callee pops.
+Each version's stack relation must fix that pop; two vtable calls in a row
+fix only the sum of their pops and are refused. The module docstrings of
+`reprobit.classic.function_validation` (a4-a7) and
+`reprobit.classic.toolchain_helpers` state the added assumptions.
+
 #### Project-level families (role `project`)
 
 | Family | Contract and meaning |

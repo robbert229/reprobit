@@ -509,3 +509,34 @@ MSVC50_NATIVE_CRT_LINK_AUTHORITIES = {
         ),
     },
 }
+
+# Single files inside the audited lib tree that a proof reads compiler-helper
+# bodies from (reprobit.classic.toolchain_helpers). Each digest is the file's
+# bytes in a tree whose portable-tree-v1 receipt is the profile's reviewed
+# lib authority above, so these bytes are exactly the tree's.
+MSVC50_LIBRARY_AUTHORITIES = {
+    "msvc_5_0_rtm": {
+        "lib/libc.lib": Msvc50FileAuthority(
+            898826,
+            "4ae22c6f35a87c55c453ad388ada649ea3ba190614be3d1ab95935ba0faa7416",
+        ),
+    },
+    "msvc_5_0_sp1": {
+        "lib/libc.lib": Msvc50FileAuthority(
+            900472,
+            "f81440dd014ca4ce7ef8b4d60ed1ee4ad544601b07fbdb4fca54a1dfca31f9b0",
+        ),
+    },
+    "msvc_5_0_sp2": {
+        "lib/libc.lib": Msvc50FileAuthority(
+            900472,
+            "f81440dd014ca4ce7ef8b4d60ed1ee4ad544601b07fbdb4fca54a1dfca31f9b0",
+        ),
+    },
+    "msvc_5_0_sp3": {
+        "lib/libc.lib": Msvc50FileAuthority(
+            900626,
+            "3b5f43e920c37c8da086b0d3ef0396e6517d44fcdcb4e7d03a6058620bc13ee3",
+        ),
+    },
+}

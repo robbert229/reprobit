@@ -68,6 +68,7 @@ from reprobit.schema import (
 )
 from reprobit.secure_path_contracts import SecureFileSnapshot
 from reprobit.strict_json import JsonValue
+from reprobit.toolchain_helper_library import load_helper_library
 from reprobit.toolchains import ClassicMSVCToolchain
 
 if TYPE_CHECKING:
@@ -671,6 +672,7 @@ def prepare_classic_incremental_plan(
         bundle,
         clean_sources=clean_sources,
         effective_sources=effective_sources,
+        helper_library=load_helper_library(toolchain_root, bundle.spec.toolchain.profile),
     )
     units_by_id: dict[str, ClassicPreparedUnit] = {}
     for unit in units:

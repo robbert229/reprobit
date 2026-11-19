@@ -34,6 +34,7 @@ from reprobit.classic.function_validation import (
     measure_function_validation,
 )
 from reprobit.classic.region_simulation import region_boundaries
+from reprobit.classic.toolchain_helpers import HelperLibrary
 from reprobit.classic_donors import DonorSourceError, merge_candidate_constraints
 from reprobit.classic_project import (
     ClassicDispatchMaterials,
@@ -117,8 +118,13 @@ def build_function_validation_rewriting(
     seed_object: bytes,
     donor_object: bytes,
     reference_object: bytes,
+    helper_library: HelperLibrary | None = None,
 ) -> DeclarationShapeEqualBodyAuthoring:
-    """Author a translation-validation consumer whose replacement is the reference body."""
+    """Author a translation-validation consumer whose replacement is the reference body.
+
+    ``helper_library`` is the authenticated toolchain library the bodies of
+    compiler helpers are read from (`classic.toolchain_helpers`).
+    """
 
     for name, value in (
         ("seed_object", seed_object),
@@ -214,6 +220,7 @@ def build_function_validation_rewriting(
                 "expected_fill_alignment": fill_alignment,
             },
             _comdat_child_closure(donor_coff, dp)[1],
+            helper_library,
         )
         if measured.image != reference_body:
             raise DiscoveryAuthoringError("the proved image differs from the reference body")
@@ -255,6 +262,7 @@ def build_function_validation_rewriting(
                 seed_object=seed_object,
                 donor_object=donor_object,
                 candidate_constraints=constraints,
+                helper_library=helper_library,
             ),
         )
         composed = CoffObject(candidate.output)

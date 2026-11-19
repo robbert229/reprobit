@@ -217,6 +217,16 @@ footprint covers, and never traps between the two versions' differing
 schedules.  No precision or rounding mode is assumed: no term identity
 depends on one.
 
+Compiler helpers.  A direct call inside a region to a compiler helper
+(``__ftol``, ``__chkstk``) runs the helper's own bytes inline, read from
+the authenticated toolchain library (:func:`region_helper_callees`,
+`toolchain_helpers`); its ``fldcw`` must keep the shared word's exception
+masks, so x4 still holds.  The record pins the library and body digests
+(``expected_helper_callees``); a helper the donor calls outside every
+region is neither simulated nor pinned.  An inlined helper's stores wholly
+below ESP after it returns are dead stack and leave the store log, as a
+call event's callee frame does (`function_validation`'s a6).
+
 Calls.  A direct call to a symbol whose MSVC C decoration is ``_name`` or
 ``_name@N`` (or that thunk's ``__imp_`` slot) reads no general register: only
 ``__fastcall`` and C++ member functions take register arguments.  Compiler
@@ -231,7 +241,7 @@ byte: rows are debug metadata only, and the count is kept.
 from __future__ import annotations
 
 import itertools
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from typing import Any, cast
 
@@ -281,6 +291,7 @@ from .foundation import local_symbol_kind, require_payload_free_declaration, sha
 from .region_simulation import (
     FLAG_NAMES,
     X87_CONDITION_BITS,
+    HelperCode,
     RelocationTarget,
     canonical_flag,
     contradictory,
@@ -313,6 +324,7 @@ from .relational import (
     ia32_relational_flow_walk,
     relational_form_external_entries,
 )
+from .toolchain_helpers import HelperLibrary, compiler_helper
 
 REGION_RESIZE_KIND = "simulated_region_resize_v1"
 REGION_RESIZE_CLASS = "retail_exact_region_resize_rewriting"
@@ -788,6 +800,7 @@ def apply_region_resize(
     bijection: object = None,
     frame_pointer_free: bool = False,
     void_return: bool = False,
+    helpers: Mapping[str, HelperCode] | None = None,
 ) -> tuple[bytes, dict[str, Any]]:
     """Install each declared replacement, relay the body out, and prove it (checks 1-8).
 
@@ -800,8 +813,11 @@ def apply_region_resize(
     declared scope bijection of check 10; ``frame_pointer_free`` states that
     the caller proved EBP is not this body's frame pointer; ``void_return``
     that the caller proved, from the donor's own type records, that the
-    function returns ``void``, so EAX is dead at its returns.  Returns the
-    unpadded image (code and tail) and the proof; the caller pads it.
+    function returns ``void``, so EAX is dead at its returns.  ``helpers``
+    maps each compiler helper a region calls to its verified body
+    (:func:`region_helper_callees`), which the simulator runs inline.
+    Returns the unpadded image (code and tail) and the proof; the caller
+    pads it.
     """
     body = bytes(body)
     require(bool(body), f"{context}: body is empty")
@@ -1325,6 +1341,7 @@ def apply_region_resize(
                     x87_exposures=x87_exposures,
                     x87_record=x87_record,
                     x87_returns=x87_returns,
+                    helpers=helpers,
                 )
                 pairs += pairs_here
                 donor_count += counts[0]
@@ -1412,6 +1429,7 @@ def _prove_region_entry(
     x87_exposures: list[int] | None = None,
     x87_record: dict[str, Any] | None = None,
     x87_returns: dict[str, int] | None = None,
+    helpers: Mapping[str, HelperCode] | None = None,
 ) -> tuple[int, set[str], set[str], tuple[int, int]]:
     """Check 8 for the run of one region from one of its entries.
 
@@ -1436,6 +1454,7 @@ def _prove_region_entry(
         begin=donor_entry,
         leave=True,
         x87_returns=x87_returns,
+        helpers=helpers,
     )
     image_paths = simulate_region(
         replacement,
@@ -1448,6 +1467,7 @@ def _prove_region_entry(
         begin=image_local,
         leave=True,
         x87_returns=x87_returns,
+        helpers=helpers,
     )
     entry_live = live_at(donor_entry)
     entry_flags = flags_live(donor_entry)
@@ -1624,6 +1644,42 @@ def _prove_region_entry(
                 f"{context}: the entry flag {name} is read but dead at the region entry",
             )
     return pairs, compared_union, flags_union, (len(donor_paths), len(image_paths))
+
+
+def region_helper_callees(
+    regions: object,
+    rows: list[dict[str, Any]],
+    library: HelperLibrary | None,
+    context: str,
+) -> tuple[dict[str, HelperCode], list[dict[str, Any]]]:
+    """The compiler helpers a declared region calls: their verified bodies and their pins.
+
+    A helper the donor calls only outside every region is not simulated and
+    not pinned.  When a region calls one, ``library`` (the authenticated
+    toolchain library) must supply its body.
+    """
+    declared = _validate_regions(regions, context)
+    symbols = sorted(
+        {
+            row["target"]
+            for row in rows
+            if row["type"] == _REL32
+            and compiler_helper(row["target"])
+            and any(region["start"] <= row["offset"] < region["end"] for region in declared)
+        }
+    )
+    if not symbols:
+        return {}, []
+    require(
+        library is not None,
+        f"{context}: a region calls the compiler helpers {symbols}, and no authenticated "
+        "toolchain library is supplied to read their bodies from",
+    )
+    bodies = cast(HelperLibrary, library).helpers(symbols)
+    return (
+        {symbol: body.code for symbol, body in bodies.items()},
+        [body.pin() for body in bodies.values()],
+    )
 
 
 def _padded_length(proc_size: int, fill_alignment: int) -> int:
@@ -1936,9 +1992,16 @@ def _composed_identity(row: dict[str, Any]) -> tuple[Any, ...]:
 
 
 def produce_region_resize_rewriting_candidate(
-    seed_bytes: bytes, donor_bytes: bytes, function: dict[str, Any]
+    seed_bytes: bytes,
+    donor_bytes: bytes,
+    function: dict[str, Any],
+    helper_library: HelperLibrary | None = None,
 ) -> tuple[bytes, dict[str, Any]]:
-    """Produce the resized REWRITE(donor body) of a fresh compiler artifact (check 9)."""
+    """Produce the resized REWRITE(donor body) of a fresh compiler artifact (check 9).
+
+    ``helper_library`` is the authenticated toolchain library, needed when a
+    region calls a compiler helper (its pins are ``expected_helper_callees``).
+    """
     seats = open_candidate_seats(seed_bytes, donor_bytes, function, REGION_RESIZE_RECIPE)
     donor, mangled = seats.donor, seats.mangled
     dp, spec = seats.donor_section, seats.spec
@@ -1967,6 +2030,7 @@ def produce_region_resize_rewriting_candidate(
             "expected_bijection_rewrites",
             "expected_bijection_mode_changes",
             "expected_void_return",
+            "expected_helper_callees",
         },
         "region-resize declaration names an unknown field",
     )
@@ -2024,6 +2088,14 @@ def produce_region_resize_rewriting_candidate(
             "region-resize frame proof",
         )
         frame_pointer_free = True
+    helpers, helper_pins = region_helper_callees(
+        spec["regions"], donor_rows, helper_library, "region-resize"
+    )
+    require(
+        spec.get("expected_helper_callees", []) == helper_pins
+        and ("expected_helper_callees" in spec) == bool(helper_pins),
+        "region-resize helper callees differ from its declaration",
+    )
     image, proof = apply_region_resize(
         donor_body,
         spec["regions"],
@@ -2038,6 +2110,7 @@ def produce_region_resize_rewriting_candidate(
         bijection=bijection,
         frame_pointer_free=frame_pointer_free,
         void_return=void_return is not None,
+        helpers=helpers,
     )
     if bijection is not None:
         require(
@@ -2127,6 +2200,7 @@ def produce_region_resize_rewriting_candidate(
             "carried_code_symbols": derived_detail["carried_code_symbols"],
             "collapsed_line_rows": derived_detail["collapsed_line_rows"],
             "procedure_range": derived_detail["procedure_range"],
+            **({"helper_callees": helper_pins} if helper_pins else {}),
         },
         semantic_detail,
     )
