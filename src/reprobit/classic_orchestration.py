@@ -818,6 +818,12 @@ def compose_classic_unit(
     donor_objects = {
         donor_id: material.donor_object for donor_id, material in donor_materials.items()
     }
+    # The PDB each donor's compile wrote, when its producer kept it (a14 of
+    # `function_validation`); a material without one supplies none.
+    donor_type_servers = {
+        donor_id: getattr(material, "donor_type_server", None)
+        for donor_id, material in donor_materials.items()
+    }
     donor_object_recorder = getattr(measured_receipt_repair, "record_unit_donor_objects", None)
     if donor_object_recorder is not None:
         # A repair analysis keeps every unit's fresh donor objects, bound to the
@@ -981,6 +987,7 @@ def compose_classic_unit(
             candidate_constraints=values,
             compiler_identity=unit.compiler_identity,
             helper_library=unit.helper_library,
+            donor_type_server=donor_type_servers.get(primary_id),
         )
         dispatch = repair_dispatch.dispatch_classic_action(
             dispatcher,

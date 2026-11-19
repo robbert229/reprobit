@@ -130,11 +130,14 @@ def build_function_validation_rewriting(
     donor_object: bytes,
     reference_object: bytes,
     helper_library: HelperLibrary | None = None,
+    donor_type_server: bytes | None = None,
 ) -> DeclarationShapeEqualBodyAuthoring:
     """Author a translation-validation consumer whose replacement is the reference body.
 
     ``helper_library`` is the authenticated toolchain library the bodies of
     compiler helpers are read from (`classic.toolchain_helpers`).
+    ``donor_type_server`` is the PDB the donor's compile wrote its types to,
+    read only by the frame-objects pass (a14 of `classic.function_validation`).
     """
 
     for name, value in (
@@ -232,6 +235,7 @@ def build_function_validation_rewriting(
             },
             _comdat_child_closure(donor_coff, dp)[1],
             helper_library,
+            donor_type_server,
         )
         if measured.image != reference_body:
             raise DiscoveryAuthoringError("the proved image differs from the reference body")
@@ -274,6 +278,7 @@ def build_function_validation_rewriting(
                 donor_object=donor_object,
                 candidate_constraints=constraints,
                 helper_library=helper_library,
+                donor_type_server=donor_type_server,
             ),
         )
         composed = CoffObject(candidate.output)

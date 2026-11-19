@@ -292,6 +292,10 @@ class _ClassicDonorSemanticMaterial:
     source_inputs: Mapping[str, bytes]
     compiler_statement: Mapping[str, object]
     _issuer: object = field(repr=False, compare=False)
+    # The PDB the same compile wrote the donor's types to (``/Fd``), which a
+    # frame-objects proof reads (a14 of `function_validation`); None when the
+    # producer did not keep it.
+    donor_type_server: bytes | None = field(default=None, repr=False, compare=False)
 
 
 def _require_classic_candidate_semantic_material(

@@ -363,6 +363,24 @@ nor any callee changes the protection of the image's pages (no admitted
 instruction can; a callee would have to call ``VirtualProtect`` on them), so
 a load inside it reads its initial bytes whatever store comes first: a
 store that reached them faults, and the state at a fault is not compared.
+(a14) Frame objects, for the
+frame-objects pass only (below): when a stack address p escapes -- it is
+passed to a call, stored to memory, used by a block string operation, or
+held in a register -- the callee, and the donor itself, read and write only
+within the local object p points into.  That object is a contiguous range of
+the frame, [ESP0 + s, ESP0 + s + n) for a local or parameter the donor's
+``S_BPREL32`` record places at s with a type of n bytes
+(`frame_objects.donor_frame_objects`), and no access through p, or through
+a pointer derived from it, goes past either end.  This is ISO C's rule
+against out-of-bounds pointer arithmetic (C90 6.3.6, C99 6.5.6p8: a pointer
+into an object, plus or minus an integer, points into the same object or one
+past its end, and nothing else is defined), applied to compiled code: the
+donor is compiled C, so every access it makes through a pointer is in the
+object the pointer was derived from, and a callee that keeps the pointer
+obeys the same rule whenever it uses it.  The replacement's accesses that
+are not at a constant offset from ESP0 are the donor's (5c compares the
+footprints path by path), and its constant-offset accesses are classified
+by the same extents, so the two versions agree on which bytes are memory.
 No other assumption is made: the relation is inferred, nothing about the
 replacement is believed, and the simulator's term model is exact.
 
@@ -399,6 +417,55 @@ normal forms, each exact (`region_simulation._equivalences`):
   ``fcom m; fxch; fmul; fxch; fstp [esp+0x14]; fnstsw`` meets the same with
   ``fstp [esp+0x10]``.
 
+The frame-objects pass (a14).  When every earlier pass refuses and the
+private frame was given up because a stack address escapes (`prove_function`
+records it on the refusal), a frame-pointer-free donor runs once more in a
+private frame whose escaping objects are memory.
+
+- The extents.  Every ``S_BPREL32`` local of the donor function, its size
+  from a CodeView primitive or a type record of the object (``/Z7``) or of
+  the PDB type server the object names (``/Zi``), which must carry the
+  signature and age the object records (`frame_objects`).  Each lies in the
+  locals block [B, ESP0) or the parameter words [ESP0 + 4, E); locals of
+  sibling scopes that share bytes are merged into one object.  A local of
+  unknown size refuses the pass.
+- The objects' starts are related by equality: an escaping object lies at
+  the same offset from ESP0 in both versions, so its address is one value in
+  both, named ``("fobj", s, n)`` (`frame_object_atom`).  A replacement that
+  keeps the object elsewhere passes another address and makes another call.
+- A value computed from ESP0 must be ESP0 + k for a constant k inside an
+  object or one past its end, and becomes that object's atom plus k - s
+  (`FrameModel.canonical`), in every register after every instruction and in
+  every stored value.  Its object escapes; so does the object k is one past
+  the end of, when k is both an object's start and another's end (the
+  pointer may be either, and C lets a pointer one past the end reach back
+  into its object).  The pass starts with no object escaping and runs again
+  with every object a run finds escaping (`ObjectEscape`), until none is new.
+- An access at ESP0 + k inside an escaping object, or through its atom, is
+  memory, at the atom's address (`FrameModel.memory_address`): in the store
+  log, the footprint and the call and block events, compared as any memory
+  is, so each escaping object is compared as a unit at every call, and after
+  a call its bytes are the call's result, one term in both versions.  Two
+  escaping objects, or one and a symbol of a10, are disjoint objects
+  (`region_simulation.ObjectModel`).  Every other access at ESP0 + k below E
+  is a private slot, related as check 7 relates one: by a14 no callee and no
+  pointer reaches it.  At a return the objects' stores are dead stack.
+- Refused: a stack address that is not ESP0 plus a constant or that lies in
+  no object (a compiler temporary has no record, so its extent is unknown);
+  an access at a variable offset from ESP itself (its displacement may fold
+  an index, so its object is not known); an access that lies partly inside
+  an escaping object; an access at a constant offset from an object's atom
+  that leaves the object; a stored pointer at a constant offset outside its
+  object, one past its end included (``va_start``'s address past the last
+  parameter, which a callee walks beyond the object); an address combining
+  objects' atoms other than as one pointer.
+
+A record this pass made pins ``frame_objects`` (the escaping objects'
+starts and sizes) and ``assumptions: ["a14"]``; records of the earlier
+passes pin neither.  The build re-derives the extents from the donor it
+compiles and the PDB that compile wrote (`classic_project.
+ClassicDispatchMaterials.donor_type_server`).
+
 Still refused, with the reason.  x87 operands are commuted only between
 registers (since `region_simulation`'s commutativity probe): a memory
 operand is not the register a load of it gives, because ``fld m32`` quiets
@@ -411,13 +478,16 @@ loaded register, none under commuted registers; every one has a NaN).  So
 ``fld A; fadd B`` never meets ``fld B; fadd A``, and nothing is
 reassociated.  In a shared frame (a stack address escapes) every frame byte
 is still memory, compared exactly, even a slot whose address is never
-taken: a callee holding an interior pointer may reach any byte of the
-object it points into, and the objects carry no object extents (the types
-live in a PDB type server), so a slot cannot be shown outside every escaped
-object.  ESP is part of every call event, so two frames of different sizes
-make different calls.  And EAX is compared at every return: no type in the
-object says a function is void (its S_GPROC32 names a type in the PDB type
-server), and a caller's use of EAX would be a whole-program fact.
+taken; only the frame-objects pass, under a14 and the extents the donor's
+debug records and type server give, relates such slots.  An escaping object
+the replacement keeps at another offset is refused: relating two addresses
+of one object would need a callee never to observe a pointer's value (only
+its object and offset), and the memory a function leaves could then hold
+different dangling pointers to its dead frame.  ESP is part of every call
+event, so two frames of different sizes make different calls.  And EAX is
+compared at every return: no type in the object says a function is void (its
+S_GPROC32 names a type in the PDB type server), and a caller's use of EAX
+would be a whole-program fact.
 """
 
 from __future__ import annotations
@@ -447,6 +517,7 @@ from .candidate_recipe import (
 from .coff import _comdat_child
 from .debug import MSVC50_FUNCTION_FILL_BYTE, parse_fpo_data
 from .foundation import require_payload_free_declaration, sha256_bytes
+from .frame_objects import FrameObject, FrameObjects, donor_frame_objects
 from .region_simulation import (
     _STRING_OPCODES,
     FLAG_NAMES,
@@ -497,6 +568,58 @@ _MASK = 0xFFFFFFFF
 
 class EscapeRefusal(ByteIdentityError):
     """A stack address escapes, so the frame cannot be private (check 7)."""
+
+
+class ObjectEscape(ByteIdentityError):
+    """A frame object's address escapes that the run took as private (a14).
+
+    The frame-objects pass runs again with ``starts`` added to the escaping
+    objects (`prove_function`).
+    """
+
+    def __init__(self, message: str, starts: Iterable[int]) -> None:
+        super().__init__(message)
+        self.starts = frozenset(starts)
+
+
+def frame_object_atom(item: FrameObject) -> Term:
+    """The atom of a frame object's address: ESP0 + its start, in both versions (a14)."""
+    return ("fobj", item.start, item.size)
+
+
+def _frame_object_terms(term: Term) -> list[tuple[Term, int]]:
+    """The frame-object atoms of a 32-bit linear term with their coefficients."""
+    if term[0] != "lin":
+        return []
+    return [
+        (atom, _signed(coefficient))
+        for atom, coefficient in term[2]
+        if isinstance(atom, tuple) and atom and atom[0] == "fobj"
+    ]
+
+
+def computed_from_frame_object(term: Term) -> bool:
+    """Whether a value is computed from a frame object's address (a14).
+
+    As :func:`computed_from_stack`: a word loaded from memory is whatever was
+    stored there, so a load's address (and an event's name) is not part of
+    the value's computation.
+    """
+    stack = [term]
+    seen: set[int] = set()
+    while stack:
+        current = stack.pop()
+        if isinstance(current, (tuple, list, frozenset, set)):
+            if id(current) in seen:
+                continue
+            seen.add(id(current))
+            if isinstance(current, tuple):
+                if current and current[0] == "fobj":
+                    return True
+                if current and current[0] in ("call", "call#", "ld"):
+                    continue
+            stack.extend(item for item in current if not isinstance(item, (str, int)))
+    return False
 
 
 def _signed(value: int) -> int:
@@ -574,7 +697,7 @@ def _shape(term: Term) -> Any:
 
 # Function-wide values: no execution point changes a register's entry value
 # or the entry value of a parameter word.
-_CLOSED_TAGS = frozenset({"lin", "b", "k", "sym", "fconst", "reg0", "pld"})
+_CLOSED_TAGS = frozenset({"lin", "b", "k", "sym", "fconst", "reg0", "pld", "fobj"})
 # A word holding one of these marks a saved register (check 7c).
 _SAVED_ENTRY_VALUES = frozenset(lin_atom(("reg0", name)) for name in ("ebx", "ebp", "esi", "edi"))
 
@@ -610,6 +733,12 @@ class FrameFacts:
     objects: ObjectModel | None = None
     # The equivalences pass (`region_simulation._equivalences`, a10).
     equivalences: bool = False
+    # The frame-objects pass (a14): the donor's frame objects, and the starts
+    # of those whose address escapes in either version.  Their bytes are
+    # memory, at addresses named by `frame_object_atom`; every other byte
+    # below E is a private slot.
+    frame_objects: FrameObjects | None = None
+    escaping: frozenset[int] = frozenset()
 
 
 _IMAGE_SCN_LNK_COMDAT = 0x1000
@@ -785,6 +914,11 @@ class FrameModel:
         if ESP0 not in coefficients:
             return None
         if len(coefficients) != 1 or coefficients[ESP0] != 1:
+            require(
+                self.facts.frame_objects is None,
+                f"{self.context}: a stack access at a variable offset from ESP, which a14 "
+                "attributes to no frame object (the displacement may fold an index)",
+            )
             if self.facts.private:
                 raise EscapeRefusal(f"{self.context}: a stack access at a variable offset from ESP")
             return None
@@ -802,7 +936,134 @@ class FrameModel:
             offset + width <= self.facts.params_end,
             f"{self.context}: a stack access straddles the end of the parameter words",
         )
-        return True
+        return self._escaping_object(offset, width) is None
+
+    def _escaping_object(self, offset: int, width: int) -> FrameObject | None:
+        """The escaping frame object an access at ESP0 + offset lies in (a14), or None.
+
+        An access that lies partly inside an escaping object is refused: its
+        bytes would be both memory and a private slot.
+        """
+        objects = self.facts.frame_objects
+        if objects is None:
+            return None
+        for item in objects.objects:
+            if (
+                item.start in self.facts.escaping
+                and item.start < offset + width
+                and offset < item.end
+            ):
+                require(
+                    item.start <= offset and offset + width <= item.end,
+                    f"{self.context}: a stack access at ESP0{offset:+d} ({width} bytes) straddles "
+                    f"the escaping frame object [ESP0{item.start:+d}, ESP0{item.end:+d}) of "
+                    f"{', '.join(item.names)}",
+                )
+                return item
+        return None
+
+    # --- the frame-objects pass (a14) ------------------------------------------------
+
+    def canonical(self, value: Term, context: str) -> Term:
+        """A value with every stack address it holds named by its frame object (a14).
+
+        A value computed from ESP0 must be ESP0 + k for a constant k: a pointer
+        into the frame object k lies in (or one past the end of one), which
+        becomes ``frame_object_atom(object) + (k - start)``.  Its object must
+        already escape; when it does not, the pass runs again with it escaping
+        (`ObjectEscape`).  A k outside every object the donor declares, a
+        variable or scaled stack address, and a value naming ESP0 only through
+        a load from the stack outside the frame are refused.
+        """
+        if not mentions_stack_address(value):
+            return value
+        require(
+            computed_from_stack(value),
+            f"{context}: a value read from the stack above the parameter words reaches a "
+            "register or memory",
+        )
+        offset = _esp_offset(value)
+        require(
+            offset is not None,
+            f"{context}: a stack address that is not ESP0 plus a constant, which a14 attributes "
+            "to no frame object",
+        )
+        objects = cast(FrameObjects, self.facts.frame_objects)
+        pointees = objects.pointees(cast(int, offset))
+        require(
+            bool(pointees),
+            f"{context}: the stack address ESP0{offset:+d} lies in no local the donor's debug "
+            "records declare, so its object has no extent",
+        )
+        missing = sorted({item.start for item in pointees} - self.facts.escaping)
+        if missing:
+            raise ObjectEscape(
+                f"{context}: the address of the frame object at ESP0{missing[0]:+d} escapes",
+                missing,
+            )
+        own = pointees[0]
+        return lin(cast(int, offset) - own.start, [(frame_object_atom(own), 1)])
+
+    def _object_access(self, address: Term, width: int, context: str) -> None:
+        """Check an access through a frame object's address (a14).
+
+        The address must name one object, once: at a constant offset the access
+        must lie wholly inside it (pointer arithmetic that leaves the object is
+        refused); at a variable offset it lies inside by a14, as C's rule
+        against out-of-bounds arithmetic places every access of the donor.
+        """
+        named = _frame_object_terms(address)
+        if not named:
+            require(
+                not computed_from_frame_object(address),
+                f"{context}: an address combines a frame object's address other than linearly",
+            )
+            return
+        require(
+            len(named) == 1 and named[0][1] == 1,
+            f"{context}: an address combines frame objects' addresses other than as one pointer",
+        )
+        atom = named[0][0]
+        if len(address[2]) == 1:
+            at = _signed(address[1])
+            require(
+                at >= 0 and at + width <= atom[2],
+                f"{context}: an access at offset {at} ({width} bytes) of the frame object "
+                f"[ESP0{atom[1]:+d}, ESP0{atom[1] + atom[2]:+d}) leaves it",
+            )
+
+    def memory_address(self, state: PathState, address: Term, width: int) -> Term:
+        """The address a memory access uses (a14: an escaping object's bytes by its atom)."""
+        if self.facts.frame_objects is None:
+            return address
+        offset = _esp_offset(address) if address[0] == "lin" else None
+        if offset is not None:
+            item = self._escaping_object(offset, width)
+            if item is not None:
+                address = lin(offset - item.start, [(frame_object_atom(item), 1)])
+        self._object_access(address, width, self.context)
+        return address
+
+    def memory_value(self, value: Term) -> Term:
+        """A stored value (a14): its stack address named, a stored pointer inside its object.
+
+        A pointer stored at a constant offset of one past the end of its
+        object (a ``va_list`` walked from a parameter) is refused: a callee
+        could read beyond the object through it.
+        """
+        if self.facts.frame_objects is None:
+            return value
+        value = self.canonical(value, self.context)
+        named = _frame_object_terms(value)
+        if len(named) == 1 and len(value[2]) == 1 and named[0][1] == 1:
+            at, size = _signed(value[1]), named[0][0][2]
+            require(
+                0 <= at < size,
+                f"{self.context}: a pointer at offset {at} of the frame object "
+                f"[ESP0{named[0][0][1]:+d}, ESP0{named[0][0][1] + size:+d}) is stored, outside "
+                "the object",
+            )
+        return value
 
     def _overlapping(self, offset: int, width: int) -> list[tuple[int, int]]:
         return [key for key in self.slots if key[0] < offset + width and offset < key[0] + key[1]]
@@ -866,7 +1127,9 @@ class FrameModel:
         return _tiled(tuple(tiles), width)
 
     def store(self, state: PathState, address: Term, width: int, value: Term) -> bool:
-        if self.facts.private and mentions_stack_address(value):
+        if self.facts.frame_objects is not None:
+            value = self.memory_value(value)
+        elif self.facts.private and mentions_stack_address(value):
             raise EscapeRefusal(f"{self.context}: a stack address is stored to memory")
         offset = self._offset(state, address)
         if offset is None or not self._owned(offset, width):
@@ -1534,7 +1797,14 @@ def run_paths(
                 results.append(PathEnd("ret", offset, path, start_depth, address))
                 break
             action, detail = _step(path, item, undefined, x87_returns, program.helpers)
-            if frame.private:
+            if frame.frame_objects is not None:
+                # a14: a stack address in a register is named by its frame
+                # object before any later instruction reads it.
+                for name in GENERAL_REGISTERS:
+                    path.regs[name] = path.frame.canonical(
+                        path.regs[name], f"{context}: {name} after {offset}"
+                    )
+            elif frame.private:
                 for name in GENERAL_REGISTERS:
                     if mentions_stack_address(path.regs[name]):
                         raise EscapeRefusal(
@@ -1628,6 +1898,10 @@ def _summarise(end: PathEnd, frame: FrameFacts, context: str) -> None:
 
 
 def _dead_stack_store(store: tuple[Term, int, Term], frame: FrameFacts) -> bool:
+    if frame.frame_objects is not None and _frame_object_terms(store[0]):
+        # A store into a frame object (a14): the object lies in the locals
+        # block or the parameter words, dead at the return.
+        return True
     offset = _esp_offset(store[0])
     if offset is None:
         return False
@@ -1941,6 +2215,7 @@ def prove_function(
     private_frame: FrameFacts | None = None,
     helpers: Mapping[str, HelperCode] | None = None,
     objects: ObjectModel | None = None,
+    frame_objects: FrameObjects | None = None,
 ) -> ValidationProof:
     """Checks 2 and 4-7: a private frame when one is given and no stack address escapes.
 
@@ -1950,9 +2225,21 @@ def prove_function(
     the object model of a10 (its stack end is replaced by the frame's E),
     runs the proof's equivalences pass (`region_simulation._equivalences`);
     None runs the first pass.
+    ``frame_objects`` (with ``objects`` and the private frame) runs the
+    frame-objects pass (a14) instead: the private frame with every escaping
+    frame object's bytes as memory.  It starts with no object escaping and
+    runs again with each object whose address a run finds escaping
+    (`ObjectEscape`), until a run needs no more; there is no shared-frame
+    fallback.
     """
-    donor = Program(donor_code, donor_relocations, "D", f"{context} donor", helpers)
-    image = Program(image_code, image_relocations, "P", f"{context} replacement", helpers)
+
+    def programs() -> tuple[Program, Program]:
+        return (
+            Program(donor_code, donor_relocations, "D", f"{context} donor", helpers),
+            Program(image_code, image_relocations, "P", f"{context} replacement", helpers),
+        )
+
+    donor, image = programs()
     params_end = 4 if private_frame is None else private_frame.params_end
     equivalences = objects is not None
     if objects is not None:
@@ -1960,15 +2247,50 @@ def prove_function(
         if private_frame is not None:
             private_frame = replace(private_frame, objects=objects, equivalences=True)
     shared = FrameFacts(False, params_end=params_end, objects=objects, equivalences=equivalences)
+    if frame_objects is not None:
+        require(
+            private_frame is not None and objects is not None,
+            f"{context}: the frame-objects pass needs the donor's FPO frame and the object model",
+        )
+        frame = cast(FrameFacts, private_frame)
+        require(
+            locals_block_first(donor, frame.base),
+            f"{context}: the frame-objects pass needs the donor to allocate its locals block first",
+        )
+        # The FPO record's locals block must hold every object below ESP0.
+        require(
+            all(item.start >= frame.base for item in frame_objects.objects),
+            f"{context}: a frame object lies below the locals block",
+        )
+        escaping: frozenset[int] = frozenset()
+        for _ in range(len(frame_objects.objects) + 1):
+            facts = replace(frame, frame_objects=frame_objects, escaping=escaping)
+            try:
+                return validate_function(
+                    donor, image, facts, x87_returns, f"{context} (frame objects)"
+                )
+            except ObjectEscape as escape:
+                grown = escaping | escape.starts
+                require(grown != escaping, f"{context}: {escape}, and it already escapes")
+                escaping = grown
+                donor, image = programs()
+        raise ByteIdentityError(f"{context}: the escaping frame objects do not settle")
+    escaped = False
     if private_frame is not None and locals_block_first(donor, private_frame.base):
         try:
             return validate_function(
                 donor, image, private_frame, x87_returns, f"{context} (private frame)"
             )
         except EscapeRefusal:
-            donor = Program(donor_code, donor_relocations, "D", f"{context} donor", helpers)
-            image = Program(image_code, image_relocations, "P", f"{context} replacement", helpers)
-    return validate_function(donor, image, shared, x87_returns, f"{context} (shared frame)")
+            donor, image = programs()
+            escaped = True
+    try:
+        return validate_function(donor, image, shared, x87_returns, f"{context} (shared frame)")
+    except ByteIdentityError as error:
+        # The shared frame was used because a stack address escapes the
+        # private one: the case the frame-objects pass (a14) is for.
+        error.escaped = escaped  # type: ignore[attr-defined]
+        raise
 
 
 def _x87_case_proofs(
@@ -2026,7 +2348,7 @@ def _case_note(case: Mapping[str, int], symbols: Iterable[str]) -> str:
 
 def proof_summary(proof: ValidationProof) -> dict[str, Any]:
     """The pinned measurements of a proof (check 8)."""
-    return {
+    summary: dict[str, Any] = {
         "frame": "private" if proof.frame.private else "shared",
         "frame_base": proof.frame.base if proof.frame.private else None,
         "params_end": proof.frame.params_end,
@@ -2039,6 +2361,14 @@ def proof_summary(proof: ValidationProof) -> dict[str, Any]:
             len(cls.members) for relation in proof.relations.values() for cls in relation.classes
         ),
     }
+    objects = proof.frame.frame_objects
+    if objects is not None:
+        # Only a frame-objects proof pins its escaping objects and a14.
+        summary["frame_objects"] = [
+            item.pin() for item in objects.objects if item.start in proof.frame.escaping
+        ]
+        summary["assumptions"] = ["a14"]
+    return summary
 
 
 # --- the record, the image and its installation (checks 1, 3, 8, 9) -------------------
@@ -2166,6 +2496,7 @@ def measure_function_validation(
     spec: dict[str, Any],
     closure: Iterable[str],
     helper_library: HelperLibrary | None = None,
+    donor_type_server: bytes | None = None,
 ) -> FunctionValidationMeasure:
     """Checks 1-7 and 9 on a donor object and a declaration; the measured pins of check 8.
 
@@ -2173,6 +2504,9 @@ def measure_function_validation(
     procedure size and fill alignment (both checked against the donor).
     ``helper_library`` is the authenticated toolchain library the bodies of
     the compiler helpers the donor calls are read from (check 2).
+    ``donor_type_server`` is the PDB the donor's compile wrote its types to
+    (``/Zi``), which only the frame-objects pass reads (a14,
+    `frame_objects.object_type_records`).
     """
     label = "function-validation"
     donor = CoffObject(donor_bytes)
@@ -2240,7 +2574,9 @@ def measure_function_validation(
         donor_body[:proc], view, f"{label} donor flow", None, frozenset()
     )
 
-    def summary(model: ObjectModel | None, tag: str) -> dict[str, Any]:
+    def summary(
+        model: ObjectModel | None, tag: str, frame_objects: FrameObjects | None = None
+    ) -> dict[str, Any]:
         return _x87_case_proofs(
             items,
             successors,
@@ -2257,8 +2593,40 @@ def measure_function_validation(
                 private_frame=private_frame,
                 helpers=helpers,
                 objects=model,
+                frame_objects=frame_objects,
             ),
         )
+
+    def frame_objects_pass(earlier: ByteIdentityError) -> dict[str, Any]:
+        # Only when every earlier pass refuses because a stack address
+        # escapes, and only in an FPO frame: the frame-objects pass (a14),
+        # whose summary pins its escaping objects and the assumption.  A
+        # record made by an earlier pass never needs it.
+        frame = cast(FrameFacts, private_frame)
+        try:
+            frame_objects = donor_frame_objects(
+                donor,
+                dp,
+                donor_type_server,
+                base=frame.base,
+                params_end=frame.params_end,
+                context=label,
+            )
+        except ByteIdentityError as missing:
+            raise ByteIdentityError(
+                f"{earlier}; the frame-objects pass (a14) cannot run: {missing}"
+            ) from earlier
+        if not locals_block_first(
+            Program(donor_body[:proc], donor_targets, "D", label, helpers), frame.base
+        ):
+            raise ByteIdentityError(
+                f"{earlier}; the frame-objects pass (a14) cannot run: the donor does not allocate "
+                "its locals block first"
+            ) from earlier
+        return {
+            **summary(objects, " (frame-objects pass)", frame_objects=frame_objects),
+            "equivalences": True,
+        }
 
     # The first pass is the proof every record made before the equivalences
     # pass pins; only when it refuses does the second run, under a10 and the
@@ -2267,7 +2635,12 @@ def measure_function_validation(
     try:
         proof_summary_pin = summary(None, "")
     except ByteIdentityError:
-        proof_summary_pin = {**summary(objects, " (equivalences pass)"), "equivalences": True}
+        try:
+            proof_summary_pin = {**summary(objects, " (equivalences pass)"), "equivalences": True}
+        except ByteIdentityError as earlier:
+            if private_frame is None or not getattr(earlier, "escaped", False):
+                raise
+            proof_summary_pin = frame_objects_pass(earlier)
     image = code + bytes([MSVC50_FUNCTION_FILL_BYTE]) * (
         _padded_length(len(code), fill_alignment) - len(code)
     )
@@ -2310,11 +2683,14 @@ def produce_function_validation_candidate(
     donor_bytes: bytes,
     function: dict[str, Any],
     helper_library: HelperLibrary | None = None,
+    donor_type_server: bytes | None = None,
 ) -> tuple[bytes, dict[str, Any]]:
     """Produce the translation-validated replacement of a fresh donor body (checks 1-9).
 
     ``helper_library`` is the authenticated toolchain library, needed when
-    the donor calls a compiler helper.
+    the donor calls a compiler helper.  ``donor_type_server`` is the PDB the
+    donor's compile wrote, needed only by a record of the frame-objects pass
+    (a14).
     """
     label = "function-validation"
     seats = open_candidate_seats(seed_bytes, donor_bytes, function, FUNCTION_VALIDATION_RECIPE)
@@ -2322,7 +2698,7 @@ def produce_function_validation_candidate(
     pin_candidate_bodies(seats, function, FUNCTION_VALIDATION_RECIPE)
     require(set(spec) <= _SPEC_FIELDS, f"{label} declaration names an unknown field")
     measured = measure_function_validation(
-        donor_bytes, mangled, spec, seats.expected_closure, helper_library
+        donor_bytes, mangled, spec, seats.expected_closure, helper_library, donor_type_server
     )
     for key, value in measured.pins.items():
         require(
