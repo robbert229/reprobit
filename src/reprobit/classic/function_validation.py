@@ -582,6 +582,25 @@ class ObjectEscape(ByteIdentityError):
         self.starts = frozenset(starts)
 
 
+class UncarriedSlot(ByteIdentityError):
+    """A read of a private slot this version wrote, whose value the relation lost.
+
+    ``side`` is the reading version ("D" or "P") and ``offsets`` the bytes it
+    wrote.  ``causes`` (`validate_function`) are the (version, byte) pairs of
+    slots that a class holding those bytes also held, and that were unwritten
+    on another path into a join where the class was lost.  With partial slot
+    relations (`prove_function`'s ``partial_slots``) the proof runs again with
+    those bytes splitting the relation at every join (`FrameFacts.split`), so
+    the paths that wrote them are related apart from the paths that did not.
+    """
+
+    def __init__(self, message: str, side: str, offsets: Iterable[int]) -> None:
+        super().__init__(message)
+        self.side = side
+        self.offsets = frozenset(offsets)
+        self.causes: frozenset[tuple[str, int]] = frozenset()
+
+
 def frame_object_atom(item: FrameObject) -> Term:
     """The atom of a frame object's address: ESP0 + its start, in both versions (a14)."""
     return ("fobj", item.start, item.size)
@@ -739,6 +758,18 @@ class FrameFacts:
     # below E is a private slot.
     frame_objects: FrameObjects | None = None
     escaping: frozenset[int] = frozenset()
+    # Partial slot relations: the (version, byte) pairs whose writes split the
+    # relation at every join (`validate_function`).  A path end belongs to
+    # the variant named by which of these bytes it has written since the
+    # entry, and each variant is its own relation.
+    split: frozenset[tuple[str, int]] = frozenset()
+    # Whether partial slot relations run: then every byte's writes are
+    # tracked (``FrameModel.dirty``), the locals' in every pass.
+    partial: bool = False
+
+    def tracks(self, byte: int) -> bool:
+        """Whether ``FrameModel.dirty`` records writes to the byte at ESP0 + byte."""
+        return byte >= 0 or self.equivalences or self.partial
 
 
 _IMAGE_SCN_LNK_COMDAT = 0x1000
@@ -810,8 +841,11 @@ class FrameModel:
         dirty: Iterable[int] = (),
         context: str = "",
         cc_sites: dict[Term, str] | None = None,
+        side: str = "",
     ) -> None:
         self.facts = facts
+        # The version this frame belongs to ("D" or "P"), for `UncarriedSlot`.
+        self.side = side
         # The object model of a10 (`region_simulation.ObjectModel`) and
         # whether the proof runs its equivalences pass.
         self.objects = facts.objects
@@ -831,7 +865,9 @@ class FrameModel:
         self.block_floors: dict[Term, int] = {}
 
     def fork(self) -> FrameModel:
-        forked = FrameModel(self.facts, self.slots, self.dirty, self.context, self.cc_sites)
+        forked = FrameModel(
+            self.facts, self.slots, self.dirty, self.context, self.cc_sites, self.side
+        )
         forked.block_floors = dict(self.block_floors)
         return forked
 
@@ -1085,8 +1121,19 @@ class FrameModel:
         overlapping = sorted(self._overlapping(offset, width))
         if overlapping:
             return self._split_read(offset, width, overlapping)
+        written = sorted(self.dirty & set(range(offset, offset + width)))
+        if written and self.side:
+            # Written on a path to the join this run started from: partial
+            # slot relations may split the joins (`prove_function`).
+            raise UncarriedSlot(
+                f"{self.context}: a read of the stack slot ESP0{offset:+d} whose value the "
+                f"relation does not carry (this version wrote its bytes {written[0]:+d}.. on a "
+                "path that reaches here, and the relation keeps no value for it)",
+                self.side,
+                written,
+            )
         require(
-            offset >= 0 and not self.dirty & set(range(offset, offset + width)),
+            offset >= 0 and not written,
             f"{self.context}: a read of the stack slot ESP0{offset:+d} whose value the relation "
             "does not carry",
         )
@@ -1137,7 +1184,9 @@ class FrameModel:
         for key in self._overlapping(offset, width):
             del self.slots[key]
         self.slots[(offset, width)] = value
-        self.dirty |= {byte for byte in range(offset, offset + width) if byte >= 0}
+        # Every byte written since the entry: the parameter words always, and
+        # with partial slot relations the locals too (`FrameFacts.tracks`).
+        self.dirty |= {byte for byte in range(offset, offset + width) if self.facts.tracks(byte)}
         return True
 
     def _window(self, state: PathState, context: str) -> tuple[int, int]:
@@ -1721,7 +1770,7 @@ def entry_state(
             {name: lin_atom(("reg0", name)) for name in (*GENERAL_REGISTERS, "esp")},
             {name: ("flag0", name) for name in FLAG_NAMES},
         )
-        state.frame = FrameModel(frame, context=context)
+        state.frame = FrameModel(frame, context=context, side=side)
         state.fpu.origin = 0
         return state, ("depth", 0)
     terms: dict[Member, Term] = {}
@@ -1756,7 +1805,7 @@ def entry_state(
             _tag, offset, width = member[1]
             slots[(offset, width)] = terms[member]
     state = PathState(regs, flags, fpu=fpu, epoch=("mem@", key))
-    state.frame = FrameModel(frame, slots, facts.dirty, context)
+    state.frame = FrameModel(frame, slots, facts.dirty, context, side=side)
     return state, facts.x87
 
 
@@ -1971,6 +2020,46 @@ def _compare_pair(left: PathEnd, right: PathEnd, frame: FrameFacts, context: str
         raise ByteIdentityError(f"{error}{_undefined_bits_note(left, right)}") from error
 
 
+def _entry_values(value: Any) -> set[int]:
+    """The offsets of the stack slots whose entry values (a13) a term names."""
+    found: set[int] = set()
+    stack, seen = [value], set()
+    while stack:
+        current = stack.pop()
+        if isinstance(current, (tuple, list)) and id(current) not in seen:
+            seen.add(id(current))
+            if (
+                isinstance(current, tuple)
+                and len(current) == 3
+                and current[0] == "pld"
+                and isinstance(current[1], int)
+            ):
+                found.add(current[1])
+            else:
+                stack.extend(current)
+    return found
+
+
+def _entry_values_note(left: PathEnd, right: PathEnd) -> str:
+    """A refusal's note on a call that passes unwritten slots' entry values at other offsets."""
+    for number, (donor_event, image_event) in enumerate(
+        zip(left.state.events, right.state.events, strict=False), 1
+    ):
+        donor, image = _entry_values(donor_event), _entry_values(image_event)
+        if donor != image:
+            return (
+                f"; event {number} passes the entry values of stack slots never written since "
+                f"the entry (the donor's {_offsets(donor)}, the replacement's "
+                f"{_offsets(image)}): an unwritten slot holds whatever the stack held, so it "
+                "equals only the other version's slot at the same offset"
+            )
+    return ""
+
+
+def _offsets(found: set[int]) -> str:
+    return ", ".join(f"ESP0{offset:+d}" for offset in sorted(found)) or "none"
+
+
 def _compare_paths(left: PathEnd, right: PathEnd, frame: FrameFacts, context: str) -> None:
     where = f"{context} (the donor's path to {left.at}, the replacement's to {right.at})"
     if left.state.events != right.state.events:
@@ -1978,6 +2067,7 @@ def _compare_paths(left: PathEnd, right: PathEnd, frame: FrameFacts, context: st
         raise ByteIdentityError(
             f"{where}: the two versions make different calls"
             + (" or block string moves" if blocks else "")
+            + _entry_values_note(left, right)
         )
     returning = left.kind == "ret"
     require(
@@ -2031,6 +2121,31 @@ class ValidationProof:
     path_counts: tuple[int, int]
     path_pairs: int
     returns: int
+    # Every relation the fixpoint settled, by cut pair and variant
+    # (`variant_of`); ``relations`` holds those of the unsplit variant.
+    variants: dict[tuple[tuple[int, int], Variant], Relation] = field(default_factory=dict)
+
+
+# Which bytes of the split (`FrameFacts.split`) a path end has written since
+# the entry: the donor's, then the replacement's.
+Variant = tuple[frozenset[int], frozenset[int]]
+UNSPLIT: Variant = (frozenset(), frozenset())
+MAX_VARIANTS = 16
+
+
+def variant_of(frame: FrameFacts, left: SideFacts, right: SideFacts) -> Variant:
+    """The variant of the relation a pair of path ends reaches a join in.
+
+    The written bytes are exact facts of each path (``SideFacts.dirty``: a
+    byte outside it is not written since the entry), so every pair of paths
+    lies in exactly one variant, and each variant is a relation of its own.
+    """
+    if not frame.split:
+        return UNSPLIT
+    return (
+        frozenset(byte for byte in left.dirty if ("D", byte) in frame.split),
+        frozenset(byte for byte in right.dirty if ("P", byte) in frame.split),
+    )
 
 
 def validate_function(
@@ -2043,16 +2158,76 @@ def validate_function(
     """Checks 4-6: pair the cut points, settle the relations, prove every path pair.
 
     Each program carries its verified helper bodies (``Program.helpers``).
+    With a split frame (`FrameFacts.split`) each cut pair holds one relation
+    per variant (`variant_of`).  A refusal to read a slot whose class a join
+    lost (`UncarriedSlot`) names the slots whose missing writes lost it.
     """
-    relations: dict[tuple[int, int], Relation | None] = {(0, 0): None}
+    # For each (version, byte) of a slot whose class a join lost: the slots
+    # that class held which were unwritten on another path into the join.
+    losses: dict[tuple[str, int], set[tuple[str, int]]] = {}
+    try:
+        return _settle(donor, image, frame, x87_returns, context, losses)
+    except UncarriedSlot as uncarried:
+        uncarried.causes = frozenset(
+            cause for byte in uncarried.offsets for cause in losses.get((uncarried.side, byte), ())
+        )
+        raise
+
+
+def _record_losses(
+    frame: FrameFacts,
+    old: Relation,
+    established: Relation,
+    new: Relation,
+    losses: dict[tuple[str, int], set[tuple[str, int]]],
+) -> None:
+    """Note the slots a meet lost a class over because another path left them unwritten.
+
+    A class of one relation that no class of the meet keeps whole lost a
+    member.  Each of its slots whose bytes the other relation's paths have not
+    written (some byte outside that side's ``dirty``) is a cause: splitting
+    the joins on those bytes keeps the paths that wrote them apart.  Only the
+    bytes ``dirty`` tracks count (`FrameFacts.tracks`).
+    """
+    kept = {member: cls.members for cls in new.classes for member in cls.members}
+    for relation, other in ((old, established), (established, old)):
+        for cls in relation.classes:
+            if any(not cls.members <= kept.get(member, frozenset()) for member in cls.members):
+                causes = {
+                    (side, byte)
+                    for side, location in cls.members
+                    if location[0] == "m"
+                    for byte in range(location[1], location[1] + location[2])
+                    if frame.tracks(byte) and byte not in other.side(side).dirty
+                }
+                if not causes:
+                    continue
+                for side, location in cls.members:
+                    if location[0] == "m":
+                        for byte in range(location[1], location[1] + location[2]):
+                            losses.setdefault((side, byte), set()).update(causes)
+
+
+def _settle(
+    donor: Program,
+    image: Program,
+    frame: FrameFacts,
+    x87_returns: Mapping[str, int],
+    context: str,
+    losses: dict[tuple[str, int], set[tuple[str, int]]],
+) -> ValidationProof:
+    """The fixpoint and the final pass of `validate_function`."""
+    Key = tuple[tuple[int, int], Variant]
+    relations: dict[Key, Relation | None] = {((0, 0), UNSPLIT): None}
     pair_of_donor = {0: 0}
     pair_of_image = {0: 0}
-    queue = [(0, 0)]
-    visits: Counter[tuple[int, int]] = Counter()
+    queue: list[Key] = [((0, 0), UNSPLIT)]
+    visits: Counter[Key] = Counter()
 
-    def run(key: tuple[int, int]) -> list[tuple[PathEnd, PathEnd]]:
-        relation = relations[key]
-        here = f"{context} from ({key[0]}, {key[1]})"
+    def run(node: Key) -> list[tuple[PathEnd, PathEnd]]:
+        key, variant = node
+        relation = relations[node]
+        here = f"{context} from ({key[0]}, {key[1]})" + _variant_note(variant)
         ends = []
         for program, start in ((donor, key[0]), (image, key[1])):
             state, depth = entry_state(program.side, key, relation, frame, f"{here} {program.side}")
@@ -2085,40 +2260,45 @@ def validate_function(
         return (x, y)
 
     while queue:
-        key = queue.pop(0)
-        visits[key] += 1
+        node = queue.pop(0)
+        visits[node] += 1
         require(
-            visits[key] <= MAX_VISITS,
-            f"{context}: the relation at ({key[0]}, {key[1]}) does not settle",
+            visits[node] <= MAX_VISITS,
+            f"{context}: the relation at ({node[0][0]}, {node[0][1]}) does not settle",
         )
-        for left, right in run(key):
+        for left, right in run(node):
             if left.kind == "ret":
                 continue
-            target = pair(left, right, f"{context} from ({key[0]}, {key[1]})")
-            established = establish(
-                left.locations,
-                right.locations,
-                cast(SideFacts, left.facts),
-                cast(SideFacts, right.facts),
-            )
-            old = relations.get(target)
+            target = pair(left, right, f"{context} from ({node[0][0]}, {node[0][1]})")
+            require(target != (0, 0), f"{context}: a branch targets the function's entry")
+            left_facts, right_facts = cast(SideFacts, left.facts), cast(SideFacts, right.facts)
+            established = establish(left.locations, right.locations, left_facts, right_facts)
+            reached = (target, variant_of(frame, left_facts, right_facts))
+            old = relations.get(reached)
             new = (
                 established
-                if target not in relations
+                if reached not in relations
                 else meet(cast(Relation, old), established, f"{context} at {target}")
             )
-            require(target != (0, 0), f"{context}: a branch targets the function's entry")
-            if target not in relations or new != old:
-                relations[target] = new
-                if target not in queue:
-                    queue.append(target)
+            if old is not None:
+                _record_losses(frame, old, established, new, losses)
+            if reached not in relations:
+                require(
+                    sum(1 for item in relations if item[0] == target) < MAX_VARIANTS,
+                    f"{context}: the relation at {target} splits into more than {MAX_VARIANTS} "
+                    "variants, so which paths write its split slots is not decided",
+                )
+            if reached not in relations or new != old:
+                relations[reached] = new
+                if reached not in queue:
+                    queue.append(reached)
     # The final pass under the settled relations.
     path_pairs = 0
     returns = 0
     donor_paths = 0
     image_paths = 0
-    for key in sorted(relations):
-        consistent = run(key)
+    for node in sorted(relations, key=_node_order):
+        consistent = run(node)
         donor_paths += len({id(left) for left, _right in consistent})
         image_paths += len({id(right) for _left, right in consistent})
         for left, right in consistent:
@@ -2131,17 +2311,19 @@ def validate_function(
                 pair_of_donor.get(left.at) == right.at,
                 f"{context}: the final pass reaches an unpaired cut point",
             )
-            established = establish(
-                left.locations,
-                right.locations,
-                cast(SideFacts, left.facts),
-                cast(SideFacts, right.facts),
+            left_facts, right_facts = cast(SideFacts, left.facts), cast(SideFacts, right.facts)
+            established = establish(left.locations, right.locations, left_facts, right_facts)
+            reached = (target, variant_of(frame, left_facts, right_facts))
+            require(
+                reached in relations,
+                f"{context}: the final pass reaches a variant of the relation at {target} the "
+                "fixpoint did not settle",
             )
-            why = implies(established, cast(Relation, relations[target]))
+            why = implies(established, cast(Relation, relations[reached]))
             require(
                 why is None,
-                f"{context}: the path pair from ({key[0]}, {key[1]}) to {target} breaks the "
-                f"relation there: {why}",
+                f"{context}: the path pair from ({node[0][0]}, {node[0][1]}) to {target} breaks "
+                f"the relation there: {why}",
             )
     for program in (donor, image):
         consumed: set[int] = set()
@@ -2155,10 +2337,45 @@ def validate_function(
     return ValidationProof(
         frame,
         dict(sorted(pair_of_donor.items())),
-        {key: value for key, value in relations.items() if value is not None},
+        {
+            key: value
+            for (key, variant), value in relations.items()
+            if value is not None and variant == UNSPLIT
+        },
         (donor_paths, image_paths),
         path_pairs,
         returns,
+        {node: value for node, value in relations.items() if value is not None},
+    )
+
+
+def _node_order(node: tuple[tuple[int, int], Variant]) -> tuple[Any, ...]:
+    key, (donor_bytes, image_bytes) = node
+    return (key, sorted(donor_bytes), sorted(image_bytes))
+
+
+def _variant_note(variant: Variant) -> str:
+    """A run's context: the variant of its relation, when the relation is split."""
+    if variant == UNSPLIT:
+        return ""
+    parts = [
+        f"the {name} has written {_byte_ranges(written)}"
+        for name, written in (("donor", variant[0]), ("replacement", variant[1]))
+        if written
+    ]
+    return f" [the variant where {' and '.join(parts) or 'no split byte is written'}]"
+
+
+def _byte_ranges(offsets: Iterable[int]) -> str:
+    """Stack bytes as ESP0 ranges: ``ESP0-8..-5``."""
+    ranges: list[list[int]] = []
+    for offset in sorted(offsets):
+        if ranges and ranges[-1][1] == offset - 1:
+            ranges[-1][1] = offset
+        else:
+            ranges.append([offset, offset])
+    return ", ".join(
+        f"ESP0{start:+d}" if start == end else f"ESP0{start:+d}..{end:+d}" for start, end in ranges
     )
 
 
@@ -2216,6 +2433,7 @@ def prove_function(
     helpers: Mapping[str, HelperCode] | None = None,
     objects: ObjectModel | None = None,
     frame_objects: FrameObjects | None = None,
+    partial_slots: bool = False,
 ) -> ValidationProof:
     """Checks 2 and 4-7: a private frame when one is given and no stack address escapes.
 
@@ -2231,6 +2449,11 @@ def prove_function(
     runs again with each object whose address a run finds escaping
     (`ObjectEscape`), until a run needs no more; there is no shared-frame
     fallback.
+    ``partial_slots`` relates a private slot at a join only on the paths
+    that wrote it: when a run reads a slot it wrote on only some paths to the
+    join it started from (`UncarriedSlot`), the run is repeated with those
+    bytes splitting every join (`FrameFacts.split`), until a run needs no
+    more.  Without it that read is refused.
     """
 
     def programs() -> tuple[Program, Program]:
@@ -2240,6 +2463,41 @@ def prove_function(
         )
 
     donor, image = programs()
+
+    def validate(facts: FrameFacts, note: str) -> ValidationProof:
+        # The private frame, split wherever a run reads a slot written on only
+        # some paths (partial slot relations); each run starts afresh.
+        nonlocal donor, image
+        split: frozenset[tuple[str, int]] = frozenset()
+        while True:
+            try:
+                return validate_function(
+                    donor,
+                    image,
+                    replace(facts, split=split, partial=partial_slots),
+                    x87_returns,
+                    f"{context}{note}",
+                )
+            except UncarriedSlot as uncarried:
+                if not partial_slots:
+                    raise
+                grown = split | uncarried.causes
+                require(
+                    grown != split,
+                    f"{uncarried}; partial slot relations do not carry it: "
+                    + (
+                        "every slot whose missing write on a path into a join lost its class "
+                        "already splits the joins, so the paths that wrote it leave values "
+                        "the relation does not keep"
+                        if uncarried.causes
+                        else "no path into a join that lost its class left one of the class's "
+                        "slots unwritten, so the paths that wrote it leave values the relation "
+                        "does not keep"
+                    ),
+                )
+                split = grown
+                donor, image = programs()
+
     params_end = 4 if private_frame is None else private_frame.params_end
     equivalences = objects is not None
     if objects is not None:
@@ -2266,9 +2524,7 @@ def prove_function(
         for _ in range(len(frame_objects.objects) + 1):
             facts = replace(frame, frame_objects=frame_objects, escaping=escaping)
             try:
-                return validate_function(
-                    donor, image, facts, x87_returns, f"{context} (frame objects)"
-                )
+                return validate(facts, " (frame objects)")
             except ObjectEscape as escape:
                 grown = escaping | escape.starts
                 require(grown != escaping, f"{context}: {escape}, and it already escapes")
@@ -2278,9 +2534,7 @@ def prove_function(
     escaped = False
     if private_frame is not None and locals_block_first(donor, private_frame.base):
         try:
-            return validate_function(
-                donor, image, private_frame, x87_returns, f"{context} (private frame)"
-            )
+            return validate(private_frame, " (private frame)")
         except EscapeRefusal:
             donor, image = programs()
             escaped = True
@@ -2358,9 +2612,14 @@ def proof_summary(proof: ValidationProof) -> dict[str, Any]:
         "path_pairs": proof.path_pairs,
         "returning_pairs": proof.returns,
         "related_locations": sum(
-            len(cls.members) for relation in proof.relations.values() for cls in relation.classes
+            len(cls.members) for relation in proof.variants.values() for cls in relation.classes
         ),
     }
+    if proof.frame.split:
+        # Only a proof that split its joins pins the split bytes and its
+        # variants, so earlier records keep their pins.
+        summary["partial_slots"] = [[side, offset] for side, offset in sorted(proof.frame.split)]
+        summary["relation_variants"] = len(proof.variants)
     objects = proof.frame.frame_objects
     if objects is not None:
         # Only a frame-objects proof pins its escaping objects and a14.
@@ -2574,28 +2833,35 @@ def measure_function_validation(
         donor_body[:proc], view, f"{label} donor flow", None, frozenset()
     )
 
+    # Whether partial slot relations run, and whether a run without them
+    # refused a slot written on only some paths (`UncarriedSlot`).
+    partial = {"on": False, "needed": False}
+
     def summary(
         model: ObjectModel | None, tag: str, frame_objects: FrameObjects | None = None
     ) -> dict[str, Any]:
-        return _x87_case_proofs(
-            items,
-            successors,
-            entries,
-            donor_body[:proc],
-            view,
-            lambda counts, note: prove_function(
-                donor_body[:proc],
-                donor_targets,
-                code,
-                image_targets,
-                counts,
-                f"{label} proof{tag}{note}",
-                private_frame=private_frame,
-                helpers=helpers,
-                objects=model,
-                frame_objects=frame_objects,
-            ),
-        )
+        tag += " (partial slots)" if partial["on"] else ""
+
+        def prove_case(counts: Mapping[str, int], note: str) -> ValidationProof:
+            try:
+                return prove_function(
+                    donor_body[:proc],
+                    donor_targets,
+                    code,
+                    image_targets,
+                    counts,
+                    f"{label} proof{tag}{note}",
+                    private_frame=private_frame,
+                    helpers=helpers,
+                    objects=model,
+                    frame_objects=frame_objects,
+                    partial_slots=partial["on"],
+                )
+            except UncarriedSlot:
+                partial["needed"] = True
+                raise
+
+        return _x87_case_proofs(items, successors, entries, donor_body[:proc], view, prove_case)
 
     def frame_objects_pass(earlier: ByteIdentityError) -> dict[str, Any]:
         # Only when every earlier pass refuses because a stack address
@@ -2632,15 +2898,28 @@ def measure_function_validation(
     # pass pins; only when it refuses does the second run, under a10 and the
     # normal forms of `region_simulation._equivalences`, and its summary
     # then says so.  Each pass is sound alone.
-    try:
-        proof_summary_pin = summary(None, "")
-    except ByteIdentityError:
+    def passes() -> dict[str, Any]:
         try:
-            proof_summary_pin = {**summary(objects, " (equivalences pass)"), "equivalences": True}
-        except ByteIdentityError as earlier:
-            if private_frame is None or not getattr(earlier, "escaped", False):
-                raise
-            proof_summary_pin = frame_objects_pass(earlier)
+            return summary(None, "")
+        except ByteIdentityError:
+            try:
+                return {**summary(objects, " (equivalences pass)"), "equivalences": True}
+            except ByteIdentityError as earlier:
+                if private_frame is None or not getattr(earlier, "escaped", False):
+                    raise
+                return frame_objects_pass(earlier)
+
+    try:
+        proof_summary_pin = passes()
+    except ByteIdentityError:
+        # Only when every pass refuses, and some run refused a private slot
+        # written on only some paths to a join: every pass again, with
+        # partial slot relations.  A record made without them never needs
+        # them, and one that does pins its split bytes (`proof_summary`).
+        if not partial["needed"]:
+            raise
+        partial["on"] = True
+        proof_summary_pin = passes()
     image = code + bytes([MSVC50_FUNCTION_FILL_BYTE]) * (
         _padded_length(len(code), fill_alignment) - len(code)
     )
