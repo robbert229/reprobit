@@ -427,6 +427,8 @@ def test_msvc50_code_end_stops_before_two_switch_tables() -> None:
     # A foreign relocation after the first table means it is not a table tail.
     foreign = [*rows, {"offset": second + 4, "width": 2, "target_section": 9}]
     assert msvc50_code_end(body, foreign, 3, second + 6) == second + 6
+
+
 # A struct local's field store that the reference makes after the call's
 # argument pushes, its ESP displacement rebased by the pushes it crosses.
 # push esi; push edi | mov [esp+0x1c], edi; lea edx, [esp+0x1c]; <push>; push edx |
