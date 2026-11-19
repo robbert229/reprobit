@@ -35,7 +35,10 @@ interval of its form over the narrowed domains, an over-approximation.  The
 analysis fails (returns None) when a domain empties.  A C callee whose
 domain narrows to one value has that return count
 (:func:`x87_stack_solution`); the region simulator uses it to run x87 code
-after a direct call to that callee inside a region.
+after a direct call to that callee inside a region.  A whole-function proof
+also splits on the counts left open: :func:`x87_return_cases` lists every
+assignment of them that propagation does not refute, and the proof must hold
+in each.
 
 Assumption (MSVC 5.0's x87 discipline).  The donor is compiled code: its
 depth at a point is one number on every path that reaches it (the
@@ -50,6 +53,8 @@ that the donor is consistent with them.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
+from itertools import product
 from typing import Any
 
 from reprobit.binary import require
@@ -241,6 +246,91 @@ def x87_stack_solution(
     Under assumption x1 (the module docstring) the number is the callee's:
     bounds propagation removes only values no consistent assignment has.
     """
+    system = _x87_system(items, successors, entries, code, relocations)
+    if not _propagate(system.constraints, system.domains):
+        return None
+    return system.depths(), system.returns()
+
+
+# Above this many undetermined callees no case split is made (2**4 proofs).
+MAX_RETURN_CASE_SYMBOLS = 4
+
+
+def x87_return_cases(
+    items: list[dict[str, Any]],
+    successors: list[list[int]],
+    entries: list[int],
+    code: bytes,
+    relocations: Mapping[int, Any],
+    limit: int = MAX_RETURN_CASE_SYMBOLS,
+) -> list[dict[str, int]] | None:
+    """Every consistent assignment of the callees' x87 return counts, or None.
+
+    :func:`x87_stack_solution` names the counts the donor's discipline
+    fixes.  A callee it leaves undetermined still leaves one fixed count
+    (x1), so the true assignment is one of the products of the narrowed
+    domains.  Each case fixes every undetermined C callee (an import slot
+    included: its symbol is its own variable, as for the solver) to one of
+    its values and propagates again; a case whose propagation empties a
+    domain has no consistent assignment and is dropped -- propagation
+    removes only values no consistent assignment has, so the true
+    assignment is never dropped.  Each case's map is every count it then
+    determines.  A proof that holds in every case holds for the true one.
+
+    None when the donor is inconsistent; ``[solution]`` alone when nothing
+    is undetermined; and also ``[solution]`` when more than ``limit`` callees
+    are undetermined (the caller then treats them as unknown, as before).
+    """
+    system = _x87_system(items, successors, entries, code, relocations)
+    if not _propagate(system.constraints, system.domains):
+        return None
+    open_symbols = sorted(
+        symbol
+        for symbol, index in system.symbol_variable.items()
+        if not _is_helper(symbol) and len(system.domains[index]) > 1
+    )
+    if not open_symbols or len(open_symbols) > limit:
+        return [system.returns()]
+    cases: list[dict[str, int]] = []
+    for values in product(
+        *(sorted(system.domains[system.symbol_variable[s]]) for s in open_symbols)
+    ):
+        domains = [set(domain) for domain in system.domains]
+        for symbol, value in zip(open_symbols, values, strict=True):
+            domains[system.symbol_variable[symbol]] = {value}
+        if _propagate(system.constraints, domains):
+            cases.append(system.returns(domains))
+    return cases
+
+
+@dataclass
+class _X87System:
+    """The donor's depth forms, constraints and unknowns (see the module docstring)."""
+
+    forms: list[Form | None]
+    constraints: list[tuple[str, Form]]
+    domains: list[set[int]]
+    symbol_variable: dict[str, int]
+
+    def depths(self) -> list[tuple[int, int] | None]:
+        return [None if form is None else _bounds(form, self.domains) for form in self.forms]
+
+    def returns(self, domains: list[set[int]] | None = None) -> dict[str, int]:
+        chosen = self.domains if domains is None else domains
+        return {
+            symbol: next(iter(chosen[index]))
+            for symbol, index in self.symbol_variable.items()
+            if not _is_helper(symbol) and len(chosen[index]) == 1
+        }
+
+
+def _x87_system(
+    items: list[dict[str, Any]],
+    successors: list[list[int]],
+    entries: list[int],
+    code: bytes,
+    relocations: Mapping[int, Any],
+) -> _X87System:
     domains: list[set[int]] = []
     symbol_variable: dict[str, int] = {}
     forms: list[Form | None] = [None] * len(items)
@@ -312,7 +402,11 @@ def x87_stack_solution(
                     pending.append(successor)
                 elif known != after:
                     constrain("eq", _sub(known, after))
-    # Bounds propagation to a fixpoint.
+    return _X87System(forms, constraints, domains, symbol_variable)
+
+
+def _propagate(constraints: list[tuple[str, Form]], domains: list[set[int]]) -> bool:
+    """Bounds propagation to a fixpoint, narrowing ``domains`` in place; False when one empties."""
     changed = True
     while changed:
         changed = False
@@ -331,18 +425,12 @@ def x87_stack_solution(
                 }
                 if keep != domains[variable_index]:
                     if not keep:
-                        return None
+                        return False
                     domains[variable_index] = keep
                     changed = True
             if not form[1] and ((kind == "eq" and form[0] != 0) or (kind == "ge" and form[0] < 0)):
-                return None
-    depths = [None if form is None else _bounds(form, domains) for form in forms]
-    returns = {
-        symbol: next(iter(domains[index]))
-        for symbol, index in symbol_variable.items()
-        if not _is_helper(symbol) and len(domains[index]) == 1
-    }
-    return depths, returns
+                return False
+    return True
 
 
 def _condition_effect(
@@ -440,6 +528,7 @@ __all__ = [
     "require_x87_depth",
     "x87_condition_liveness",
     "x87_environment_exposures",
+    "x87_return_cases",
     "x87_stack_depths",
     "x87_stack_effect",
     "x87_stack_solution",
