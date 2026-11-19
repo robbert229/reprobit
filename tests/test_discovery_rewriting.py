@@ -427,3 +427,184 @@ def test_msvc50_code_end_stops_before_two_switch_tables() -> None:
     # A foreign relocation after the first table means it is not a table tail.
     foreign = [*rows, {"offset": second + 4, "width": 2, "target_section": 9}]
     assert msvc50_code_end(body, foreign, 3, second + 6) == second + 6
+
+
+# A struct local's field store that the reference makes after the call's
+# argument pushes, its ESP displacement rebased by the pushes it crosses.
+# push esi; push edi | mov [esp+0x1c], edi; lea edx, [esp+0x1c]; <push>; push edx |
+# add esp, 8; pop edi; pop esi; ret
+def _store_across(push: str, rebased: int) -> tuple[bytes, bytes]:
+    donor = bytes.fromhex(f"5657897c241c8d54241c{push}5283c4085f5ec3")
+    target = bytes.fromhex(f"56578d54241c{push}52897c24{rebased:02x}83c4085f5ec3")
+    return donor, target
+
+
+def _coff(body: bytes) -> bytes:
+    from test_classic_instruction_schedule_full import codeview_stream
+
+    return make_coff(
+        body=body,
+        debug_stream=codeview_stream(size=len(body), debug_end=len(body) - 3),
+        line_rows=((0, 11),),
+    )
+
+
+def _author(donor_body: bytes, target_body: bytes):
+    seed = _coff(donor_body)
+    return build_donor_schedule_rewriting(
+        donor=_donor(),
+        target_id="program",
+        translation_unit_id=UNIT,
+        build_target="program",
+        symbol=TARGET_SYMBOL,
+        seed_object=seed,
+        donor_object=seed,
+        reference_object=_coff(target_body),
+    )
+
+
+def test_a_store_moved_across_register_pushes_is_rebased() -> None:
+    donor, target = _store_across("56", 0x24)  # push esi
+    assert derive_schedule_windows(donor, target, _spans(donor), frozenset()) == [
+        {
+            "start": 2,
+            "end": 12,
+            "source_instruction_lengths": [4, 4, 1, 1],
+            "target_order": [1, 2, 3, 0],
+        }
+    ]
+    authored = _author(donor, target)
+    window = authored.function.intervention.parameters[0].value["windows"][0]
+    assert window["stack_adjustments"] == [[0, 5, 0x1C, 0x24]]
+    assert "stack_frontier_theorem" not in window
+    composed = CoffObject(authored.candidate_object)
+    assert bytes(coff_body(composed, composed.function_section(TARGET_SYMBOL))) == target
+
+
+@pytest.mark.parametrize("push", ["6a01", "6878563412"])  # push 1; push 0x12345678
+def test_a_store_moved_across_an_immediate_push_declares_its_theorem(push: str) -> None:
+    from reprobit.classic.rewriting_certificates import validate_donor_rewriting
+    from reprobit.classic.scheduling_dependence import IA32_SCHEDULE_IMMEDIATE_PUSH_THEOREM
+    from reprobit.classic_donors import merge_candidate_constraints
+
+    donor, target = _store_across(push, 0x24)
+    authored = _author(donor, target)
+    window = authored.function.intervention.parameters[0].value["windows"][0]
+    assert window["target_order"] == [1, 2, 3, 0]
+    assert window["stack_adjustments"] == [[0, 5, 0x1C, 0x24]]
+    assert window["stack_frontier_theorem"] == IA32_SCHEDULE_IMMEDIATE_PUSH_THEOREM
+    composed = CoffObject(authored.candidate_object)
+    assert bytes(coff_body(composed, composed.function_section(TARGET_SYMBOL))) == target
+    # The certificate checker accepts the materialized declaration as it stands ...
+    constraints = merge_candidate_constraints(
+        authored.function.intervention, authored.function.receipt
+    ).materialize()
+    declaration = {
+        **constraints["donor_rewriting"],
+        "authenticity_rationale": "test fixture: a struct store scheduled after its call's pushes",
+    }
+    checked = validate_donor_rewriting(declaration, "t", len(donor))
+    assert checked["windows"][0]["stack_frontier_theorem"] == IA32_SCHEDULE_IMMEDIATE_PUSH_THEOREM
+    # ... and refuses the marker without the stack adjustment it exists for.
+    from reprobit.binary import ByteIdentityError
+
+    stripped = {
+        **declaration,
+        "windows": [
+            {
+                key: value
+                for key, value in declaration["windows"][0].items()
+                if key != "stack_adjustments"
+            }
+        ],
+    }
+    with pytest.raises(ByteIdentityError, match="immediate-push theorem declares no stack"):
+        validate_donor_rewriting(stripped, "t", len(donor))
+
+
+def test_the_immediate_push_marker_is_what_admits_the_rebase() -> None:
+    from reprobit.binary import ByteIdentityError
+    from reprobit.classic.register_semantics import decode_ia32_bijection_instruction
+    from reprobit.classic.scheduling_apply import apply_instruction_schedule
+
+    donor, target = _store_across("6a01", 0x24)
+    window = derive_schedule_windows(donor, target, _spans(donor), frozenset())[0]
+    inside = [decode_ia32_bijection_instruction(donor, offset, "t") for offset in (2, 6, 10, 12)]
+    assert inside[2]["opcode"] == 0x6A
+    # Without the marker the immediate PUSH is no stack update: the store's
+    # rebase is only the register PUSH's, and its ESP edge to `push 1` stays.
+    unmarked = {
+        **window,
+        "stack_adjustments": [[0, 5, 0x1C, 0x20]],
+        "expected_dependence_edges": [],
+        "expected_line_rows": [],
+    }
+    with pytest.raises(ByteIdentityError, match="dependence DAG"):
+        apply_instruction_schedule(donor, [unmarked], frozenset(), "t")
+
+
+def test_a_rebase_that_would_overflow_its_disp8_reaches_no_window() -> None:
+    # mov [esp+0x7c], edi; push esi; push edi -- 0x7c + 8 has no disp8 spelling.
+    donor = bytes.fromhex("897c247c5657c3")
+    target = bytes.fromhex("5657897c2484c3")
+    with pytest.raises(DiscoveryAuthoringError, match="no reorder window"):
+        derive_schedule_windows(donor, target, _spans(donor), frozenset())
+    # 0x74 + 8 still fits, and the same shape is one window.
+    donor = bytes.fromhex("897c24745657c3")
+    target = bytes.fromhex("5657897c247cc3")
+    assert derive_schedule_windows(donor, target, _spans(donor), frozenset())[0][
+        "target_order"
+    ] == [1, 2, 0]
+
+
+def test_an_esp_read_of_the_pushed_value_is_never_moved_above_the_push() -> None:
+    # push 1; mov eax, [esp+0] reads the pushed 1.  Above the push the rebased
+    # [esp-4] names the same address, but the value there is not yet written.
+    donor = bytes.fromhex("56576a018b44240083c4045f5ec3")
+    target = bytes.fromhex("56578b4424fc6a0183c4045f5ec3")
+    with pytest.raises(DiscoveryAuthoringError, match="dependence DAG forbids"):
+        _author(donor, target)
+
+
+def test_another_esp_writer_in_an_immediate_push_window_is_refused() -> None:
+    # mov [esp+0x1c], edi; push 1; add esp, 4: the add is an ESP update the
+    # immediate-push theorem does not count, so the derived +4 rebase is wrong.
+    donor = bytes.fromhex("5657897c241c6a0183c4045f5ec3")
+    target = bytes.fromhex("56576a0183c404897c24205f5ec3")
+    with pytest.raises(DiscoveryAuthoringError, match="changes ESP inside an immediate-push"):
+        _author(donor, target)
+
+
+def test_a_relocated_push_immediate_is_an_address_the_theorem_refuses() -> None:
+    from reprobit.binary import ByteIdentityError
+    from reprobit.classic.register_semantics import decode_ia32_bijection_instruction
+    from reprobit.classic.scheduling_dependence import (
+        IA32_SCHEDULE_IMMEDIATE_PUSH_THEOREM,
+        ScheduleTheoremContext,
+        _ia32_schedule_immediate_push_projection,
+        ia32_schedule_dependence_edges,
+        ia32_schedule_stack_adjustments,
+    )
+
+    # mov [esp+0x1c], edi; push imm32 -> push imm32; mov [esp+0x20], edi
+    body = bytes.fromhex("897c241c6878563412c3")
+    inside = [decode_ia32_bijection_instruction(body, offset, "t") for offset in (0, 4)]
+    stack = ia32_schedule_stack_adjustments(body, inside, [1, 0], "t", immediate_push=True)
+    assert stack == [[0, 3, 0x1C, 0x20]]
+    facts, edges = ia32_schedule_dependence_edges(inside, "t", body, True, immediate_push=True)
+    assert edges == []
+    context = ScheduleTheoremContext(
+        instructions=inside,
+        facts=facts,
+        strict_edges=edges,
+        order=[1, 0],
+        theorem=IA32_SCHEDULE_IMMEDIATE_PUSH_THEOREM,
+        body=body,
+        compiler_identity=None,
+    )
+    _edges, receipt = _ia32_schedule_immediate_push_projection(context, stack, frozenset(), "t")
+    assert receipt["immediate_pushes"] == [
+        {"instruction": 1, "offset": 4, "opcode": 0x68, "length": 5}
+    ]
+    with pytest.raises(ByteIdentityError, match="relocated"):
+        _ia32_schedule_immediate_push_projection(context, stack, frozenset({5}), "t")

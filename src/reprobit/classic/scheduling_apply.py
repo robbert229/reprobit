@@ -20,10 +20,13 @@ from .register_semantics import (
     decode_ia32_bijection_instruction,
 )
 from .scheduling_dependence import (
+    _IA32_SCHEDULE_COMPILER_SCOPED_THEOREMS,
     _IA32_SCHEDULE_STACK_FRONTIER_THEOREMS,
+    IA32_SCHEDULE_IMMEDIATE_PUSH_THEOREM,
     IA32_SCHEDULE_PRIVATE_STACK_OBJECT_THEOREM,
     IA32_SCHEDULE_STACK_FRONTIER_THEOREM,
     ScheduleTheoremContext,
+    _ia32_schedule_immediate_push_projection,
     _ia32_schedule_private_stack_object_projection,
     _ia32_schedule_stack_frontier_projection,
     ia32_esp_relative_displacement,
@@ -193,6 +196,7 @@ def apply_instruction_schedule(
             ),
             f"{context}: stack_frontier_theorem differs from the supported exact marker",
         )
+    if any(marker in _IA32_SCHEDULE_COMPILER_SCOPED_THEOREMS for marker in frontier_markers):
         require(
             type(compiler_identity) is Msvc420CompilerIdentity
             and compiler_identity.target == MSVC420_WIN32_I386_TARGET,
@@ -319,12 +323,14 @@ def apply_instruction_schedule(
         stack_frontier_theorem = window.get("stack_frontier_theorem")
         order = list(window["target_order"])
         private_stack_object = stack_frontier_theorem == IA32_SCHEDULE_PRIVATE_STACK_OBJECT_THEOREM
+        immediate_push = stack_frontier_theorem == IA32_SCHEDULE_IMMEDIATE_PUSH_THEOREM
         window_stack = ia32_schedule_stack_adjustments(
             body,
             inside,
             order,
             window_context,
             private_stack_object=private_stack_object,
+            immediate_push=immediate_push,
         )
         stack_scope = bool(window_stack) or private_stack_object
         facts, strict_edges = ia32_schedule_dependence_edges(
@@ -333,6 +339,7 @@ def apply_instruction_schedule(
             body,
             stack_scope,
             private_stack_object=private_stack_object,
+            immediate_push=immediate_push,
             # Standard v1 is the original VC 4.20 compiler-output theorem:
             # every direct ESP-base operand is expressed in the canonical
             # window-entry stack space.  A pair that actually crosses a PUSH
@@ -370,6 +377,15 @@ def apply_instruction_schedule(
             if stack_frontier_theorem == IA32_SCHEDULE_STACK_FRONTIER_THEOREM:
                 edges, stack_frontier = _ia32_schedule_stack_frontier_projection(
                     theorem_context, declared_stack is not None, window_context
+                )
+            elif immediate_push:
+                edges, stack_frontier = _ia32_schedule_immediate_push_projection(
+                    theorem_context,
+                    window_stack,
+                    frozenset(
+                        offset for offset in range(start, end) if offset in relocation_offsets
+                    ),
+                    window_context,
                 )
             else:
                 edges, stack_frontier = _ia32_schedule_private_stack_object_projection(
