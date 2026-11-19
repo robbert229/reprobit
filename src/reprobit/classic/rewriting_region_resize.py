@@ -218,6 +218,7 @@ from .debug import (
 from .foundation import require_payload_free_declaration, sha256_bytes
 from .region_simulation import (
     FLAG_NAMES,
+    X87_CONDITION_BITS,
     RelocationTarget,
     canonical_flag,
     contradictory,
@@ -226,6 +227,13 @@ from .region_simulation import (
     simulate_region,
     stores_equivalent,
     term_atoms,
+    x87_stacks_equivalent,
+)
+from .region_x87 import (
+    require_x87_depth,
+    x87_condition_liveness,
+    x87_environment_exposures,
+    x87_stack_depths,
 )
 from .register_reencoding import require_frame_pointer_free_frame
 from .register_semantics import (
@@ -1141,6 +1149,32 @@ def apply_region_resize(
         image_items, image_successors, f"{context} image flags"
     )
     image_item_index = {item["offset"]: index for index, item in enumerate(image_items)}
+    # Check 7 (x87): C0-C3 liveness on both bodies, the environment stores of
+    # either, and the donor's stack depths (computed only if a region needs them).
+    donor_cc_live = x87_condition_liveness(items, successors, body, f"{context} donor x87 status")
+    image_cc_live = x87_condition_liveness(
+        image_items, image_successors, image_bytes, f"{context} image x87 status"
+    )
+    x87_exposures = x87_environment_exposures(items, body) + x87_environment_exposures(
+        image_items, image_bytes
+    )
+    depth_cache: list[Any] = []
+
+    def x87_depth(offset: int) -> tuple[int, int] | None:
+        if not depth_cache:
+            depth_cache.append(
+                x87_stack_depths(items, successors, entries, body, relocation_view)
+            )
+        depths = depth_cache[0]
+        return None if depths is None else depths[donor_item_index[offset]]
+
+    def x87_facts(offset: int) -> tuple[frozenset[str], Any]:
+        """C0-C3 live at a donor point in D or at its image in I, and the x87 depth oracle."""
+        return (
+            donor_cc_live[donor_item_index[offset]]
+            | image_cc_live[image_item_index[mapped(offset)]]
+        ), x87_depth
+
     # Check 8: the simulation.
     proved = []
     for ordinal, region in enumerate(declared):
@@ -1160,6 +1194,7 @@ def apply_region_resize(
             flags_union: set[str] = set()
             entry_sigma = sigma if scoped(start) else {}
             exit_sigma = sigma if scoped(end) else {}
+            x87_record: dict[str, Any] = {}
             for donor_entry, image_local in [(start, 0), *sorted(region["entries"].items())]:
                 proof_context = (
                     region_context
@@ -1185,6 +1220,9 @@ def apply_region_resize(
                         | image_flag_live[image_item_index[mapped(offset)]]
                     ),
                     proof_context,
+                    x87_facts=x87_facts,
+                    x87_exposures=x87_exposures,
+                    x87_record=x87_record,
                 )
                 pairs += pairs_here
                 donor_count += counts[0]
@@ -1205,6 +1243,13 @@ def apply_region_resize(
                 "compared_registers": compared_registers,
                 "compared_flags": compared_flags,
             }
+            if x87_record:
+                record["x87"] = {
+                    "entry_depths": [list(depth) for depth in sorted(x87_record["entry_depths"])],
+                    "need": x87_record["need"],
+                    "peak": x87_record["peak"],
+                    "compared_condition_bits": sorted(x87_record["compared_condition_bits"]),
+                }
             if sigma:
                 record["entry_mapped"] = bool(entry_sigma)
                 record["exit_mapped"] = bool(exit_sigma)
@@ -1258,6 +1303,10 @@ def _prove_region_entry(
     live_at: Any,
     flags_live: Any,
     context: str,
+    *,
+    x87_facts: Any = None,
+    x87_exposures: list[int] | None = None,
+    x87_record: dict[str, Any] | None = None,
 ) -> tuple[int, set[str], set[str], tuple[int, int]]:
     """Check 8 for the run of one region from one of its entries.
 
@@ -1295,6 +1344,30 @@ def _prove_region_entry(
     )
     entry_live = live_at(donor_entry)
     entry_flags = flags_live(donor_entry)
+    x87_used = any(path.x87.used for path in (*donor_paths, *image_paths))
+    entry_cc: frozenset[str] = frozenset()
+    if x87_facts is not None:
+        entry_cc = x87_facts(donor_entry)[0]
+    if x87_used:
+        require(
+            x87_facts is not None,
+            f"{context}: the region uses the x87 unit but no x87 facts were supplied",
+        )
+        require(
+            not x87_exposures,
+            f"{context}: the region uses the x87 unit and the body stores the x87 environment at "
+            f"{sorted(set(x87_exposures or []))}, which would expose state the proof does not compare",
+        )
+        depth_of = x87_facts(donor_entry)[1]
+        need = max(path.x87.need for path in (*donor_paths, *image_paths))
+        peak = max(path.x87.peak for path in (*donor_paths, *image_paths))
+        entry_depth = depth_of(donor_entry)
+        require_x87_depth(entry_depth, need, peak, context)
+        if x87_record is not None:
+            x87_record.setdefault("entry_depths", set()).add(tuple(entry_depth))
+            x87_record["need"] = max(x87_record.get("need", 0), need)
+            x87_record["peak"] = max(x87_record.get("peak", 0), peak)
+            x87_record.setdefault("compared_condition_bits", set())
 
     def entry_cover(name: str) -> frozenset[str]:
         return _cover(name, entry_sigma, entry_live)
@@ -1353,6 +1426,22 @@ def _prove_region_entry(
                     f"{context}: the flag {name} is live at the exit and the two versions leave it "
                     "different",
                 )
+            why = x87_stacks_equivalent(left.x87, right.x87)
+            require(
+                why is None, f"{context}: the two versions leave different x87 stacks: {why}"
+            )
+            exit_cc: frozenset[str] = (
+                x87_facts(left.exit)[0] if x87_facts is not None else frozenset()
+            )
+            for name in X87_CONDITION_BITS:
+                if name in exit_cc:
+                    require(
+                        left.fcc[name] == right.fcc[name],
+                        f"{context}: the x87 condition bit {name.upper()} is live at the exit and "
+                        "the two versions leave it different",
+                    )
+            if x87_record is not None and x87_used:
+                x87_record["compared_condition_bits"] |= set(exit_cc)
             why = stores_equivalent(left.stores, right.stores)
             require(why is None, f"{context}: the two versions leave different memory: {why}")
             require(
@@ -1375,6 +1464,13 @@ def _prove_region_entry(
                     term_atoms(value, mentioned)
                 for name in compared_flags:
                     term_atoms(path.flags[name], mentioned)
+                for name in exit_cc:
+                    if path.fcc[name] == ("fcc0", name):
+                        # A bit both versions leave at its entry value
+                        # needs no liveness at the entry beyond its own.
+                        continue
+                    term_atoms(path.fcc[name], mentioned)
+                term_atoms(path.x87.slots, mentioned)
                 term_atoms(path.stores, mentioned)
                 term_atoms(path.footprint, mentioned)
                 term_atoms(path.conditions, mentioned)
@@ -1388,6 +1484,12 @@ def _prove_region_entry(
                 not missing,
                 f"{context}: the entry value of {name} is read but {sorted(missing)} is dead at "
                 "the region entry",
+            )
+        elif kind == "fcc0":
+            require(
+                name in entry_cc,
+                f"{context}: the entry x87 condition bit {name.upper()} is read but dead at the "
+                "region entry",
             )
         else:
             require(

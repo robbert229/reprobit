@@ -236,7 +236,7 @@ def test_a_store_swap_needs_provably_disjoint_stores() -> None:
 
 @pytest.mark.parametrize(
     "encoding",
-    ["e800000000", "c3", "f6f1", "d9c0", "ff10", "f3a4", "648b00", "1bc0"],
+    ["e800000000", "c3", "f6f1", "d9fe", "ff10", "f3a4", "648b00", "1bc0"],
 )
 def test_instructions_outside_the_closed_set_are_refused(encoding: str) -> None:
     code = bytes.fromhex(encoding)

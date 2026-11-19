@@ -1,0 +1,75 @@
+     74 9b db e3	finit
+      1 d8 15 00 00 00 00	fcom   DWORD PTR ds:0x0
+      1 d8 1d 00 00 00 00	fcomp  DWORD PTR ds:0x0
+      2 d8 c1	fadd   st,st(1)
+      1 d8 c2	fadd   st,st(2)
+      2 d8 c9	fmul   st,st(1)
+      1 d8 ca	fmul   st,st(2)
+      2 d8 d1	fcom   st(1)
+      1 d8 d2	fcom   st(2)
+      2 d8 d9	fcomp  st(1)
+      1 d8 da	fcomp  st(2)
+      2 d8 e1	fsub   st,st(1)
+      1 d8 e2	fsub   st,st(2)
+      2 d8 e9	fsubr  st,st(1)
+      1 d8 ea	fsubr  st,st(2)
+      2 d8 f1	fdiv   st,st(1)
+      1 d8 f2	fdiv   st,st(2)
+      2 d8 f9	fdivr  st,st(1)
+      1 d8 fa	fdivr  st,st(2)
+      2 d9 05 00 00 00 00	fld    DWORD PTR ds:0x0
+      1 d9 15 00 00 00 00	fst    DWORD PTR ds:0x0
+      1 d9 1d 00 00 00 00	fstp   DWORD PTR ds:0x0
+     50 d9 25 00 00 00 00	fldenv ds:0x0
+      2 d9 2d 00 00 00 00	fldcw  WORD PTR ds:0x0
+     50 d9 35 00 00 00 00	fnstenv ds:0x0
+      1 d9 c0	fld    st(0)
+      1 d9 c1	fld    st(1)
+      3 d9 c9	fxch   st(1)
+      1 d9 e0	fchs
+      1 d9 e1	fabs
+      1 d9 e8	fld1
+      1 d9 ee	fldz
+      1 da e9	fucompp
+     44 db 2d 00 00 00 00	fld    TBYTE PTR ds:0x0
+     30 db 3d 00 00 00 00	fstp   TBYTE PTR ds:0x0
+     22 db e2	fnclex
+      3 dc 0d 00 00 00 00	fmul   QWORD PTR ds:0x0
+      1 dc 15 00 00 00 00	fcom   QWORD PTR ds:0x0
+      1 dc 1d 00 00 00 00	fcomp  QWORD PTR ds:0x0
+      1 dc c1	fadd   st(1),st
+      1 dc c2	fadd   st(2),st
+      1 dc c9	fmul   st(1),st
+      1 dc ca	fmul   st(2),st
+      2 dc e1	fsubr  st(1),st
+      1 dc e2	fsubr  st(2),st
+      2 dc e9	fsub   st(1),st
+      1 dc ea	fsub   st(2),st
+      1 dc f1	fdivr  st(1),st
+      1 dc f2	fdivr  st(2),st
+      1 dc f9	fdiv   st(1),st
+      1 dc fa	fdiv   st(2),st
+    155 dd 05 00 00 00 00	fld    QWORD PTR ds:0x0
+      1 dd 15 00 00 00 00	fst    QWORD PTR ds:0x0
+      1 dd 1c 24	fstp   QWORD PTR [esp]
+     51 dd 1d 00 00 00 00	fstp   QWORD PTR ds:0x0
+     50 dd 1d 08 00 00 00	fstp   QWORD PTR ds:0x8
+     50 dd 1d 10 00 00 00	fstp   QWORD PTR ds:0x10
+      1 dd d1	fst    st(1)
+      2 dd d8	fstp   st(0)
+      1 dd e1	fucom  st(1)
+      1 dd e9	fucomp st(1)
+      2 de c1	faddp  st(1),st
+      1 de c2	faddp  st(2),st
+      2 de c9	fmulp  st(1),st
+      1 de ca	fmulp  st(2),st
+      3 de d9	fcompp
+      2 de e1	fsubrp st(1),st
+      1 de e2	fsubrp st(2),st
+      2 de e9	fsubp  st(1),st
+      1 de ea	fsubp  st(2),st
+      2 de f1	fdivrp st(1),st
+      1 de f2	fdivrp st(2),st
+      2 de f9	fdivp  st(1),st
+      1 de fa	fdivp  st(2),st
+    124 df e0	fnstsw ax

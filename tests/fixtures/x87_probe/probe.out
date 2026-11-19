@@ -1,0 +1,290 @@
+ARITH D8C1 A=7 B=2 C=100 top0=5 top1=5 tag=03ff R0=9 R1=7 R2=100
+ARITH D8C2 A=7 B=2 C=100 top0=5 top1=5 tag=03ff R0=102 R1=7 R2=100
+ARITH D8C9 A=7 B=2 C=100 top0=5 top1=5 tag=03ff R0=14 R1=7 R2=100
+ARITH D8CA A=7 B=2 C=100 top0=5 top1=5 tag=03ff R0=200 R1=7 R2=100
+ARITH D8D1 A=7 B=2 C=100 top0=5 top1=5 tag=03ff R0=2 R1=7 R2=100
+ARITH D8D2 A=7 B=2 C=100 top0=5 top1=5 tag=03ff R0=2 R1=7 R2=100
+ARITH D8D9 A=7 B=2 C=100 top0=5 top1=6 tag=0fff R0=7 R1=100 R2=-1.#IND
+ARITH D8DA A=7 B=2 C=100 top0=5 top1=6 tag=0fff R0=7 R1=100 R2=-1.#IND
+ARITH D8E1 A=7 B=2 C=100 top0=5 top1=5 tag=03ff R0=-5 R1=7 R2=100
+ARITH D8E2 A=7 B=2 C=100 top0=5 top1=5 tag=03ff R0=-98 R1=7 R2=100
+ARITH D8E9 A=7 B=2 C=100 top0=5 top1=5 tag=03ff R0=5 R1=7 R2=100
+ARITH D8EA A=7 B=2 C=100 top0=5 top1=5 tag=03ff R0=98 R1=7 R2=100
+ARITH D8F1 A=7 B=2 C=100 top0=5 top1=5 tag=03ff R0=0.2857142857142857 R1=7 R2=100
+ARITH D8F2 A=7 B=2 C=100 top0=5 top1=5 tag=03ff R0=0.02 R1=7 R2=100
+ARITH D8F9 A=7 B=2 C=100 top0=5 top1=5 tag=03ff R0=3.5 R1=7 R2=100
+ARITH D8FA A=7 B=2 C=100 top0=5 top1=5 tag=03ff R0=50 R1=7 R2=100
+ARITH DCC1 A=7 B=2 C=100 top0=5 top1=5 tag=03ff R0=2 R1=9 R2=100
+ARITH DCC2 A=7 B=2 C=100 top0=5 top1=5 tag=03ff R0=2 R1=7 R2=102
+ARITH DCC9 A=7 B=2 C=100 top0=5 top1=5 tag=03ff R0=2 R1=14 R2=100
+ARITH DCCA A=7 B=2 C=100 top0=5 top1=5 tag=03ff R0=2 R1=7 R2=200
+ARITH DCE1 A=7 B=2 C=100 top0=5 top1=5 tag=03ff R0=2 R1=-5 R2=100
+ARITH DCE2 A=7 B=2 C=100 top0=5 top1=5 tag=03ff R0=2 R1=7 R2=-98
+ARITH DCE9 A=7 B=2 C=100 top0=5 top1=5 tag=03ff R0=2 R1=5 R2=100
+ARITH DCEA A=7 B=2 C=100 top0=5 top1=5 tag=03ff R0=2 R1=7 R2=98
+ARITH DCF1 A=7 B=2 C=100 top0=5 top1=5 tag=03ff R0=2 R1=0.2857142857142857 R2=100
+ARITH DCF2 A=7 B=2 C=100 top0=5 top1=5 tag=03ff R0=2 R1=7 R2=0.02
+ARITH DCF9 A=7 B=2 C=100 top0=5 top1=5 tag=03ff R0=2 R1=3.5 R2=100
+ARITH DCFA A=7 B=2 C=100 top0=5 top1=5 tag=03ff R0=2 R1=7 R2=50
+ARITH DEC1 A=7 B=2 C=100 top0=5 top1=6 tag=0fff R0=9 R1=100 R2=-1.#IND
+ARITH DEC2 A=7 B=2 C=100 top0=5 top1=6 tag=0fff R0=7 R1=102 R2=-1.#IND
+ARITH DEC9 A=7 B=2 C=100 top0=5 top1=6 tag=0fff R0=14 R1=100 R2=-1.#IND
+ARITH DECA A=7 B=2 C=100 top0=5 top1=6 tag=0fff R0=7 R1=200 R2=-1.#IND
+ARITH DEE1 A=7 B=2 C=100 top0=5 top1=6 tag=0fff R0=-5 R1=100 R2=-1.#IND
+ARITH DEE2 A=7 B=2 C=100 top0=5 top1=6 tag=0fff R0=7 R1=-98 R2=-1.#IND
+ARITH DEE9 A=7 B=2 C=100 top0=5 top1=6 tag=0fff R0=5 R1=100 R2=-1.#IND
+ARITH DEEA A=7 B=2 C=100 top0=5 top1=6 tag=0fff R0=7 R1=98 R2=-1.#IND
+ARITH DEF1 A=7 B=2 C=100 top0=5 top1=6 tag=0fff R0=0.2857142857142857 R1=100 R2=-1.#IND
+ARITH DEF2 A=7 B=2 C=100 top0=5 top1=6 tag=0fff R0=7 R1=0.02 R2=-1.#IND
+ARITH DEF9 A=7 B=2 C=100 top0=5 top1=6 tag=0fff R0=3.5 R1=100 R2=-1.#IND
+ARITH DEFA A=7 B=2 C=100 top0=5 top1=6 tag=0fff R0=7 R1=50 R2=-1.#IND
+ARITH D8C1 A=1 B=3 C=-9 top0=5 top1=5 tag=03ff R0=4 R1=1 R2=-9
+ARITH D8C2 A=1 B=3 C=-9 top0=5 top1=5 tag=03ff R0=-6 R1=1 R2=-9
+ARITH D8C9 A=1 B=3 C=-9 top0=5 top1=5 tag=03ff R0=3 R1=1 R2=-9
+ARITH D8CA A=1 B=3 C=-9 top0=5 top1=5 tag=03ff R0=-27 R1=1 R2=-9
+ARITH D8D1 A=1 B=3 C=-9 top0=5 top1=5 tag=03ff R0=3 R1=1 R2=-9
+ARITH D8D2 A=1 B=3 C=-9 top0=5 top1=5 tag=03ff R0=3 R1=1 R2=-9
+ARITH D8D9 A=1 B=3 C=-9 top0=5 top1=6 tag=0fff R0=1 R1=-9 R2=-1.#IND
+ARITH D8DA A=1 B=3 C=-9 top0=5 top1=6 tag=0fff R0=1 R1=-9 R2=-1.#IND
+ARITH D8E1 A=1 B=3 C=-9 top0=5 top1=5 tag=03ff R0=2 R1=1 R2=-9
+ARITH D8E2 A=1 B=3 C=-9 top0=5 top1=5 tag=03ff R0=12 R1=1 R2=-9
+ARITH D8E9 A=1 B=3 C=-9 top0=5 top1=5 tag=03ff R0=-2 R1=1 R2=-9
+ARITH D8EA A=1 B=3 C=-9 top0=5 top1=5 tag=03ff R0=-12 R1=1 R2=-9
+ARITH D8F1 A=1 B=3 C=-9 top0=5 top1=5 tag=03ff R0=3 R1=1 R2=-9
+ARITH D8F2 A=1 B=3 C=-9 top0=5 top1=5 tag=03ff R0=-0.33333333333333331 R1=1 R2=-9
+ARITH D8F9 A=1 B=3 C=-9 top0=5 top1=5 tag=03ff R0=0.33333333333333331 R1=1 R2=-9
+ARITH D8FA A=1 B=3 C=-9 top0=5 top1=5 tag=03ff R0=-3 R1=1 R2=-9
+ARITH DCC1 A=1 B=3 C=-9 top0=5 top1=5 tag=03ff R0=3 R1=4 R2=-9
+ARITH DCC2 A=1 B=3 C=-9 top0=5 top1=5 tag=03ff R0=3 R1=1 R2=-6
+ARITH DCC9 A=1 B=3 C=-9 top0=5 top1=5 tag=03ff R0=3 R1=3 R2=-9
+ARITH DCCA A=1 B=3 C=-9 top0=5 top1=5 tag=03ff R0=3 R1=1 R2=-27
+ARITH DCE1 A=1 B=3 C=-9 top0=5 top1=5 tag=03ff R0=3 R1=2 R2=-9
+ARITH DCE2 A=1 B=3 C=-9 top0=5 top1=5 tag=03ff R0=3 R1=1 R2=12
+ARITH DCE9 A=1 B=3 C=-9 top0=5 top1=5 tag=03ff R0=3 R1=-2 R2=-9
+ARITH DCEA A=1 B=3 C=-9 top0=5 top1=5 tag=03ff R0=3 R1=1 R2=-12
+ARITH DCF1 A=1 B=3 C=-9 top0=5 top1=5 tag=03ff R0=3 R1=3 R2=-9
+ARITH DCF2 A=1 B=3 C=-9 top0=5 top1=5 tag=03ff R0=3 R1=1 R2=-0.33333333333333331
+ARITH DCF9 A=1 B=3 C=-9 top0=5 top1=5 tag=03ff R0=3 R1=0.33333333333333331 R2=-9
+ARITH DCFA A=1 B=3 C=-9 top0=5 top1=5 tag=03ff R0=3 R1=1 R2=-3
+ARITH DEC1 A=1 B=3 C=-9 top0=5 top1=6 tag=0fff R0=4 R1=-9 R2=-1.#IND
+ARITH DEC2 A=1 B=3 C=-9 top0=5 top1=6 tag=0fff R0=1 R1=-6 R2=-1.#IND
+ARITH DEC9 A=1 B=3 C=-9 top0=5 top1=6 tag=0fff R0=3 R1=-9 R2=-1.#IND
+ARITH DECA A=1 B=3 C=-9 top0=5 top1=6 tag=0fff R0=1 R1=-27 R2=-1.#IND
+ARITH DEE1 A=1 B=3 C=-9 top0=5 top1=6 tag=0fff R0=2 R1=-9 R2=-1.#IND
+ARITH DEE2 A=1 B=3 C=-9 top0=5 top1=6 tag=0fff R0=1 R1=12 R2=-1.#IND
+ARITH DEE9 A=1 B=3 C=-9 top0=5 top1=6 tag=0fff R0=-2 R1=-9 R2=-1.#IND
+ARITH DEEA A=1 B=3 C=-9 top0=5 top1=6 tag=0fff R0=1 R1=-12 R2=-1.#IND
+ARITH DEF1 A=1 B=3 C=-9 top0=5 top1=6 tag=0fff R0=3 R1=-9 R2=-1.#IND
+ARITH DEF2 A=1 B=3 C=-9 top0=5 top1=6 tag=0fff R0=1 R1=-0.33333333333333331 R2=-1.#IND
+ARITH DEF9 A=1 B=3 C=-9 top0=5 top1=6 tag=0fff R0=0.33333333333333331 R1=-9 R2=-1.#IND
+ARITH DEFA A=1 B=3 C=-9 top0=5 top1=6 tag=0fff R0=1 R1=-3 R2=-1.#IND
+ARITH D8C1 A=-5 B=0.25 C=0.5 top0=5 top1=5 tag=03ff R0=-4.75 R1=-5 R2=0.5
+ARITH D8C2 A=-5 B=0.25 C=0.5 top0=5 top1=5 tag=03ff R0=0.75 R1=-5 R2=0.5
+ARITH D8C9 A=-5 B=0.25 C=0.5 top0=5 top1=5 tag=03ff R0=-1.25 R1=-5 R2=0.5
+ARITH D8CA A=-5 B=0.25 C=0.5 top0=5 top1=5 tag=03ff R0=0.125 R1=-5 R2=0.5
+ARITH D8D1 A=-5 B=0.25 C=0.5 top0=5 top1=5 tag=03ff R0=0.25 R1=-5 R2=0.5
+ARITH D8D2 A=-5 B=0.25 C=0.5 top0=5 top1=5 tag=03ff R0=0.25 R1=-5 R2=0.5
+ARITH D8D9 A=-5 B=0.25 C=0.5 top0=5 top1=6 tag=0fff R0=-5 R1=0.5 R2=-1.#IND
+ARITH D8DA A=-5 B=0.25 C=0.5 top0=5 top1=6 tag=0fff R0=-5 R1=0.5 R2=-1.#IND
+ARITH D8E1 A=-5 B=0.25 C=0.5 top0=5 top1=5 tag=03ff R0=5.25 R1=-5 R2=0.5
+ARITH D8E2 A=-5 B=0.25 C=0.5 top0=5 top1=5 tag=03ff R0=-0.25 R1=-5 R2=0.5
+ARITH D8E9 A=-5 B=0.25 C=0.5 top0=5 top1=5 tag=03ff R0=-5.25 R1=-5 R2=0.5
+ARITH D8EA A=-5 B=0.25 C=0.5 top0=5 top1=5 tag=03ff R0=0.25 R1=-5 R2=0.5
+ARITH D8F1 A=-5 B=0.25 C=0.5 top0=5 top1=5 tag=03ff R0=-0.050000000000000003 R1=-5 R2=0.5
+ARITH D8F2 A=-5 B=0.25 C=0.5 top0=5 top1=5 tag=03ff R0=0.5 R1=-5 R2=0.5
+ARITH D8F9 A=-5 B=0.25 C=0.5 top0=5 top1=5 tag=03ff R0=-20 R1=-5 R2=0.5
+ARITH D8FA A=-5 B=0.25 C=0.5 top0=5 top1=5 tag=03ff R0=2 R1=-5 R2=0.5
+ARITH DCC1 A=-5 B=0.25 C=0.5 top0=5 top1=5 tag=03ff R0=0.25 R1=-4.75 R2=0.5
+ARITH DCC2 A=-5 B=0.25 C=0.5 top0=5 top1=5 tag=03ff R0=0.25 R1=-5 R2=0.75
+ARITH DCC9 A=-5 B=0.25 C=0.5 top0=5 top1=5 tag=03ff R0=0.25 R1=-1.25 R2=0.5
+ARITH DCCA A=-5 B=0.25 C=0.5 top0=5 top1=5 tag=03ff R0=0.25 R1=-5 R2=0.125
+ARITH DCE1 A=-5 B=0.25 C=0.5 top0=5 top1=5 tag=03ff R0=0.25 R1=5.25 R2=0.5
+ARITH DCE2 A=-5 B=0.25 C=0.5 top0=5 top1=5 tag=03ff R0=0.25 R1=-5 R2=-0.25
+ARITH DCE9 A=-5 B=0.25 C=0.5 top0=5 top1=5 tag=03ff R0=0.25 R1=-5.25 R2=0.5
+ARITH DCEA A=-5 B=0.25 C=0.5 top0=5 top1=5 tag=03ff R0=0.25 R1=-5 R2=0.25
+ARITH DCF1 A=-5 B=0.25 C=0.5 top0=5 top1=5 tag=03ff R0=0.25 R1=-0.050000000000000003 R2=0.5
+ARITH DCF2 A=-5 B=0.25 C=0.5 top0=5 top1=5 tag=03ff R0=0.25 R1=-5 R2=0.5
+ARITH DCF9 A=-5 B=0.25 C=0.5 top0=5 top1=5 tag=03ff R0=0.25 R1=-20 R2=0.5
+ARITH DCFA A=-5 B=0.25 C=0.5 top0=5 top1=5 tag=03ff R0=0.25 R1=-5 R2=2
+ARITH DEC1 A=-5 B=0.25 C=0.5 top0=5 top1=6 tag=0fff R0=-4.75 R1=0.5 R2=-1.#IND
+ARITH DEC2 A=-5 B=0.25 C=0.5 top0=5 top1=6 tag=0fff R0=-5 R1=0.75 R2=-1.#IND
+ARITH DEC9 A=-5 B=0.25 C=0.5 top0=5 top1=6 tag=0fff R0=-1.25 R1=0.5 R2=-1.#IND
+ARITH DECA A=-5 B=0.25 C=0.5 top0=5 top1=6 tag=0fff R0=-5 R1=0.125 R2=-1.#IND
+ARITH DEE1 A=-5 B=0.25 C=0.5 top0=5 top1=6 tag=0fff R0=5.25 R1=0.5 R2=-1.#IND
+ARITH DEE2 A=-5 B=0.25 C=0.5 top0=5 top1=6 tag=0fff R0=-5 R1=-0.25 R2=-1.#IND
+ARITH DEE9 A=-5 B=0.25 C=0.5 top0=5 top1=6 tag=0fff R0=-5.25 R1=0.5 R2=-1.#IND
+ARITH DEEA A=-5 B=0.25 C=0.5 top0=5 top1=6 tag=0fff R0=-5 R1=0.25 R2=-1.#IND
+ARITH DEF1 A=-5 B=0.25 C=0.5 top0=5 top1=6 tag=0fff R0=-0.050000000000000003 R1=0.5 R2=-1.#IND
+ARITH DEF2 A=-5 B=0.25 C=0.5 top0=5 top1=6 tag=0fff R0=-5 R1=0.5 R2=-1.#IND
+ARITH DEF9 A=-5 B=0.25 C=0.5 top0=5 top1=6 tag=0fff R0=-20 R1=0.5 R2=-1.#IND
+ARITH DEFA A=-5 B=0.25 C=0.5 top0=5 top1=6 tag=0fff R0=-5 R1=2 R2=-1.#IND
+ARITH D8C1 A=10000000000 B=3 C=7 top0=5 top1=5 tag=03ff R0=10000000003 R1=10000000000 R2=7
+ARITH D8C2 A=10000000000 B=3 C=7 top0=5 top1=5 tag=03ff R0=10 R1=10000000000 R2=7
+ARITH D8C9 A=10000000000 B=3 C=7 top0=5 top1=5 tag=03ff R0=30000000000 R1=10000000000 R2=7
+ARITH D8CA A=10000000000 B=3 C=7 top0=5 top1=5 tag=03ff R0=21 R1=10000000000 R2=7
+ARITH D8D1 A=10000000000 B=3 C=7 top0=5 top1=5 tag=03ff R0=3 R1=10000000000 R2=7
+ARITH D8D2 A=10000000000 B=3 C=7 top0=5 top1=5 tag=03ff R0=3 R1=10000000000 R2=7
+ARITH D8D9 A=10000000000 B=3 C=7 top0=5 top1=6 tag=0fff R0=10000000000 R1=7 R2=-1.#IND
+ARITH D8DA A=10000000000 B=3 C=7 top0=5 top1=6 tag=0fff R0=10000000000 R1=7 R2=-1.#IND
+ARITH D8E1 A=10000000000 B=3 C=7 top0=5 top1=5 tag=03ff R0=-9999999997 R1=10000000000 R2=7
+ARITH D8E2 A=10000000000 B=3 C=7 top0=5 top1=5 tag=03ff R0=-4 R1=10000000000 R2=7
+ARITH D8E9 A=10000000000 B=3 C=7 top0=5 top1=5 tag=03ff R0=9999999997 R1=10000000000 R2=7
+ARITH D8EA A=10000000000 B=3 C=7 top0=5 top1=5 tag=03ff R0=4 R1=10000000000 R2=7
+ARITH D8F1 A=10000000000 B=3 C=7 top0=5 top1=5 tag=03ff R0=3e-010 R1=10000000000 R2=7
+ARITH D8F2 A=10000000000 B=3 C=7 top0=5 top1=5 tag=03ff R0=0.42857142857142855 R1=10000000000 R2=7
+ARITH D8F9 A=10000000000 B=3 C=7 top0=5 top1=5 tag=03ff R0=3333333333.3333335 R1=10000000000 R2=7
+ARITH D8FA A=10000000000 B=3 C=7 top0=5 top1=5 tag=03ff R0=2.3333333333333335 R1=10000000000 R2=7
+ARITH DCC1 A=10000000000 B=3 C=7 top0=5 top1=5 tag=03ff R0=3 R1=10000000003 R2=7
+ARITH DCC2 A=10000000000 B=3 C=7 top0=5 top1=5 tag=03ff R0=3 R1=10000000000 R2=10
+ARITH DCC9 A=10000000000 B=3 C=7 top0=5 top1=5 tag=03ff R0=3 R1=30000000000 R2=7
+ARITH DCCA A=10000000000 B=3 C=7 top0=5 top1=5 tag=03ff R0=3 R1=10000000000 R2=21
+ARITH DCE1 A=10000000000 B=3 C=7 top0=5 top1=5 tag=03ff R0=3 R1=-9999999997 R2=7
+ARITH DCE2 A=10000000000 B=3 C=7 top0=5 top1=5 tag=03ff R0=3 R1=10000000000 R2=-4
+ARITH DCE9 A=10000000000 B=3 C=7 top0=5 top1=5 tag=03ff R0=3 R1=9999999997 R2=7
+ARITH DCEA A=10000000000 B=3 C=7 top0=5 top1=5 tag=03ff R0=3 R1=10000000000 R2=4
+ARITH DCF1 A=10000000000 B=3 C=7 top0=5 top1=5 tag=03ff R0=3 R1=3e-010 R2=7
+ARITH DCF2 A=10000000000 B=3 C=7 top0=5 top1=5 tag=03ff R0=3 R1=10000000000 R2=0.42857142857142855
+ARITH DCF9 A=10000000000 B=3 C=7 top0=5 top1=5 tag=03ff R0=3 R1=3333333333.3333335 R2=7
+ARITH DCFA A=10000000000 B=3 C=7 top0=5 top1=5 tag=03ff R0=3 R1=10000000000 R2=2.3333333333333335
+ARITH DEC1 A=10000000000 B=3 C=7 top0=5 top1=6 tag=0fff R0=10000000003 R1=7 R2=-1.#IND
+ARITH DEC2 A=10000000000 B=3 C=7 top0=5 top1=6 tag=0fff R0=10000000000 R1=10 R2=-1.#IND
+ARITH DEC9 A=10000000000 B=3 C=7 top0=5 top1=6 tag=0fff R0=30000000000 R1=7 R2=-1.#IND
+ARITH DECA A=10000000000 B=3 C=7 top0=5 top1=6 tag=0fff R0=10000000000 R1=21 R2=-1.#IND
+ARITH DEE1 A=10000000000 B=3 C=7 top0=5 top1=6 tag=0fff R0=-9999999997 R1=7 R2=-1.#IND
+ARITH DEE2 A=10000000000 B=3 C=7 top0=5 top1=6 tag=0fff R0=10000000000 R1=-4 R2=-1.#IND
+ARITH DEE9 A=10000000000 B=3 C=7 top0=5 top1=6 tag=0fff R0=9999999997 R1=7 R2=-1.#IND
+ARITH DEEA A=10000000000 B=3 C=7 top0=5 top1=6 tag=0fff R0=10000000000 R1=4 R2=-1.#IND
+ARITH DEF1 A=10000000000 B=3 C=7 top0=5 top1=6 tag=0fff R0=3e-010 R1=7 R2=-1.#IND
+ARITH DEF2 A=10000000000 B=3 C=7 top0=5 top1=6 tag=0fff R0=10000000000 R1=0.42857142857142855 R2=-1.#IND
+ARITH DEF9 A=10000000000 B=3 C=7 top0=5 top1=6 tag=0fff R0=3333333333.3333335 R1=7 R2=-1.#IND
+ARITH DEFA A=10000000000 B=3 C=7 top0=5 top1=6 tag=0fff R0=10000000000 R1=2.3333333333333335 R2=-1.#IND
+CMP fcom_m32 A=2 B=1 preset=0 swbefore=2800 swafter=2800 top0=5 top1=5
+CMP fcomp_m32 A=2 B=1 preset=0 swbefore=2800 swafter=3000 top0=5 top1=6
+CMP fcom_m64 A=2 B=1 preset=0 swbefore=2800 swafter=2800 top0=5 top1=5
+CMP fcomp_m64 A=2 B=1 preset=0 swbefore=2800 swafter=3000 top0=5 top1=6
+CMP D8D1 A=2 B=1 preset=0 swbefore=2800 swafter=2800 top0=5 top1=5
+CMP D8D9 A=2 B=1 preset=0 swbefore=2800 swafter=3000 top0=5 top1=6
+CMP DED9 A=2 B=1 preset=0 swbefore=2800 swafter=3800 top0=5 top1=7
+CMP DDE1 A=2 B=1 preset=0 swbefore=2800 swafter=2800 top0=5 top1=5
+CMP DDE9 A=2 B=1 preset=0 swbefore=2800 swafter=3000 top0=5 top1=6
+CMP DAE9 A=2 B=1 preset=0 swbefore=2800 swafter=3800 top0=5 top1=7
+CMP fcom_m32 A=2 B=1 preset=1 swbefore=6f00 swafter=2800 top0=5 top1=5
+CMP fcomp_m32 A=2 B=1 preset=1 swbefore=6f00 swafter=3000 top0=5 top1=6
+CMP fcom_m64 A=2 B=1 preset=1 swbefore=6f00 swafter=2800 top0=5 top1=5
+CMP fcomp_m64 A=2 B=1 preset=1 swbefore=6f00 swafter=3000 top0=5 top1=6
+CMP D8D1 A=2 B=1 preset=1 swbefore=6f00 swafter=2800 top0=5 top1=5
+CMP D8D9 A=2 B=1 preset=1 swbefore=6f00 swafter=3000 top0=5 top1=6
+CMP DED9 A=2 B=1 preset=1 swbefore=6f00 swafter=3800 top0=5 top1=7
+CMP DDE1 A=2 B=1 preset=1 swbefore=6f00 swafter=2800 top0=5 top1=5
+CMP DDE9 A=2 B=1 preset=1 swbefore=6f00 swafter=3000 top0=5 top1=6
+CMP DAE9 A=2 B=1 preset=1 swbefore=6f00 swafter=3800 top0=5 top1=7
+CMP fcom_m32 A=1 B=2 preset=0 swbefore=2800 swafter=2900 top0=5 top1=5
+CMP fcomp_m32 A=1 B=2 preset=0 swbefore=2800 swafter=3100 top0=5 top1=6
+CMP fcom_m64 A=1 B=2 preset=0 swbefore=2800 swafter=2900 top0=5 top1=5
+CMP fcomp_m64 A=1 B=2 preset=0 swbefore=2800 swafter=3100 top0=5 top1=6
+CMP D8D1 A=1 B=2 preset=0 swbefore=2800 swafter=2900 top0=5 top1=5
+CMP D8D9 A=1 B=2 preset=0 swbefore=2800 swafter=3100 top0=5 top1=6
+CMP DED9 A=1 B=2 preset=0 swbefore=2800 swafter=3900 top0=5 top1=7
+CMP DDE1 A=1 B=2 preset=0 swbefore=2800 swafter=2900 top0=5 top1=5
+CMP DDE9 A=1 B=2 preset=0 swbefore=2800 swafter=3100 top0=5 top1=6
+CMP DAE9 A=1 B=2 preset=0 swbefore=2800 swafter=3900 top0=5 top1=7
+CMP fcom_m32 A=1 B=2 preset=1 swbefore=6f00 swafter=2900 top0=5 top1=5
+CMP fcomp_m32 A=1 B=2 preset=1 swbefore=6f00 swafter=3100 top0=5 top1=6
+CMP fcom_m64 A=1 B=2 preset=1 swbefore=6f00 swafter=2900 top0=5 top1=5
+CMP fcomp_m64 A=1 B=2 preset=1 swbefore=6f00 swafter=3100 top0=5 top1=6
+CMP D8D1 A=1 B=2 preset=1 swbefore=6f00 swafter=2900 top0=5 top1=5
+CMP D8D9 A=1 B=2 preset=1 swbefore=6f00 swafter=3100 top0=5 top1=6
+CMP DED9 A=1 B=2 preset=1 swbefore=6f00 swafter=3900 top0=5 top1=7
+CMP DDE1 A=1 B=2 preset=1 swbefore=6f00 swafter=2900 top0=5 top1=5
+CMP DDE9 A=1 B=2 preset=1 swbefore=6f00 swafter=3100 top0=5 top1=6
+CMP DAE9 A=1 B=2 preset=1 swbefore=6f00 swafter=3900 top0=5 top1=7
+CMP fcom_m32 A=1.5 B=1.5 preset=0 swbefore=2800 swafter=6800 top0=5 top1=5
+CMP fcomp_m32 A=1.5 B=1.5 preset=0 swbefore=2800 swafter=7000 top0=5 top1=6
+CMP fcom_m64 A=1.5 B=1.5 preset=0 swbefore=2800 swafter=6800 top0=5 top1=5
+CMP fcomp_m64 A=1.5 B=1.5 preset=0 swbefore=2800 swafter=7000 top0=5 top1=6
+CMP D8D1 A=1.5 B=1.5 preset=0 swbefore=2800 swafter=6800 top0=5 top1=5
+CMP D8D9 A=1.5 B=1.5 preset=0 swbefore=2800 swafter=7000 top0=5 top1=6
+CMP DED9 A=1.5 B=1.5 preset=0 swbefore=2800 swafter=7800 top0=5 top1=7
+CMP DDE1 A=1.5 B=1.5 preset=0 swbefore=2800 swafter=6800 top0=5 top1=5
+CMP DDE9 A=1.5 B=1.5 preset=0 swbefore=2800 swafter=7000 top0=5 top1=6
+CMP DAE9 A=1.5 B=1.5 preset=0 swbefore=2800 swafter=7800 top0=5 top1=7
+CMP fcom_m32 A=1.5 B=1.5 preset=1 swbefore=6f00 swafter=6800 top0=5 top1=5
+CMP fcomp_m32 A=1.5 B=1.5 preset=1 swbefore=6f00 swafter=7000 top0=5 top1=6
+CMP fcom_m64 A=1.5 B=1.5 preset=1 swbefore=6f00 swafter=6800 top0=5 top1=5
+CMP fcomp_m64 A=1.5 B=1.5 preset=1 swbefore=6f00 swafter=7000 top0=5 top1=6
+CMP D8D1 A=1.5 B=1.5 preset=1 swbefore=6f00 swafter=6800 top0=5 top1=5
+CMP D8D9 A=1.5 B=1.5 preset=1 swbefore=6f00 swafter=7000 top0=5 top1=6
+CMP DED9 A=1.5 B=1.5 preset=1 swbefore=6f00 swafter=7800 top0=5 top1=7
+CMP DDE1 A=1.5 B=1.5 preset=1 swbefore=6f00 swafter=6800 top0=5 top1=5
+CMP DDE9 A=1.5 B=1.5 preset=1 swbefore=6f00 swafter=7000 top0=5 top1=6
+CMP DAE9 A=1.5 B=1.5 preset=1 swbefore=6f00 swafter=7800 top0=5 top1=7
+CMP fcom_m32 A=0 B=0 preset=0 swbefore=2800 swafter=6800 top0=5 top1=5
+CMP fcomp_m32 A=0 B=0 preset=0 swbefore=2800 swafter=7000 top0=5 top1=6
+CMP fcom_m64 A=0 B=0 preset=0 swbefore=2800 swafter=6800 top0=5 top1=5
+CMP fcomp_m64 A=0 B=0 preset=0 swbefore=2800 swafter=7000 top0=5 top1=6
+CMP D8D1 A=0 B=0 preset=0 swbefore=2800 swafter=6800 top0=5 top1=5
+CMP D8D9 A=0 B=0 preset=0 swbefore=2800 swafter=7000 top0=5 top1=6
+CMP DED9 A=0 B=0 preset=0 swbefore=2800 swafter=7800 top0=5 top1=7
+CMP DDE1 A=0 B=0 preset=0 swbefore=2800 swafter=6800 top0=5 top1=5
+CMP DDE9 A=0 B=0 preset=0 swbefore=2800 swafter=7000 top0=5 top1=6
+CMP DAE9 A=0 B=0 preset=0 swbefore=2800 swafter=7800 top0=5 top1=7
+CMP fcom_m32 A=0 B=0 preset=1 swbefore=6f00 swafter=6800 top0=5 top1=5
+CMP fcomp_m32 A=0 B=0 preset=1 swbefore=6f00 swafter=7000 top0=5 top1=6
+CMP fcom_m64 A=0 B=0 preset=1 swbefore=6f00 swafter=6800 top0=5 top1=5
+CMP fcomp_m64 A=0 B=0 preset=1 swbefore=6f00 swafter=7000 top0=5 top1=6
+CMP D8D1 A=0 B=0 preset=1 swbefore=6f00 swafter=6800 top0=5 top1=5
+CMP D8D9 A=0 B=0 preset=1 swbefore=6f00 swafter=7000 top0=5 top1=6
+CMP DED9 A=0 B=0 preset=1 swbefore=6f00 swafter=7800 top0=5 top1=7
+CMP DDE1 A=0 B=0 preset=1 swbefore=6f00 swafter=6800 top0=5 top1=5
+CMP DDE9 A=0 B=0 preset=1 swbefore=6f00 swafter=7000 top0=5 top1=6
+CMP DAE9 A=0 B=0 preset=1 swbefore=6f00 swafter=7800 top0=5 top1=7
+CMP fcom_m32 A=1.#QNAN B=1 preset=0 swbefore=2800 swafter=6d01 top0=5 top1=5
+CMP fcomp_m32 A=1.#QNAN B=1 preset=0 swbefore=2800 swafter=7501 top0=5 top1=6
+CMP fcom_m64 A=1.#QNAN B=1 preset=0 swbefore=2800 swafter=6d01 top0=5 top1=5
+CMP fcomp_m64 A=1.#QNAN B=1 preset=0 swbefore=2800 swafter=7501 top0=5 top1=6
+CMP D8D1 A=1.#QNAN B=1 preset=0 swbefore=2800 swafter=6d01 top0=5 top1=5
+CMP D8D9 A=1.#QNAN B=1 preset=0 swbefore=2800 swafter=7501 top0=5 top1=6
+CMP DED9 A=1.#QNAN B=1 preset=0 swbefore=2800 swafter=7d01 top0=5 top1=7
+CMP DDE1 A=1.#QNAN B=1 preset=0 swbefore=2800 swafter=6d00 top0=5 top1=5
+CMP DDE9 A=1.#QNAN B=1 preset=0 swbefore=2800 swafter=7500 top0=5 top1=6
+CMP DAE9 A=1.#QNAN B=1 preset=0 swbefore=2800 swafter=7d00 top0=5 top1=7
+CMP fcom_m32 A=1.#QNAN B=1 preset=1 swbefore=6f00 swafter=6d01 top0=5 top1=5
+CMP fcomp_m32 A=1.#QNAN B=1 preset=1 swbefore=6f00 swafter=7501 top0=5 top1=6
+CMP fcom_m64 A=1.#QNAN B=1 preset=1 swbefore=6f00 swafter=6d01 top0=5 top1=5
+CMP fcomp_m64 A=1.#QNAN B=1 preset=1 swbefore=6f00 swafter=7501 top0=5 top1=6
+CMP D8D1 A=1.#QNAN B=1 preset=1 swbefore=6f00 swafter=6d01 top0=5 top1=5
+CMP D8D9 A=1.#QNAN B=1 preset=1 swbefore=6f00 swafter=7501 top0=5 top1=6
+CMP DED9 A=1.#QNAN B=1 preset=1 swbefore=6f00 swafter=7d01 top0=5 top1=7
+CMP DDE1 A=1.#QNAN B=1 preset=1 swbefore=6f00 swafter=6d00 top0=5 top1=5
+CMP DDE9 A=1.#QNAN B=1 preset=1 swbefore=6f00 swafter=7500 top0=5 top1=6
+CMP DAE9 A=1.#QNAN B=1 preset=1 swbefore=6f00 swafter=7d00 top0=5 top1=7
+SPILL32 cw=007f A=1 B=0.333333 c3c2c0=100 S32=0.333333343
+SPILL64 cw=007f A=1 B=0.333333 c3c2c0=100 S64=0.3333333432674408
+SPILL32 cw=007f A=1e+030 B=1e+030 c3c2c0=001 S32=1.#INF
+SPILL64 cw=007f A=1e+030 B=1e+030 c3c2c0=100 S64=9.9999998574801759e+059
+SPILL32 cw=007f A=1e+300 B=1e+300 c3c2c0=001 S32=1.#INF
+SPILL64 cw=007f A=1e+300 B=1e+300 c3c2c0=001 S64=1.#INF
+SPILL32 cw=007f A=1e-030 B=1e-030 c3c2c0=000 S32=0
+SPILL64 cw=007f A=1e-030 B=1e-030 c3c2c0=100 S64=9.9999997525400743e-061
+SPILL32 cw=007f A=0.5 B=4 c3c2c0=100 S32=2
+SPILL64 cw=007f A=0.5 B=4 c3c2c0=100 S64=2
+SPILL32 cw=027f A=1 B=0.333333 c3c2c0=001 S32=0.333333343
+SPILL64 cw=027f A=1 B=0.333333 c3c2c0=100 S64=0.33333333333333331
+SPILL32 cw=027f A=1e+030 B=1e+030 c3c2c0=001 S32=1.#INF
+SPILL64 cw=027f A=1e+030 B=1e+030 c3c2c0=100 S64=1.0000000000000001e+060
+SPILL32 cw=027f A=1e+300 B=1e+300 c3c2c0=001 S32=1.#INF
+SPILL64 cw=027f A=1e+300 B=1e+300 c3c2c0=001 S64=1.#INF
+SPILL32 cw=027f A=1e-030 B=1e-030 c3c2c0=000 S32=0
+SPILL64 cw=027f A=1e-030 B=1e-030 c3c2c0=100 S64=1.0000000000000001e-060
+SPILL32 cw=027f A=0.5 B=4 c3c2c0=100 S32=2
+SPILL64 cw=027f A=0.5 B=4 c3c2c0=100 S64=2
+SPILL32 cw=037f A=1 B=0.333333 c3c2c0=001 S32=0.333333343
+SPILL64 cw=037f A=1 B=0.333333 c3c2c0=100 S64=0.33333333333333331
+SPILL32 cw=037f A=1e+030 B=1e+030 c3c2c0=001 S32=1.#INF
+SPILL64 cw=037f A=1e+030 B=1e+030 c3c2c0=001 S64=1.0000000000000001e+060
+SPILL32 cw=037f A=1e+300 B=1e+300 c3c2c0=001 S32=1.#INF
+SPILL64 cw=037f A=1e+300 B=1e+300 c3c2c0=001 S64=1.#INF
+SPILL32 cw=037f A=1e-030 B=1e-030 c3c2c0=000 S32=0
+SPILL64 cw=037f A=1e-030 B=1e-030 c3c2c0=000 S64=1.0000000000000001e-060
+SPILL32 cw=037f A=0.5 B=4 c3c2c0=100 S32=2
+SPILL64 cw=037f A=0.5 B=4 c3c2c0=100 S64=2

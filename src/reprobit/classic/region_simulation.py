@@ -171,6 +171,14 @@ def extract(value: Term, low: int, width: int) -> Term:
             return inserted
         if low + width <= ins_low or ins_low + ins_width <= low:
             return extract(old, low, width)
+    if atom is not None and atom[0] == "ins" and (atom[2], atom[3]) == (0, 16):
+        inserted = atom[4]
+        if inserted[0] == "b" and inserted[2][0] == "fsw":
+            # ``fnstsw ax``: AH holds C0 C1 C2 TOP C3 B, AL the exception bits.
+            if (low, width) == (8, 8):
+                return ("b", 8, ("fswh", *inserted[2][1:]))
+            if (low, width) == (0, 8):
+                return ("b", 8, ("fswl", inserted[2][6]))
     if atom is not None and atom[0] in ("zx", "sx") and low == 0 and width == atom[2]:
         return atom[1]
     if atom is not None and atom[0] == "zx" and low >= atom[2]:
@@ -204,6 +212,8 @@ def sign_extend(part: Term, width: int) -> Term:
 
 def _bitop(name: str, width: int, left: Term, right: Term) -> Term:
     """``and``/``or``/``xor`` with constant folding and idempotence."""
+    if width == 8 and (_is_fswh(left) or _is_fswh(right)):
+        return _fsw_mask(name, left, right)
     mask = (1 << width) - 1
     if width == 32:
         a, b = const_of(left), const_of(right)
@@ -247,6 +257,115 @@ def address_relation(left: Term, left_width: int, right: Term, right_width: int)
     return "unknown"
 
 
+# --- the x87 status word -------------------------------------------------------
+
+# The four outcomes of an x87 compare of ST(0) with its source, and the
+# condition bits each sets (C1 is cleared by every compare).  Measured with
+# MSVC 5.0 inline assembly under Wine for fcom/fcomp m32 and m64, fcom/fcomp
+# ST(1), fcompp, fucom/fucomp ST(1) and fucompp, with C0-C3 preset both to
+# 0 and to 1 (tests/test_classic_region_x87.py records the probe).
+FCMP_OUTCOMES = ("eq", "gt", "lt", "un")
+FCMP_BITS: dict[str, dict[str, int]] = {
+    "gt": {"c0": 0, "c1": 0, "c2": 0, "c3": 0},
+    "lt": {"c0": 1, "c1": 0, "c2": 0, "c3": 0},
+    "eq": {"c0": 0, "c1": 0, "c2": 0, "c3": 1},
+    "un": {"c0": 1, "c1": 0, "c2": 1, "c3": 1},
+}
+_MIRROR = {"gt": "lt", "lt": "gt", "eq": "eq", "un": "un"}
+# AH after ``fnstsw ax``: bit 0 C0, 1 C1, 2 C2, 3-5 TOP, 6 C3, 7 B.
+_AH_BITS = ((0, "c0"), (1, "c1"), (2, "c2"), (6, "c3"))
+
+
+def _is_fswh(value: Term) -> bool:
+    return value[0] == "b" and value[2][0] == "fswh"
+
+
+def _fsw_mask(name: str, left: Term, right: Term) -> Term:
+    """``and``/``test`` of AH (after ``fnstsw ax``) with an immediate.
+
+    The result names exactly the bits the mask keeps.  A kept condition bit
+    that the last x87 instruction left undefined is refused: Intel defines
+    C0, C2 and C3 only after a compare, and the simulator never guesses what
+    a processor leaves in an undefined bit.
+    """
+    status, other = (left, right) if _is_fswh(left) else (right, left)
+    mask = _small_const(other)
+    require(
+        name == "and" and mask is not None,
+        "an x87 status-word byte is combined other than by masking it with an immediate, which "
+        "is outside the simulator's closed set",
+    )
+    c0, c1, c2, c3, top, exceptions = status[2][1:]
+    terms = {"c0": c0, "c1": c1, "c2": c2, "c3": c3}
+    kept: list[tuple[str, Term]] = []
+    for bit, bit_name in _AH_BITS:
+        if not cast(int, mask) >> bit & 1:
+            continue
+        term = terms[bit_name]
+        require(
+            term[0] != "x87undef",
+            f"the x87 condition bit {bit_name.upper()} is read but the last x87 instruction left it "
+            "undefined",
+        )
+        if term != ("fbit", 0):
+            kept.append((bit_name, term))
+    if cast(int, mask) & 0x38:
+        kept.append(("top", (cast(int, mask) & 0x38, top)))
+    if cast(int, mask) & 0x80:
+        kept.append(("b", exceptions))
+    if not kept:
+        return _small(8, 0)
+    return ("b", 8, ("fswand", mask, tuple(kept)))
+
+
+def fcc_atom(compare: Term, outcomes: Iterable[str]) -> Term | bool:
+    """The canonical atom "the compare's outcome lies in ``outcomes``", or a constant.
+
+    A compare of ``a`` with ``b`` has outcome ``gt`` exactly when one of
+    ``b`` with ``a`` has ``lt``; the atom names the operand pair in a fixed
+    order and mirrors the outcome set to match, so both spellings meet.
+    """
+    chosen = frozenset(outcomes)
+    if not chosen:
+        return False
+    if len(chosen) == len(FCMP_OUTCOMES):
+        return True
+    _tag, left, right = compare
+    if repr(right) < repr(left):
+        compare = ("fcmp", right, left)
+        chosen = frozenset(_MIRROR[outcome] for outcome in chosen)
+    return ("fcc", compare, tuple(sorted(chosen)))
+
+
+def _fsw_zero(result: Term) -> Term | bool | None:
+    """``(AH & mask) == 0`` as an outcome set of one compare, when the kept bits are its own."""
+    kept = result[2][2]
+    compares = set()
+    for bit_name, term in kept:
+        if bit_name not in ("c0", "c2", "c3") or term[0] != "fcbit":
+            return None
+        compares.add(term[2])
+    if len(compares) != 1:
+        return None
+    names = {bit_name for bit_name, _term in kept}
+    return fcc_atom(
+        next(iter(compares)),
+        (o for o in FCMP_OUTCOMES if all(FCMP_BITS[o][name] == 0 for name in names)),
+    )
+
+
+def _fcc_allowed(conditions: Iterable[tuple[Term, bool]]) -> dict[Term, frozenset[str]]:
+    """The outcomes each compare can still have under a path condition."""
+    allowed: dict[Term, frozenset[str]] = {}
+    for atom, value in conditions:
+        if isinstance(atom, tuple) and atom[0] == "fcc":
+            outcomes = frozenset(atom[2])
+            if not value:
+                outcomes = frozenset(FCMP_OUTCOMES) - outcomes
+            allowed[atom[1]] = allowed.get(atom[1], frozenset(FCMP_OUTCOMES)) & outcomes
+    return allowed
+
+
 # --- conditions ---------------------------------------------------------------
 
 
@@ -259,6 +378,10 @@ def _eqz(width: int, value: Term) -> Term | bool:
     small = _small_const(value)
     if small is not None:
         return small == 0
+    if value[2][0] == "fswand":
+        decided = _fsw_zero(value)
+        if decided is not None:
+            return decided
     return ("eqz", width, value)
 
 
@@ -370,6 +493,103 @@ def canonical_flag(name: str, term: Term) -> Term:
 # --- execution state ------------------------------------------------------------
 
 
+X87_CONDITION_BITS = ("c0", "c1", "c2", "c3")
+
+
+@dataclass
+class X87State:
+    """The x87 unit along one path, relative to the region's entry.
+
+    ``push`` is the net number of pushes since the entry (negative after
+    more pops than pushes), so ST(i) is the entry-relative *position*
+    ``i - push``: position ``k >= 0`` is the entry's ST(k), a negative
+    position a slot the region pushed.  ``slots`` holds every position the
+    path has written; a position it has not written holds the entry term
+    ``("fst0", k)`` (``("fst@", call, k)`` after a call).  ``need`` is one
+    more than the deepest entry position the path touched (the entry depth
+    must be at least ``need``) and ``peak`` the largest ``push`` (the entry
+    depth plus ``peak`` must not exceed eight).  ``cc`` holds C0-C3; an
+    undefined bit is a fresh ``("x87undef", ...)`` term.  ``events`` lists
+    every operation that can raise a floating-point exception, so two paths
+    with equal event sets leave equal sticky exception flags.
+    """
+
+    push: int = 0
+    slots: dict[int, Term] = field(default_factory=dict)
+    base: Term = None
+    need: int = 0
+    peak: int = 0
+    cc: dict[str, Term] = field(
+        default_factory=lambda: {name: ("fcc0", name) for name in X87_CONDITION_BITS}
+    )
+    events: list[Term] = field(default_factory=list)
+    used: bool = False
+    after_call: bool = False
+
+    def fork(self) -> X87State:
+        return X87State(
+            self.push,
+            dict(self.slots),
+            self.base,
+            self.need,
+            self.peak,
+            dict(self.cc),
+            list(self.events),
+            self.used,
+            self.after_call,
+        )
+
+    def entry_term(self, position: int) -> Term:
+        return ("fst0", position) if self.base is None else ("fst@", self.base, position)
+
+    def view(self) -> X87View:
+        live = tuple(
+            sorted(
+                ((position, term) for position, term in self.slots.items() if position >= -self.push),
+                key=lambda item: item[0],
+            )
+        )
+        return X87View(self.base, self.push, live, self.need, self.peak, self.used)
+
+
+@dataclass(frozen=True)
+class X87View:
+    """A path's x87 stack at its exit: the registers from TOP down, and its bounds."""
+
+    base: Term = None
+    push: int = 0
+    slots: tuple[tuple[int, Term], ...] = ()
+    need: int = 0
+    peak: int = 0
+    used: bool = False
+
+    def term(self, position: int) -> Term:
+        for at, term in self.slots:
+            if at == position:
+                return term
+        return ("fst0", position) if self.base is None else ("fst@", self.base, position)
+
+
+def x87_stacks_equivalent(left: X87View, right: X87View) -> str | None:
+    """None when two exits leave the same x87 stack (the same TOP and every register), else why.
+
+    Both start from one entry stack of some depth D.  Equal net pushes give
+    the same TOP and the same depth; every position from TOP down that
+    either path wrote must hold equal terms, and a position neither wrote
+    holds the same entry register in both.  Registers below the entry depth
+    are empty in both.
+    """
+    if left.push != right.push:
+        return f"they leave the x87 stack at depths {left.push:+d} and {right.push:+d} from its entry"
+    if left.base != right.base:
+        return "their x87 stacks descend from different calls"
+    positions = {at for at, _term in left.slots} | {at for at, _term in right.slots}
+    for position in sorted(positions):
+        if left.term(position) != right.term(position):
+            return f"they leave different values in ST({position + left.push})"
+    return None
+
+
 @dataclass
 class PathState:
     """One path's machine state while it runs through the region."""
@@ -382,6 +602,7 @@ class PathState:
     relocations_read: set[int] = field(default_factory=set)
     epoch: Term = None
     events: list[Term] = field(default_factory=list)
+    fpu: X87State = field(default_factory=X87State)
 
     def fork(self) -> PathState:
         return PathState(
@@ -393,6 +614,7 @@ class PathState:
             set(self.relocations_read),
             self.epoch,
             list(self.events),
+            self.fpu.fork(),
         )
 
 
@@ -408,6 +630,8 @@ class PathResult:
     relocations_read: frozenset[int]
     exit: int = 0
     events: tuple[Term, ...] = ()
+    x87: X87View = field(default_factory=X87View)
+    fcc: dict[str, Term] = field(default_factory=dict)
 
 
 def entry_state(entry_names: Mapping[str, str] | None = None) -> PathState:
@@ -828,17 +1052,35 @@ def _call(
         f"{context}: a call to {symbol!r}, whose decoration does not fix a register-free "
         "convention, is outside the simulator's closed set",
     )
-    identity = (
+    fpu = state.fpu
+    identity: Term = (
         "call",
         callee,
         state.regs["esp"],
         store_normal_form(state.stores),
         state.epoch,
     )
+    if fpu.used or fpu.base is not None:
+        # The callee runs from this x87 state: the stack and the sticky
+        # exception flags (the event set so far).  The calling convention
+        # gives a callee no input in C0-C3.
+        identity = (
+            *identity,
+            (fpu.base, fpu.push, fpu.view().slots),
+            tuple(sorted(set(fpu.events), key=repr)),
+        )
     state.events.append(identity)
     state.footprint.add(("event", identity))
     state.stores = []
     state.epoch = identity
+    # The x87 state after the call is the callee's function of the state
+    # before it (named by the event); how many values it leaves on the stack
+    # is not modelled, so no x87 instruction may follow inside the region.
+    fpu.base = identity
+    fpu.push = 0
+    fpu.slots = {}
+    fpu.cc = {name: ("fcccall", identity, fpu.cc[name]) for name in X87_CONDITION_BITS}
+    fpu.after_call = True
     for name in ("eax", "ecx", "edx"):
         state.regs[name] = lin_atom(("callret", name, identity))
     state.regs["esp"] = lin_add(state.regs["esp"], lin(cast(int, pop)))
@@ -849,6 +1091,213 @@ def _call(
 def _push(state: PathState, value: Term) -> None:
     state.regs["esp"] = lin_add(state.regs["esp"], lin(-4))
     _store(state, state.regs["esp"], 4, value)
+
+
+# --- x87 ------------------------------------------------------------------------
+
+# The value each arithmetic digit computes from ST(0) and the other operand
+# (ST(i) or memory): digit 4 is ST(0) - other, 5 other - ST(0), 6 ST(0) /
+# other and 7 other / ST(0), in D8 (result in ST(0)) and DC/DE (result in
+# ST(i)) alike.  Measured with MSVC 5.0 inline assembly under Wine, raw
+# encodings, for every D8/DC/DE register form with i = 1 and 2 (see
+# tests/test_classic_region_x87.py).  Subtraction and division are named by
+# their minuend and dividend, so ``fsub`` and ``fsubr`` that compute the same
+# difference meet: the role probe found the result and the exception flags of
+# every subtract (divide) encoding to be one function of (minuend,
+# subtrahend) whichever register held which.  Addition and multiplication
+# keep the order (destination, source); no commutativity is assumed.
+_X87_ARITH = {0: "add", 1: "mul", 4: "sub", 5: "subr", 6: "div", 7: "divr"}
+
+
+def _x87_arith(kind: str, st0: Term, other: Term, destination_is_st0: bool) -> Term:
+    if kind == "sub":
+        return ("fop", "sub", st0, other)
+    if kind == "subr":
+        return ("fop", "sub", other, st0)
+    if kind == "div":
+        return ("fop", "div", st0, other)
+    if kind == "divr":
+        return ("fop", "div", other, st0)
+    pair = (st0, other) if destination_is_st0 else (other, st0)
+    return ("fop", kind, *pair)
+
+
+class _X87:
+    """The x87 operations of one instruction on one path's state."""
+
+    def __init__(self, state: PathState, undefined: _Undefined, context: str) -> None:
+        self.state = state
+        self.fpu = state.fpu
+        self.undefined = undefined
+        self.context = context
+
+    def position(self, index: int) -> int:
+        position = index - self.fpu.push
+        if position >= 0:
+            # The entry's ST(position) must be a full register.
+            self.fpu.need = max(self.fpu.need, position + 1)
+        return position
+
+    def get(self, index: int) -> Term:
+        position = self.position(index)
+        return self.fpu.slots.get(position, self.fpu.entry_term(position))
+
+    def put(self, index: int, value: Term) -> None:
+        self.fpu.slots[self.position(index)] = value
+
+    def push(self, value: Term) -> None:
+        self.fpu.push += 1
+        self.fpu.peak = max(self.fpu.peak, self.fpu.push)
+        self.fpu.slots[-self.fpu.push] = value
+
+    def pop(self) -> None:
+        self.fpu.slots.pop(self.position(0), None)
+        self.fpu.push -= 1
+
+    def event(self, term: Term) -> None:
+        """An operation that can raise a floating-point exception."""
+        self.fpu.events.append(term)
+        self.state.footprint.add(("fpe", term))
+
+    def undefine(self) -> None:
+        """Every condition bit after an instruction that is not a compare (Intel: undefined)."""
+        for name in X87_CONDITION_BITS:
+            self.undefined.count += 1
+            self.fpu.cc[name] = ("x87undef", name, self.undefined.tag, self.undefined.count)
+
+    def compare(self, kind: str, other: Term) -> None:
+        compare = ("fcmp", self.get(0), other)
+        self.event((kind, *sorted(compare[1:], key=repr)))
+        for name in ("c0", "c2", "c3"):
+            self.fpu.cc[name] = ("fcbit", name, compare)
+        self.fpu.cc["c1"] = ("fbit", 0)
+
+    def status_word(self) -> Term:
+        fpu = self.fpu
+        exceptions = ("fexc", fpu.base, tuple(sorted(set(fpu.events), key=repr)))
+        top = ("ftop", fpu.base, fpu.push)
+        return ("b", 16, ("fsw", fpu.cc["c0"], fpu.cc["c1"], fpu.cc["c2"], fpu.cc["c3"], top, exceptions))
+
+
+def _x87_step(state: PathState, item: _Instruction, undefined: _Undefined) -> None:
+    """Execute one x87 instruction of the closed set (see the module docstring)."""
+    context = item.context
+    require(
+        not item.operand16, f"{context}: an operand-size-prefixed x87 instruction is outside the closed set"
+    )
+    require(
+        not state.fpu.after_call,
+        f"{context}: an x87 instruction after a call inside the region is outside the simulator's "
+        "closed set (the callee's effect on the x87 stack is not modelled)",
+    )
+    x87 = _X87(state, undefined, context)
+    state.fpu.used = True
+    op = item.opcode
+    mod, digit, index = item.modrm()
+    refused = f"{context}: the x87 instruction {item.raw.hex()} is outside the simulator's closed set"
+    if mod != 3:
+        if op in (0xD8, 0xDC):
+            width = 4 if op == 0xD8 else 8
+            operand = ("fmem", width * 8, _load(state, item.address(state.regs), width))
+            if digit in (2, 3):
+                x87.compare("fcom", operand)
+                if digit == 3:
+                    x87.pop()
+                return
+            st0 = x87.get(0)
+            result = _x87_arith(_X87_ARITH[digit], st0, operand, True)
+            x87.event(result)
+            x87.put(0, result)
+            x87.undefine()
+            return
+        if op in (0xD9, 0xDD) and digit in (0, 2, 3):
+            width = 4 if op == 0xD9 else 8
+            address = item.address(state.regs)
+            if digit == 0:
+                value = ("fld", width * 8, _load(state, address, width))
+                x87.event(value)
+                x87.push(value)
+            else:
+                # A store rounds the register to the slot's format: the
+                # memory holds the rounding of the value, never the value.
+                stored = ("fstm", width * 8, x87.get(0))
+                x87.event(stored)
+                _store(state, address, width, lin_atom(stored) if width == 4 else ("b", 64, stored))
+                if digit == 3:
+                    x87.pop()
+            x87.undefine()
+            return
+        integer = {(0xDF, 0): 2, (0xDB, 0): 4, (0xDF, 5): 8}.get((op, digit))
+        require(integer is not None, refused)
+        # fild: every 16-, 32- and 64-bit integer converts exactly.
+        x87.push(("fild", cast(int, integer) * 8, _load(state, item.address(state.regs), cast(int, integer))))
+        x87.undefine()
+        return
+    if op in (0xD8, 0xDC, 0xDE) and digit in _X87_ARITH:
+        st0, other = x87.get(0), x87.get(index)
+        result = _x87_arith(_X87_ARITH[digit], st0, other, op == 0xD8)
+        x87.event(result)
+        if op == 0xD8:
+            x87.put(0, result)
+        else:
+            x87.put(index, result)
+            if op == 0xDE:
+                x87.pop()
+        x87.undefine()
+        return
+    if op == 0xD8 and digit in (2, 3):
+        x87.compare("fcom", x87.get(index))
+        if digit == 3:
+            x87.pop()
+        return
+    if (op, digit, index) in ((0xDE, 3, 1), (0xDA, 5, 1)):
+        # fcompp / fucompp: ST(0) with ST(1), then two pops.
+        x87.compare("fcom" if op == 0xDE else "fucom", x87.get(1))
+        x87.pop()
+        x87.pop()
+        return
+    if op == 0xDD and digit in (4, 5):
+        x87.compare("fucom", x87.get(index))
+        if digit == 5:
+            x87.pop()
+        return
+    if op == 0xDD and digit in (2, 3):
+        # fst/fstp ST(i): an exact register copy.
+        x87.put(index, x87.get(0))
+        if digit == 3:
+            x87.pop()
+        x87.undefine()
+        return
+    if op == 0xD9 and digit == 0:
+        x87.push(x87.get(index))
+        x87.undefine()
+        return
+    if op == 0xD9 and digit == 1:
+        first, other = x87.get(0), x87.get(index)
+        x87.put(0, other)
+        x87.put(index, first)
+        x87.undefine()
+        return
+    if op == 0xD9 and digit == 4 and index in (0, 1):
+        x87.put(0, ("fun", "chs" if index == 0 else "abs", x87.get(0)))
+        x87.undefine()
+        return
+    if op == 0xD9 and digit == 5 and index in (0, 6):
+        x87.push(("fconst", 1 if index == 0 else 0))
+        x87.undefine()
+        return
+    if op == 0xD9 and digit == 7 and index == 2:
+        result = ("fun", "sqrt", x87.get(0))
+        x87.event(result)
+        x87.put(0, result)
+        x87.undefine()
+        return
+    if op == 0xDF and digit == 4 and index == 0:
+        # fnstsw ax: AX takes the whole status word; Intel leaves C0-C3 undefined after it.
+        _set(state, 0, 16, x87.status_word())
+        x87.undefine()
+        return
+    require(False, refused)
 
 
 def _step(state: PathState, item: _Instruction, undefined: _Undefined) -> tuple[str, Any]:
@@ -863,6 +1312,9 @@ def _step(state: PathState, item: _Instruction, undefined: _Undefined) -> tuple[
             "set",
         )
     width32 = 16 if item.operand16 else 32
+    if 0xD8 <= op <= 0xDF:
+        _x87_step(state, item, undefined)
+        return ("fall", None)
     if op in (0x88, 0x89, 0x8A, 0x8B):
         width = 8 if op in (0x88, 0x8A) else width32
         _mod, reg, _rm = item.modrm()
@@ -1243,6 +1695,14 @@ def simulate_region(
             if atom in known:
                 offset = target if known[atom] == taken_value else following
                 continue
+            if atom[0] == "fcc":
+                # The path may already pin the compare's outcome to a set
+                # inside (or outside) this atom's.
+                allowed = _fcc_allowed(state.conditions).get(atom[1])
+                if allowed is not None and (allowed <= set(atom[2]) or not allowed & set(atom[2])):
+                    holds = allowed <= set(atom[2])
+                    offset = target if holds == taken_value else following
+                    continue
             other = state.fork()
             other.conditions.append((atom, not taken_value))
             state.conditions.append((atom, taken_value))
@@ -1256,6 +1716,10 @@ def simulate_region(
         for item in instructions.values():
             consumed |= item.consumed
         state.relocations_read |= consumed
+        require(
+            not mentions_x87_undefined((state.conditions, state.stores, state.footprint)),
+            f"{context}: a path reads an x87 condition bit the last x87 instruction left undefined",
+        )
         results.append(
             PathResult(
                 tuple(state.conditions),
@@ -1266,6 +1730,8 @@ def simulate_region(
                 frozenset(state.relocations_read),
                 offset,
                 tuple(state.events),
+                state.fpu.view(),
+                dict(state.fpu.cc),
             )
         )
     if first == start:
@@ -1284,17 +1750,35 @@ def simulate_region(
 def contradictory(left: Iterable[tuple[Term, bool]], right: Iterable[tuple[Term, bool]]) -> bool:
     """Whether two path conditions assign one atom different values."""
     decided = dict(left)
-    return any(atom in decided and decided[atom] != value for atom, value in right)
+    if any(atom in decided and decided[atom] != value for atom, value in right):
+        return True
+    return any(not outcomes for outcomes in _fcc_allowed([*left, *right]).values())
+
+
+def mentions_x87_undefined(value: Term) -> bool:
+    """Whether a term mentions a condition bit an x87 instruction left undefined."""
+    stack = [value]
+    seen: set[int] = set()
+    while stack:
+        current = stack.pop()
+        if isinstance(current, (tuple, list, frozenset, set)):
+            if id(current) in seen:
+                continue
+            seen.add(id(current))
+            if isinstance(current, tuple) and current and current[0] == "x87undef":
+                return True
+            stack.extend(current)
+    return False
 
 
 def term_atoms(value: Term, found: set[Term] | None = None) -> set[Term]:
-    """Every ``reg0``/``flag0`` leaf a term mentions."""
+    """Every ``reg0``/``flag0``/``fcc0`` leaf a term mentions (entry registers, flags, C0-C3)."""
     found = set() if found is None else found
     stack = [value]
     while stack:
         current = stack.pop()
         if isinstance(current, tuple):
-            if len(current) == 2 and current[0] in ("reg0", "flag0"):
+            if len(current) == 2 and current[0] in ("reg0", "flag0", "fcc0"):
                 found.add(current)
                 continue
             stack.extend(current)
@@ -1335,9 +1819,17 @@ def stores_equivalent(
 
 
 __all__ = [
+    "FCMP_BITS",
+    "FCMP_OUTCOMES",
     "FLAG_NAMES",
     "MAX_PATHS",
+    "X87_CONDITION_BITS",
     "PathResult",
+    "X87State",
+    "X87View",
+    "fcc_atom",
+    "mentions_x87_undefined",
+    "x87_stacks_equivalent",
     "RelocationTarget",
     "address_relation",
     "callee_stack_pop",
