@@ -53,9 +53,11 @@ from reprobit.classic.rewriting_region_resize import (
     apply_region_resize,
     protected_code_offsets,
     refine_call_reads,
+    region_helper_callees,
     resized_donor_object,
 )
 from reprobit.classic.scheduling_certificates import measure_instruction_schedule_debug_envelope
+from reprobit.classic.toolchain_helpers import HelperLibrary
 from reprobit.classic_donors import DonorSourceError, merge_candidate_constraints
 from reprobit.classic_project import (
     ClassicDispatchMaterials,
@@ -529,8 +531,14 @@ def build_region_resize_rewriting(
     seed_object: bytes,
     donor_object: bytes,
     reference_object: bytes,
+    helper_library: HelperLibrary | None = None,
 ) -> DeclarationShapeEqualBodyAuthoring:
-    """Author a region-resize consumer whose proved replacements reach the reference body."""
+    """Author a region-resize consumer whose proved replacements reach the reference body.
+
+    ``helper_library`` is the authenticated toolchain library the bodies of
+    compiler helpers a region calls are read from (`classic.toolchain_helpers`);
+    without it such a region refuses in the simulator, as before.
+    """
 
     for name, value in (
         ("seed_object", seed_object),
@@ -629,6 +637,13 @@ def build_region_resize_rewriting(
                             reference_body,
                             (donor_targets, reference_targets, aligned),
                         )
+                        helpers = (
+                            region_helper_callees(
+                                regions, donor_rows, helper_library, f"{context} helpers"
+                            )[0]
+                            if helper_library is not None
+                            else {}
+                        )
                         image, proof = apply_region_resize(
                             donor_body,
                             regions,
@@ -642,6 +657,7 @@ def build_region_resize_rewriting(
                             prologue_length=prologue,
                             bijection=bijection,
                             frame_pointer_free=frame_pointer_free,
+                            helpers=helpers,
                         )
                     except (ByteIdentityError, DiscoveryAuthoringError) as exc:
                         refused = getattr(exc, "region", None)
@@ -890,6 +906,12 @@ def build_region_resize_rewriting(
             "region_resize.expected_carried_code_symbols": derived_detail["carried_code_symbols"],
             "region_resize.expected_collapsed_line_rows": derived_detail["collapsed_line_rows"],
         }
+        if helper_library is not None:
+            helper_pins = region_helper_callees(
+                regions, donor_rows, helper_library, f"{context} helpers"
+            )[1]
+            if helper_pins:
+                expected["region_resize.expected_helper_callees"] = helper_pins
         if code_end != proc:
             expected["region_resize.expected_code_length"] = code_end
         if bijection is not None:
@@ -945,6 +967,7 @@ def build_region_resize_rewriting(
                 seed_object=seed_object,
                 donor_object=donor_object,
                 candidate_constraints=constraints,
+                helper_library=helper_library,
             ),
         )
         composed = CoffObject(candidate.output)
