@@ -57,8 +57,8 @@ from reprobit.classic.rewriting_region_resize import (
     donor_void_return,
     protected_code_offsets,
     refine_call_reads,
-    release_void_return,
     region_helper_callees,
+    release_void_return,
     resized_donor_object,
 )
 from reprobit.classic.scheduling_certificates import measure_instruction_schedule_debug_envelope
