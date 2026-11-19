@@ -163,7 +163,14 @@ corresponding points and are compared there), and hold direct calls to
 callees whose C decoration fixes a register-free convention: a call is an
 event named by the callee, ESP, the canonical store log before it and the
 previous call, both versions must make the same events, and memory after a
-call is that call's result. The module docstring of
+call is that call's result. EAX counts as live at every `ret` unless the
+record declares `expected_void_return`: the donor object's own CodeView
+records (its MSVC 5.0 procedure record and the LF_PROCEDURE record in the
+object's one `.debug$T`, so a `/Z7` compile) type the function as returning
+exactly `void`. A caller of a void function cannot read EAX, so EAX is dead
+at its returns. The type index and the record's digest are pinned. A missing
+type stream, a PDB type server (`/Zi`) or any other return type keeps EAX
+live, and the reference object is never consulted. The module docstring of
 `reprobit.classic.rewriting_region_resize` states the theorem and its ten
 checks.
 

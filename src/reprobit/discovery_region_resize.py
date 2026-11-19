@@ -51,8 +51,10 @@ from reprobit.classic.rewriting_region_resize import (
     _register_level_live,
     _sigma_rewrite,
     apply_region_resize,
+    donor_void_return,
     protected_code_offsets,
     refine_call_reads,
+    release_void_return,
     resized_donor_object,
 )
 from reprobit.classic.scheduling_certificates import measure_instruction_schedule_debug_envelope
@@ -642,6 +644,7 @@ def build_region_resize_rewriting(
                             prologue_length=prologue,
                             bijection=bijection,
                             frame_pointer_free=frame_pointer_free,
+                            void_return=void_pin is not None,
                         )
                     except (ByteIdentityError, DiscoveryAuthoringError) as exc:
                         refused = getattr(exc, "region", None)
@@ -719,124 +722,148 @@ def build_region_resize_rewriting(
             return attempt
 
         frame_pointer_free = False
-        try:
-            regions, image, proof = search(donor_keys, None)
-            bijection: dict[str, Any] | None = None
-        except DiscoveryAuthoringError as plain_refusal:
-            found = None
-            donor_items = refine_call_reads(
-                decode_ia32_bijection_body(
-                    donor_body,
-                    f"{context} donor",
-                    relocation_symbol_map(donor_rows),
-                    None if code_end == len(donor_body) else code_end,
-                ),
-                relocation_symbol_map(donor_rows),
-            )
-            reference_items = decode_ia32_bijection_body(
-                reference_body,
-                f"{context} reference",
-                relocation_symbol_map(reference_rows),
-                None if reference_code_end == len(reference_body) else reference_code_end,
-            )
-            pairs = _register_pairs(
-                donor_body,
-                donor_items,
-                reference_body,
-                reference_items,
-                _instruction_keys(
-                    donor_body, donor_rows, code_end, f"{context} donor", mask_registers=True
-                ),
-                _instruction_keys(
-                    reference_body,
-                    reference_rows,
-                    reference_code_end,
-                    f"{context} reference",
-                    mask_registers=True,
-                ),
-            )
-            tried = []
-            for sigma in _bijection_candidates(pairs):
-                frame_pointer_free = False
-                if "ebp" in sigma:
-                    try:
-                        require_frame_pointer_free_frame(
-                            donor_coff, dp, donor_body, donor_items, f"{context} frame proof"
-                        )
-                    except ByteIdentityError:
-                        continue
-                    frame_pointer_free = True
-                forced: set[int] = set()
-                seen: list[list[list[int]]] = []
-                for _round in range(MAX_SCOPE_ROUNDS):
-                    scopes = _bijection_scopes(
-                        sigma,
+        void_pin: dict[str, Any] | None = None
+
+        def prove() -> tuple[list[dict[str, Any]], bytes, dict[str, Any], dict[str, Any] | None]:
+            nonlocal frame_pointer_free
+            try:
+                regions, image, proof = search(donor_keys, None)
+            except DiscoveryAuthoringError as plain_refusal:
+                found = None
+                donor_items = refine_call_reads(
+                    decode_ia32_bijection_body(
                         donor_body,
-                        donor_items,
-                        pairs,
-                        code_end,
-                        f"{context} bijection",
-                        frozenset(forced),
-                    )
-                    if not scopes or scopes in seen:
-                        break
-                    seen.append(scopes)
-                    declared = {"mapping": dict(sorted(sigma.items())), "scopes": scopes}
-                    rewritten = bytearray(donor_body)
-                    unique = set()
-                    for item in donor_items:
-                        if not any(left <= item["offset"] < right for left, right in scopes):
-                            continue
-                        saved = bytes(rewritten)
+                        f"{context} donor",
+                        relocation_symbol_map(donor_rows),
+                        None if code_end == len(donor_body) else code_end,
+                    ),
+                    relocation_symbol_map(donor_rows),
+                )
+                if void_pin is not None:
+                    donor_items = release_void_return(donor_items)
+                reference_items = decode_ia32_bijection_body(
+                    reference_body,
+                    f"{context} reference",
+                    relocation_symbol_map(reference_rows),
+                    None if reference_code_end == len(reference_body) else reference_code_end,
+                )
+                pairs = _register_pairs(
+                    donor_body,
+                    donor_items,
+                    reference_body,
+                    reference_items,
+                    _instruction_keys(
+                        donor_body, donor_rows, code_end, f"{context} donor", mask_registers=True
+                    ),
+                    _instruction_keys(
+                        reference_body,
+                        reference_rows,
+                        reference_code_end,
+                        f"{context} reference",
+                        mask_registers=True,
+                    ),
+                )
+                tried = []
+                for sigma in _bijection_candidates(pairs):
+                    frame_pointer_free = False
+                    if "ebp" in sigma:
                         try:
-                            _sigma_rewrite(
-                                rewritten,
-                                item,
-                                sigma,
-                                {
-                                    row["offset"] + k
-                                    for row in donor_rows
-                                    for k in range(row["width"])
-                                },
-                                f"{context} bijection",
+                            require_frame_pointer_free_frame(
+                                donor_coff, dp, donor_body, donor_items, f"{context} frame proof"
                             )
                         except ByteIdentityError:
-                            rewritten[:] = saved
-                            unique.add(item["offset"])
-                    try:
-                        mapped_keys = _instruction_keys(
-                            bytes(rewritten),
-                            donor_rows,
-                            code_end,
-                            f"{context} donor under the bijection",
-                            unique=frozenset(unique),
-                        )
-                    except ByteIdentityError:
-                        break
-                    if [key[:2] for key in mapped_keys] != [key[:2] for key in donor_keys]:
-                        break
-                    try:
-                        regions, image, proof = search(mapped_keys, declared)
-                    except DiscoveryAuthoringError as exc:
-                        bound = getattr(exc, "scope_bound", None)
-                        if bound is not None and bound not in forced:
-                            # A bound the image's liveness refuses: treat it as live
-                            # and choose the scopes again.
-                            forced.add(bound)
                             continue
-                        tried.append(f"{declared['mapping']}: {exc}")
+                        frame_pointer_free = True
+                    forced: set[int] = set()
+                    seen: list[list[list[int]]] = []
+                    for _round in range(MAX_SCOPE_ROUNDS):
+                        scopes = _bijection_scopes(
+                            sigma,
+                            donor_body,
+                            donor_items,
+                            pairs,
+                            code_end,
+                            f"{context} bijection",
+                            frozenset(forced),
+                        )
+                        if not scopes or scopes in seen:
+                            break
+                        seen.append(scopes)
+                        declared = {"mapping": dict(sorted(sigma.items())), "scopes": scopes}
+                        rewritten = bytearray(donor_body)
+                        unique = set()
+                        for item in donor_items:
+                            if not any(left <= item["offset"] < right for left, right in scopes):
+                                continue
+                            saved = bytes(rewritten)
+                            try:
+                                _sigma_rewrite(
+                                    rewritten,
+                                    item,
+                                    sigma,
+                                    {
+                                        row["offset"] + k
+                                        for row in donor_rows
+                                        for k in range(row["width"])
+                                    },
+                                    f"{context} bijection",
+                                )
+                            except ByteIdentityError:
+                                rewritten[:] = saved
+                                unique.add(item["offset"])
+                        try:
+                            mapped_keys = _instruction_keys(
+                                bytes(rewritten),
+                                donor_rows,
+                                code_end,
+                                f"{context} donor under the bijection",
+                                unique=frozenset(unique),
+                            )
+                        except ByteIdentityError:
+                            break
+                        if [key[:2] for key in mapped_keys] != [key[:2] for key in donor_keys]:
+                            break
+                        try:
+                            regions, image, proof = search(mapped_keys, declared)
+                        except DiscoveryAuthoringError as exc:
+                            bound = getattr(exc, "scope_bound", None)
+                            if bound is not None and bound not in forced:
+                                # A bound the image's liveness refuses: treat it as live
+                                # and choose the scopes again.
+                                forced.add(bound)
+                                continue
+                            tried.append(f"{declared['mapping']}: {exc}")
+                            break
+                        found = (regions, image, proof, declared)
                         break
-                    found = (regions, image, proof, declared)
-                    break
-                if found is not None:
-                    break
-            if found is None:
-                if tried:
-                    raise DiscoveryAuthoringError(
-                        f"{plain_refusal}; under a register bijection: {tried[0]}"
-                    ) from plain_refusal
-                raise
-            regions, image, proof, bijection = found
+                    if found is not None:
+                        break
+                if found is None:
+                    if tried:
+                        raise DiscoveryAuthoringError(
+                            f"{plain_refusal}; under a register bijection: {tried[0]}"
+                        ) from plain_refusal
+                    raise
+                return found
+            return regions, image, proof, None
+
+        try:
+            regions, image, proof, bijection = prove()
+        except DiscoveryAuthoringError as live_refusal:
+            # EAX is live at every return unless the donor's own type records
+            # say the function returns void; only then is it tried dead there.
+            try:
+                void_pin = donor_void_return(donor_coff, dp, f"{context} void return")
+            except ByteIdentityError as exc:
+                raise DiscoveryAuthoringError(
+                    f"{live_refusal}; EAX stays live at ret: {exc}"
+                ) from live_refusal
+            try:
+                regions, image, proof, bijection = prove()
+            except DiscoveryAuthoringError as exc:
+                raise DiscoveryAuthoringError(
+                    f"{exc} (with EAX dead at ret: the donor's type returns void)"
+                ) from exc
         if proof["image_proc_size"] != reference_proc:
             raise DiscoveryAuthoringError("the image's procedure size differs from the reference's")
         derived, derived_detail = resized_donor_object(
@@ -892,6 +919,8 @@ def build_region_resize_rewriting(
         }
         if code_end != proc:
             expected["region_resize.expected_code_length"] = code_end
+        if void_pin is not None:
+            expected["region_resize.expected_void_return"] = void_pin
         if bijection is not None:
             expected["region_resize.expected_bijection_rewrites"] = proof["bijection_rewrites"]
             expected["region_resize.expected_bijection_mode_changes"] = proof[
