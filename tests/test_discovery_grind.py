@@ -81,6 +81,7 @@ def _context(
             spec=SimpleNamespace(
                 project_id=f"project.{label}",
                 state_dir=".reprobit-state",
+                toolchain=SimpleNamespace(profile=f"profile.{label}"),
             ),
             interventions=(),
         ),
@@ -602,3 +603,78 @@ def test_no_solution_never_publishes_even_with_advance_acceptance(
     assert result.cold_trials == 1
     assert len(result.rejections) == 2
     assert trace.publication_calls == 0
+
+
+def test_the_sealed_profile_s_toolchain_library_reaches_every_donor_rewriting(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from reprobit.discovery_authoring import DiscoveryAuthoringError
+
+    live_root, _staged_root, _trace, callbacks = _install_grind_fixture(
+        monkeypatch,
+        tmp_path,
+        live_states=(_state(1, 1), _state(2, 2)),
+        qualification_rejections=frozenset({(1, 1), (2, 2)}),
+    )
+    library = object()
+    loads: list[str] = []
+    received: list[object] = []
+
+    def load(profile: str) -> object:
+        loads.append(profile)
+        return library
+
+    def rewriting(*_args: object, helper_library: object = None, **_kwargs: object) -> None:
+        received.append(helper_library)
+        raise DiscoveryAuthoringError("fixture rewriting refusal")
+
+    monkeypatch.setattr(grind, "_state_rewriting", rewriting)
+    callbacks = ProjectGrindCallbacks(
+        callbacks.probe_seed,
+        callbacks.probe_donors,
+        callbacks.cold_verify,
+        helper_library=load,
+    )
+
+    result = run_project_grind(live_root, callbacks=callbacks)
+
+    assert result.solution is None
+    assert loads == ["profile.sealed"]
+    assert received == [library, library]
+
+
+def test_an_unreviewed_toolchain_library_supplies_none(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from reprobit.classic.toolchain_helpers import HelperLibraryError
+    from reprobit.discovery_authoring import DiscoveryAuthoringError
+
+    live_root, _staged_root, _trace, callbacks = _install_grind_fixture(
+        monkeypatch,
+        tmp_path,
+        live_states=(_state(1, 1),),
+        qualification_rejections=frozenset({(1, 1)}),
+    )
+    received: list[object] = []
+
+    def load(_profile: str) -> object:
+        raise HelperLibraryError("the toolchain library lib/libc.lib is not the reviewed one")
+
+    def rewriting(*_args: object, helper_library: object = None, **_kwargs: object) -> None:
+        received.append(helper_library)
+        raise DiscoveryAuthoringError("fixture rewriting refusal")
+
+    monkeypatch.setattr(grind, "_state_rewriting", rewriting)
+    callbacks = ProjectGrindCallbacks(
+        callbacks.probe_seed,
+        callbacks.probe_donors,
+        callbacks.cold_verify,
+        helper_library=load,
+    )
+
+    result = run_project_grind(live_root, callbacks=callbacks)
+
+    assert result.solution is None
+    assert received == [None]
