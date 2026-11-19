@@ -150,6 +150,19 @@ x87 state it ran from (:meth:`_X87.undefine`) in place of a fresh
 ``x87undef`` term -- equal only to the bit the same instruction leaves from
 the same state (a8 of :mod:`reprobit.classic.function_validation`).  Region
 proofs still refuse all three.
+
+A whole-function proof also admits, with exact semantics, forms no region
+proof sees: x87 arithmetic and compares on a 32- or 16-bit integer in memory
+(DA and DE /0-/7, whose operand is the exactly converted ``("fild", w,
+load)`` term); ``shl``/``shr``/``sar`` of 8- and 16-bit operands and by CL
+(:func:`_shift`, :func:`_shift_by_cl`: the count is masked to five bits, a
+count of zero leaves every flag, and a count that is a term gives flags that
+are functions of the value, the count and the flag before); ``adc`` and
+``sbb`` in every form (:func:`_carry_alu`: the carry is the canonical CF bit,
+so ``sbb r, r`` is ``-CF``); byte-wide ``not``, ``neg``, ``mul``, ``imul``,
+``div`` and ``idiv`` (:func:`_byte_wide`); ``movzx``/``movsx`` into a 16-bit
+register; and, after ``call [__imp_X]``, the x87 return count the caller
+gives for the slot's symbol.
 """
 
 from __future__ import annotations
@@ -1068,25 +1081,133 @@ _ALU_NAMES = {0: "add", 1: "or", 4: "and", 5: "sub", 6: "xor", 7: "cmp"}
 _SHIFT_NAMES = {4: "shl", 5: "shr", 7: "sar"}
 
 
-def _shift(state: PathState, kind: str, value: Term, count: int, undefined: _Undefined) -> Term:
+def _shift(
+    state: PathState,
+    kind: str,
+    value: Term,
+    count: int,
+    undefined: _Undefined,
+    width: int = 32,
+) -> Term:
+    """``shl``/``shr``/``sar`` of a ``width``-bit value by a constant count.
+
+    The processor masks the count to five bits whatever the width; a masked
+    count of zero changes neither the operand nor any flag.  Otherwise SF,
+    ZF and PF follow the result, CF is the last bit shifted out -- undefined
+    (a fresh term) when the count is at least the width, which only an 8-
+    or 16-bit operand allows -- OF is defined for a count of one only and AF
+    is undefined.
+    """
     count &= 31
     if count == 0:
         return value
-    if kind == "shl":
+    if kind == "shl" and width == 32:
         result = lin_scale(value, 1 << count)
     else:
-        constant = const_of(value)
+        constant = _constant(width, value)
         if constant is not None:
-            if kind == "shr":
-                result = lin(constant >> count)
+            if kind == "shl":
+                folded = constant << count
+            elif kind == "shr":
+                folded = constant >> count
             else:
-                result = lin(_signed(constant, 32) >> count)
+                folded = _signed(constant, width) >> count
+            result = lin(folded) if width == 32 else _small(width, folded)
         else:
-            result = lin_atom((kind, 32, (value, count)))
-    for name in ("cf", "sf", "zf", "pf"):
-        state.flags[name] = ("flag", name, kind, 32, value, count)
-    state.flags["of"] = ("flag", "of", kind, 32, value, 1) if count == 1 else undefined("of")
+            result = _opaque(kind, width, value, count)
+    for name in ("sf", "zf", "pf"):
+        state.flags[name] = ("flag", name, kind, width, value, count)
+    state.flags["cf"] = (
+        ("flag", "cf", kind, width, value, count) if count < width else undefined("cf")
+    )
+    state.flags["of"] = ("flag", "of", kind, width, value, 1) if count == 1 else undefined("of")
     state.flags["af"] = undefined("af")
+    return result
+
+
+def _shift_by_cl(
+    state: PathState, kind: str, value: Term, undefined: _Undefined, width: int
+) -> Term:
+    """``shl``/``shr``/``sar`` of a ``width``-bit value by CL (D2/D3 /4, /5, /7).
+
+    A constant CL is the constant-count shift.  Otherwise the count is the
+    term ``CL & 31`` (the processor's five-bit mask), which may be zero: the
+    result is an opaque function of the value and that count (the value
+    itself when it is zero), and SF, ZF and PF are each
+    ``("shflag", flag, kind, width, value, count, prior)`` -- the flag of the
+    result when the count is not zero and the flag's ``prior`` term when it
+    is, so one exact function of the three.  CF is the same function at 32
+    bits; at 8 and 16 bits a masked count can reach the width, where Intel
+    leaves CF undefined, so it is a fresh term.  OF (defined for a count of
+    one only) and AF (undefined for every count but zero) are fresh terms:
+    no read of either can relate the two versions.  No count is assumed
+    non-zero.
+    """
+    cl = _get(state, 1, 8)
+    small = _small_const(cl)
+    if small is not None:
+        return _shift(state, kind, value, small, undefined, width)
+    count = _bitop("and", 8, cl, _small(8, 31))
+    prior = dict(state.flags)
+    for name in ("sf", "zf", "pf"):
+        state.flags[name] = ("shflag", name, kind, width, value, count, prior[name])
+    state.flags["cf"] = (
+        ("shflag", "cf", kind, width, value, count, prior["cf"]) if width == 32 else undefined("cf")
+    )
+    state.flags["of"] = undefined("of")
+    state.flags["af"] = undefined("af")
+    return _opaque(kind, width, value, count)
+
+
+def _carry_bit(state: PathState) -> Term:
+    """CF as the 32-bit value 0 or 1: the canonical ``jb`` condition, zero-extended.
+
+    This is the value ``setb`` then ``movzx`` would give, so equal flags give
+    equal bits, and it is a constant when the flags decide it.
+    """
+    decided = condition(2, state.flags)
+    if isinstance(decided, bool):
+        return lin(int(decided))
+    atom, polarity = decided
+    return zero_extend(("b", 8, ("cc", atom, polarity)), 8)
+
+
+def _carry_alu(
+    state: PathState, name: str, width: int, left: Term, right: Term, same: bool
+) -> Term:
+    """``adc``/``sbb`` (whole-function proofs): ``left + right + CF`` or ``left - right - CF``.
+
+    CF is the bit of :func:`_carry_bit`, so a 32-bit result is an exact
+    linear form: ``sbb r, r`` is ``-CF``.  ZF, SF and PF are functions of the
+    result alone after every arithmetic instruction, so they take the
+    result's terms (``("flag", f, "logic", width, "result", result)``, the
+    form ``test`` of the result gives).  CF, OF and AF are
+    ``("carryflag", f, name, width, left, right, carry)``, exact functions of
+    the operands and the carry; when the two operands are one register
+    (``same``) ``sbb`` computes ``0 - CF``: CF is unchanged (the same term)
+    and OF is 0.
+    """
+    carry = _carry_bit(state)
+    if width == 32:
+        result = (
+            lin_add(lin_add(left, right), carry)
+            if name == "adc"
+            else lin_sub(lin_sub(left, right), carry)
+        )
+    else:
+        a, b, c = _small_const(left), _small_const(right), const_of(carry)
+        if a is not None and b is not None and c is not None:
+            result = _small(width, a + b + c if name == "adc" else a - b - c)
+        else:
+            result = ("b", width, ("op", name, (left, right, carry)))
+    prior_cf = state.flags["cf"]
+    for flag in ("zf", "sf", "pf"):
+        state.flags[flag] = ("flag", flag, "logic", width, "result", result)
+    for flag in ("cf", "of", "af"):
+        state.flags[flag] = ("carryflag", flag, name, width, left, right, carry)
+    if same and name == "sbb":
+        state.flags["cf"] = prior_cf
+        state.flags["of"] = ("fconst", "of", 0)
     return result
 
 
@@ -1129,6 +1250,43 @@ def _wide(state: PathState, digit: int, source: Term, undefined: _Undefined) -> 
     state.footprint.add(("divide", kind, operands))
     state.regs["eax"] = lin_atom(("quotient", kind, operands))
     state.regs["edx"] = lin_atom(("remainder", kind, operands))
+    for name in FLAG_NAMES:
+        state.flags[name] = undefined(name)
+
+
+def _byte_wide(state: PathState, digit: int, source: Term, undefined: _Undefined) -> None:
+    """``mul``/``imul``/``div``/``idiv`` of AL or AX by an 8-bit source (F6 /4-/7).
+
+    Whole-function proofs only.  A product is AX = AL * source, the unsigned
+    or the signed 16-bit product (folded when both are constants, otherwise
+    an opaque term of the operand pair), with CF = OF the function "AH is not
+    the extension of AL" of the same pair and SF, ZF, AF and PF undefined.
+    A division is AL = quotient and AH = remainder of AX by the source, each
+    an opaque term of the exact operands, with every flag undefined; it is
+    an event in the footprint (as the 32-bit forms are), so two versions are
+    compared only when they divide the same operands and raise #DE together.
+    """
+    signed = digit in (5, 7)
+    kind = "s" if signed else "u"
+    if digit in (4, 5):
+        al = _get(state, 0, 8)
+        pair = tuple(sorted((al, source), key=repr))
+        a, b = _small_const(al), _small_const(source)
+        if a is not None and b is not None:
+            product = _signed(a, 8) * _signed(b, 8) if signed else a * b
+            value: Term = _small(16, product)
+        else:
+            value = ("b", 16, ("mul8", kind, pair))
+        _set(state, 0, 16, value)
+        for name in ("cf", "of"):
+            state.flags[name] = ("flag", name, "mul8", 8, kind, pair)
+        for name in ("pf", "af", "zf", "sf"):
+            state.flags[name] = undefined(name)
+        return
+    operands = (_get(state, 0, 16), source)
+    state.footprint.add(("divide8", kind, operands))
+    _set(state, 0, 8, ("b", 8, ("quotient8", kind, operands)))
+    _set(state, 4, 8, ("b", 8, ("remainder8", kind, operands)))
     for name in FLAG_NAMES:
         state.flags[name] = undefined(name)
 
@@ -1240,6 +1398,12 @@ def _call(
     count, an import slot) leaves the x87 stack the call's unknown function
     and no x87 instruction may follow it inside the region.
 
+    In a whole-function proof (``state.frame`` set) a call through an import
+    slot (``call [__imp_X]``) takes the count ``x87_returns`` gives the slot's
+    symbol, as the donor's solver keys it: the model already takes the slot's
+    decoration as its callee's convention (the pop above), and x1 its fixed
+    x87 count.  A region proof still treats an import's count as unknown.
+
     ``pop`` is given for an indirect call through a vtable slot (``callee``
     is ``("indirect", target, ("pop", n))``): the bytes its callee pops, as a
     whole-function proof determined them; ``symbol`` is then None.
@@ -1257,11 +1421,17 @@ def _call(
     )
     fpu = state.fpu
     returned: int | None = None
-    if (
-        callee[0] == "direct"
+    import_slot = (
+        callee[0] == "indirect"
+        and len(callee) == 2
         and isinstance(symbol, str)
-        and not symbol.startswith("__imp_")
+        and symbol.startswith("__imp_")
+        and state.frame is not None
+    )
+    if (
+        isinstance(symbol, str)
         and x87_returns is not None
+        and ((callee[0] == "direct" and not symbol.startswith("__imp_")) or import_slot)
     ):
         returned = x87_returns.get(symbol)
     if returned is not None:
@@ -1658,6 +1828,26 @@ def _x87_step(state: PathState, item: _Instruction, undefined: _Undefined) -> No
                 _store(state, address, width, lin_atom(stored) if width == 4 else ("b", 64, stored))
                 if digit == 3:
                     x87.pop()
+            x87.undefine()
+            return
+        if op in (0xDA, 0xDE) and item.extended:
+            # fiadd fimul ficom ficomp fisub fisubr fidiv fidivr m32int (DA) and
+            # m16int (DE), whole-function proofs only.  The processor converts
+            # the integer to extended precision -- exactly, as fild does, and
+            # raising nothing -- and then operates as the floating forms do,
+            # so the operand is the term fild gives the same load: fiadd m32
+            # meets fild m32; faddp, and an integer of another width never
+            # meets it.
+            width = 4 if op == 0xDA else 2
+            operand = ("fild", width * 8, _load(state, item.address(state.regs), width))
+            if digit in (2, 3):
+                x87.compare("fcom", operand)
+                if digit == 3:
+                    x87.pop()
+                return
+            result = _x87_arith(_X87_ARITH[digit], x87.get(0), operand)
+            x87.event(result)
+            x87.put(0, result)
             x87.undefine()
             return
         integer = {(0xDF, 0): 2, (0xDB, 0): 4, (0xDF, 5): 8}.get((op, digit))
@@ -2165,7 +2355,8 @@ def _step(
         return ("fall", None)
     if item.operand16:
         require(
-            op in (0x89, 0x8B, 0xC7, 0x81, 0x83, 0x39, 0x3B, 0x85),
+            op in (0x89, 0x8B, 0xC7, 0x81, 0x83, 0x39, 0x3B, 0x85)
+            or (item.extended and op in (0xC1, 0xD1, 0xD3, 0x0FB6, 0x0FBE)),
             f"{context}: an operand-size-prefixed instruction is outside the simulator's closed "
             "set",
         )
@@ -2231,6 +2422,34 @@ def _step(
             width = 32
         _write_rm(state, item, width, value)
         return ("fall", None)
+    if item.extended and op < 0x40 and op & 7 <= 5 and (op >> 3) in (2, 3):
+        # adc / sbb in every ModR/M and accumulator form (whole-function proofs).
+        name = "adc" if op >> 3 == 2 else "sbb"
+        form = op & 7
+        if form in (4, 5):
+            require(
+                not item.operand16,
+                f"{context}: a 16-bit accumulator form is outside the closed set",
+            )
+            width = 8 if form == 4 else 32
+            right = (
+                _small(8, item.raw[item.cursor]) if width == 8 else item.immediate(item.cursor, 4)
+            )
+            _set(
+                state, 0, width, _carry_alu(state, name, width, _get(state, 0, width), right, False)
+            )
+            return ("fall", None)
+        require(not item.operand16, f"{context}: a 16-bit {name} is outside the closed set")
+        width = 8 if form in (0, 2) else 32
+        mod, reg, rm = item.modrm()
+        same = mod == 3 and reg == rm
+        if form in (0, 1):
+            left, right = _read_rm(state, item, width), _get(state, reg, width)
+            _write_rm(state, item, width, _carry_alu(state, name, width, left, right, same))
+        else:
+            left, right = _get(state, reg, width), _read_rm(state, item, width)
+            _set(state, reg, width, _carry_alu(state, name, width, left, right, same))
+        return ("fall", None)
     if op < 0x40 and op & 7 <= 5 and (op >> 3) in _ALU_NAMES:
         name = _ALU_NAMES[op >> 3]
         form = op & 7
@@ -2272,9 +2491,25 @@ def _step(
         return ("fall", None)
     if op in (0x80, 0x81, 0x83):
         mod, digit, _rm = item.modrm()
-        require(digit in _ALU_NAMES, f"{context}: adc/sbb are outside the simulator's closed set")
-        name = _ALU_NAMES[digit]
+        require(
+            digit in _ALU_NAMES or (item.extended and not item.operand16),
+            f"{context}: adc/sbb are outside the simulator's closed set",
+        )
         at = item.operand_end()
+        if digit in (2, 3):
+            # adc / sbb with an immediate (whole-function proofs).
+            if op == 0x80:
+                width, right = 8, _small(8, item.raw[at])
+            elif op == 0x83:
+                width = 32
+                right = lin(int.from_bytes(item.raw[at : at + 1], "little", signed=True))
+            else:
+                width, right = 32, item.immediate(at, 4)
+            left = _read_rm(state, item, width)
+            name = "adc" if digit == 2 else "sbb"
+            _write_rm(state, item, width, _carry_alu(state, name, width, left, right, False))
+            return ("fall", None)
+        name = _ALU_NAMES[digit]
         if op == 0x80:
             width, right = 8, _small(8, item.raw[at])
         elif op == 0x83:
@@ -2304,6 +2539,13 @@ def _step(
         return ("fall", None)
     if op in (0xF6, 0xF7):
         mod, digit, _rm = item.modrm()
+        # /1 is an undocumented alias of TEST with an immediate; it would
+        # otherwise reach the neg form below, which writes its operand.
+        require(
+            digit != 1,
+            f"{context}: the undocumented F6/F7 /1 test alias is outside the simulator's closed "
+            "set",
+        )
         width = 8 if op == 0xF6 else 32
         at = item.operand_end()
         if digit == 0:
@@ -2311,7 +2553,29 @@ def _step(
             left = _read_rm(state, item, width)
             _logic_flags(state, width, _bitop("and", width, left, right), undefined)
             return ("fall", None)
-        require(width == 32, f"{context}: a byte-wide multiply or divide is outside the closed set")
+        if width == 8 and item.extended and digit in (2, 3):
+            # not / neg of a byte (whole-function proofs).
+            value = _read_rm(state, item, 8)
+            if digit == 2:
+                result = _bitop("xor", 8, value, _small(8, 0xFF))
+            else:
+                small = _small_const(value)
+                result = (
+                    _small(8, -small) if small is not None else ("b", 8, ("op", "neg", (value,)))
+                )
+                for name in FLAG_NAMES:
+                    state.flags[name] = ("flag", name, "neg", 8, value, "")
+            _write_rm(state, item, 8, result)
+            return ("fall", None)
+        if width == 8 and item.extended and digit in (4, 5, 6, 7):
+            _byte_wide(state, digit, _read_rm(state, item, 8), undefined)
+            return ("fall", None)
+        require(
+            width == 32,
+            f"{context}: a byte-wide "
+            + ("not or neg" if digit in (2, 3) else "multiply or divide")
+            + " is outside the closed set",
+        )
         if digit in (4, 5, 6, 7):
             source = _read_rm(state, item, 32)
             _wide(state, digit, source, undefined)
@@ -2359,7 +2623,16 @@ def _step(
             # call [abs32]: an import thunk's slot, read like any operand.
             callee = _read_rm(state, item, 32)
             symbol = item.relocations.get(item.modrm_at + 1 + item.offset)
-            _call(state, ("indirect", callee), symbol, undefined, context)
+            # A whole-function proof gives the import slot's x87 return count
+            # (``x87_returns``, keyed by the slot's symbol) as for a direct call.
+            _call(
+                state,
+                ("indirect", callee),
+                symbol,
+                undefined,
+                context,
+                x87_returns if state.frame is not None else None,
+            )
             return ("fall", None)
         if op == 0xFF and digit == 2 and mod != 3 and item.indirect_pop is not None:
             _vtable_call(state, item, undefined, context)
@@ -2381,12 +2654,19 @@ def _step(
             return ("fall", None)
         _call(state, ("direct", symbol), symbol, undefined, context, x87_returns)
         return ("fall", None)
-    if op in (0xC1, 0xD1):
+    if op in (0xC1, 0xD1) or (item.extended and op in (0xC0, 0xD0, 0xD2, 0xD3)):
+        # A whole-function proof also admits the byte and 16-bit forms and the
+        # shifts by CL (:func:`_shift_by_cl`).
         mod, digit, _rm = item.modrm()
         require(digit in _SHIFT_NAMES, f"{context}: a rotate is outside the simulator's closed set")
-        count = item.raw[item.operand_end()] if op == 0xC1 else 1
-        value = _read_rm(state, item, 32)
-        _write_rm(state, item, 32, _shift(state, _SHIFT_NAMES[digit], value, count, undefined))
+        width = 8 if op in (0xC0, 0xD0, 0xD2) else width32
+        value = _read_rm(state, item, width)
+        if op in (0xD2, 0xD3):
+            result = _shift_by_cl(state, _SHIFT_NAMES[digit], value, undefined, width)
+        else:
+            count = item.raw[item.operand_end()] if op in (0xC0, 0xC1) else 1
+            result = _shift(state, _SHIFT_NAMES[digit], value, count, undefined, width)
+        _write_rm(state, item, width, result)
         return ("fall", None)
     if op == 0x0FAF:
         _mod, reg, _rm = item.modrm()
@@ -2403,6 +2683,14 @@ def _step(
         )
         left = _read_rm(state, item, 32)
         _set(state, reg, 32, _multiply(state, left, factor, undefined))
+        return ("fall", None)
+    if item.extended and item.operand16 and op in (0x0FB6, 0x0FBE):
+        # movzx/movsx r16, r/m8 (whole-function proofs): the low 16 bits of
+        # the 32-bit extension; the register's upper half is unchanged.
+        _mod, reg, _rm = item.modrm()
+        part = _read_rm(state, item, 8)
+        extend = zero_extend if op == 0x0FB6 else sign_extend
+        _set(state, reg, 16, extract(extend(part, 8), 0, 16))
         return ("fall", None)
     if op in (0x0FB6, 0x0FB7, 0x0FBE, 0x0FBF):
         _mod, reg, _rm = item.modrm()
