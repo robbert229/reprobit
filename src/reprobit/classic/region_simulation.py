@@ -60,6 +60,42 @@ values on every execution that reaches them from the same entry state):
   donor's entry atom ``("reg0", sigma^-1(x))``, so the two versions' terms
   are written over one set of entry atoms.
 
+x87 (see :class:`X87State`).  The register stack is modelled relative to
+the region's entry, whose depth the simulator does not know: ST(i) is the
+entry-relative position ``i - push``; an entry register is the atom
+``("fst0", k)``; each path records ``need`` (one more than the deepest entry
+register it touches) and ``peak`` (its highest net push), and the caller
+must show from the whole body that every entry depth covers ``need`` and
+leaves room for ``peak`` (:mod:`reprobit.classic.region_x87`): stack
+underflow and overflow are refused, never modelled.  Values are
+uninterpreted terms over their exact operands with no algebraic identity:
+``("fld", w, m)`` a load of a w-bit float, ``("fild", w, m)`` of an
+integer, ``("fmem", w, m)`` a memory operand of an arithmetic instruction
+(not the same term as a loaded register), ``("fop", op, a, b)`` for add and
+mul with (destination, source) order and for sub and div with (minuend,
+subtrahend) and (dividend, divisor) order -- so ``fsub``, ``fsubr`` and the
+popping forms that compute one difference meet, as the hardware probe
+shows they are one function -- and ``("fun", op, a)`` for chs, abs and
+sqrt.  A store to memory writes ``("fstm", w, x)``, the rounding of ``x`` to
+the slot, so a spill and reload is ``("fld", w, ("fstm", w, x))`` and never
+``x``: no precision-control setting makes it the identity, because a
+register keeps a 15-bit exponent.  The terms are therefore exact under
+whatever control word the two versions share (the region never changes
+it), and no precision or rounding mode is pinned.  Every operation that can
+raise a floating-point exception is an event in the footprint, so equal
+footprints give equal sticky exception flags; register copies, ``fxch``,
+``fchs``, ``fabs``, ``fild`` and the constants raise none.  A compare
+defines C0, C2 and C3 as exact functions of its outcome (greater, less,
+equal, unordered) and clears C1; every other instruction leaves C0-C3
+undefined (fresh ``("x87undef", ...)`` terms).  ``fnstsw ax`` puts the
+status word in AX; ``test``/``and`` of AH with an immediate reads exactly
+the masked bits and refuses an undefined one, and a zero test over one
+compare's bits is the canonical atom "the outcome lies in this set" with
+the operand pair in a fixed order.  Any other use of the status word, and
+any path whose conditions, stores or footprint mention an undefined bit, is
+refused.  A call names the x87 stack and the event set in its event; no
+x87 instruction may follow a call inside the region.
+
 Every instruction outside the closed set below is refused, as is any
 relocated field the simulator does not consume as a displacement or
 immediate, any absolute address without a relocation, any prefix but the
@@ -76,8 +112,15 @@ versions must perform on the same operands), ``setcc``, ``push`` (register,
 immediate, memory), ``pop`` (register), ``nop``, ``jcc`` and ``jmp``
 (rel8/rel32), and a direct call (``call rel32``, ``call [abs32]``) to a
 callee whose MSVC C decoration fixes a register-free convention
-(:func:`_call` states its exact model).  No other call, no return, string
-instruction, x87 instruction or indirect transfer is admitted.
+(:func:`_call` states its exact model), and the x87 forms ``fld``/``fst``/
+``fstp`` m32 and m64, ``fild`` m16/m32/m64, ``fadd fmul fsub fsubr fdiv
+fdivr`` with m32, m64, ``st, st(i)``, ``st(i), st`` and popping operands,
+``fcom fcomp`` (m32, m64, st(i)), ``fcompp``, ``fucom fucomp`` st(i),
+``fucompp``, ``fld st(i)``, ``fst``/``fstp st(i)``, ``fxch``, ``fchs``,
+``fabs``, ``fsqrt``, ``fld1``, ``fldz`` and ``fnstsw ax``.  No other call,
+no return, string instruction, other x87 instruction (``fist``/``fistp``,
+``fldcw``, the transcendentals, the environment instructions, ``fwait``)
+or indirect transfer is admitted.
 """
 
 from __future__ import annotations

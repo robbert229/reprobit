@@ -108,9 +108,21 @@ Checks (each is a refusal):
       (all of its atoms), so the symbolic entry state stands for values the
       two programs really share; a register both versions leave exactly at
       its entry value needs only its exit-live atoms live at the entry.
+   g. x87 (when either version runs an x87 instruction): every entry depth
+      the donor's stack discipline allows at the region entry
+      (`region_x87.x87_stack_depths`) covers the deepest entry register
+      either version touches and leaves room for its highest push; both
+      leave the same net push and equal terms in every register from TOP
+      down (`region_simulation.x87_stacks_equivalent`); every C0-C3 bit live
+      at the exit in D or in I is equal; and neither body stores the x87
+      environment (`fnstenv`, `fnsave`, `fxsave`).  Sticky exception flags
+      are covered by 8e: every operation that can raise one is in the
+      footprint.  The x87 state is compared even when neither version
+      touches it (it then passes through, or is the same call's result).
 9. Pins.  The image digest and length, the per-region length change, the
    branch re-encodings, relocation reseats, addend repairs, path counts, the
-   bijection's rewritten bytes and changes of mapping, and the derived
+   bijection's rewritten bytes and changes of mapping, an x87 region's
+   entry depths, need, peak and compared condition bits, and the derived
    donor's procedure range are all pinned by the declaration and re-measured
    here, and the derived donor object is re-parsed and checked before the
    same-slot delegate installs it.
@@ -155,6 +167,24 @@ Checks (each is a refusal):
     and at a change of mapping both correspondences agree because no support
     register is live (10b).  Outside every scope the invariant is the
     unmapped one above.
+
+x87.  The invariant at a point also says the two x87 units agree on TOP,
+on every full register (and so on the tag word), on the control word and
+the sticky exception flags, and on the C0-C3 bits live there.  An outside
+instruction preserves it because it is the same instruction on equal
+inputs; check 8g re-establishes it at a region exit.  Assumptions: (x1)
+MSVC 5.0's x87 discipline in D, as `region_x87` states it -- one depth per
+program point, an empty stack at every call to a C function and at the
+function's entries, 0 or 1 values at a return, and each callee leaving the
+fixed number of values its prototype names; (x2) the contents of empty
+registers and the x87 instruction and data pointers are not inputs of any
+callee (the bodies themselves are checked not to store them); (x3) C0-C3
+are not inputs of a callee; and (x4) the shared control word masks every
+floating-point exception (MSVC's CRT default 0x27F; lrr's objects contain
+no `fldcw`), so an exception changes only the sticky flags, which the
+footprint covers, and never traps between the two versions' differing
+schedules.  No precision or rounding mode is assumed: no term identity
+depends on one.
 
 Calls.  A direct call to a symbol whose MSVC C decoration is ``_name`` or
 ``_name@N`` (or that thunk's ``__imp_`` slot) reads no general register: only
