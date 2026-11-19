@@ -20,7 +20,6 @@ from typing import Any, cast
 from pydantic import ValidationError
 
 from reprobit.binary import ByteIdentityError
-from reprobit.ia32_decode import supported_ia32_instruction_length
 from reprobit.classic.address_forms import apply_sib_operand_swaps
 from reprobit.classic.candidate_recipe import (
     internal_relocation_targets,
@@ -77,6 +76,7 @@ from reprobit.discovery_authoring import (
     _record_receipt,
     _stable_id,
 )
+from reprobit.ia32_decode import supported_ia32_instruction_length
 from reprobit.intervention_metadata import ClassicRecipeFamily, ClassicRecipeRole
 from reprobit.model import Scope
 from reprobit.schema import ClassicField, ClassicRecipeIntervention
@@ -453,7 +453,8 @@ def derive_register_bijection(
             right_value = target_body[right_at] >> right_shift & 7
             if left_value & 4 != right_value & 4:
                 raise DiscoveryAuthoringError(
-                    f"a byte field changes between low and high byte at donor offset {left['offset']}"
+                    "a byte field changes between low and high byte at donor offset "
+                    f"{left['offset']}"
                 )
             source = IA32_GENERAL_REGISTER_NAMES[left_value & 3]
             image = IA32_GENERAL_REGISTER_NAMES[right_value & 3]

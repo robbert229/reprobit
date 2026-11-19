@@ -163,7 +163,12 @@ corresponding points and are compared there), and hold direct calls to
 callees whose C decoration fixes a register-free convention: a call is an
 event named by the callee, ESP, the canonical store log before it and the
 previous call, both versions must make the same events, and memory after a
-call is that call's result. The module docstring of
+call is that call's result. x87 code may follow such a call when the donor's
+stack discipline fixes how many values (0 or 1) the callee returns: the call
+then leaves exactly that stack, its result a term named by the call. Add and
+multiply terms are commutative (a hardware probe shows them symmetric in
+result, NaN payload, flags and signed zero); no other algebraic identity is
+made. The module docstring of
 `reprobit.classic.rewriting_region_resize` states the theorem and its ten
 checks.
 
