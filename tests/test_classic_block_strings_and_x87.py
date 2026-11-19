@@ -259,6 +259,18 @@ def test_a_return_between_two_vtable_calls_determines_both_pops() -> None:
     assert _prove(SEPARATED_D, SEPARATED_P).returns == 2
 
 
+# The same with the first call's result pushed for the second (a nested call's shape):
+# 7: call [ecx+0x10] / 10: push eax / 11: mov eax,[esp+8] / 15: push eax / 16: mov ecx,[eax]
+# 18: call [ecx+0x14] / 21: ret
+TOGETHER_USED = _code("8b442404 50 8b08 ff5110 50 8b442408 50 8b08 ff5114 c3")
+
+
 def test_pops_fixed_only_together_are_refused_with_their_sum() -> None:
-    with pytest.raises(ByteIdentityError, match=r"pop\(7\) \+ pop\(17\) = 8 bytes"):
-        _prove(TOGETHER, TOGETHER)
+    from reprobit.classic.function_validation import Program
+
+    # The argument pushes (a11) separate them: the second call pops the word
+    # pushed since the first returned.
+    assert Program(TOGETHER, {}, "D", "fixture").indirect_pops == {7: 4, 17: 4}
+    # Where the first call's result is pushed, a11 does not apply: the sum stays.
+    with pytest.raises(ByteIdentityError, match=r"pop\(7\) \+ pop\(18\) = 12 bytes"):
+        _prove(TOGETHER_USED, TOGETHER_USED)

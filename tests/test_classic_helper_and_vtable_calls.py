@@ -217,8 +217,21 @@ def test_bytes_that_are_not_the_reviewed_library_are_refused() -> None:
 
 
 def test_a_helper_that_calls_out_is_refused() -> None:
-    with pytest.raises(HelperLibraryError, match="calls out or touches the environment"):
-        _library().helper("__caller")
+    # The library resolves it with its relocated field; a run that reaches the
+    # call is refused (it reaches the environment), and a region proof refuses
+    # any relocated body.
+    body = _library().helper("__caller")
+    assert body.code.relocations == {1: ("rel32", "_g")}
+    with pytest.raises(ByteIdentityError, match="only a whole-function proof simulates"):
+        run_helper(entry_state(), body.code, _Undefined("D"), "fixture")
+    with pytest.raises(ByteIdentityError, match="outside the toolchain's compiler helpers"):
+        _prove(
+            _code("e800000000 c3"),
+            _code("e800000000 c3"),
+            {1: ("rel32", "__caller")},
+            {1: ("rel32", "__caller")},
+            helpers={"__caller": body.code},
+        )
 
 
 def test_a_symbol_the_index_does_not_name_is_refused() -> None:
@@ -384,14 +397,23 @@ def test_an_indirect_call_that_differs_is_refused(image: bytes) -> None:
         _prove(VTABLE_D, image, {}, {})
 
 
+# The same with the first call's result pushed for the second: 0: mov eax,[esp+4] / 4: push eax
+# 5: mov ecx,[eax] / 7: call [ecx+0x10] / 10: push eax / 11: mov eax,[esp+8] / 15: push eax
+# 16: mov ecx,[eax] / 18: call [ecx+0x14] / 21: ret
+VTABLE_TWO_USED = _code("8b442404 50 8b08 ff5110 50 8b442408 50 8b08 ff5114 c3")
+
+
 def test_an_argument_pop_the_stack_relation_does_not_fix_is_refused() -> None:
+    # Two calls in a row are separated by their argument pushes (a11) ...
+    assert _prove(VTABLE_TWO, VTABLE_TWO, {}, {}).returns == 1
+    # ... unless the first call's result reaches the second's arguments.
     with pytest.raises(ByteIdentityError, match="does not determine the argument pop"):
-        _prove(VTABLE_TWO, VTABLE_TWO, {}, {})
+        _prove(VTABLE_TWO_USED, VTABLE_TWO_USED, {}, {})
 
 
-def test_an_indirect_call_that_is_not_through_a_vtable_is_refused() -> None:
-    with pytest.raises(ByteIdentityError, match="not a slot of a vtable"):
-        _prove(POINTER_CALL, POINTER_CALL, {}, {})
+def test_an_indirect_call_through_a_function_pointer_argument_is_proved() -> None:
+    # A function pointer passed as an argument is an event named by its word (a12).
+    assert _prove(POINTER_CALL, POINTER_CALL, {}, {}).returns == 1
 
 
 def test_the_region_simulator_still_refuses_an_indirect_call() -> None:

@@ -214,30 +214,75 @@ Checks (each is a refusal):
    n`` before the call), which makes its probe loop a fixed number of
    steps, and a ``mov eax, n; call __chkstk`` prologue whose simulated
    effect is ESP0 - n allocates the FPO locals block as ``sub esp, n``
-   does (check 7).  A helper that calls out or names a global (``__CIacos``,
-   ``__isctype``) is refused.  The record pins the library, its digest, the
-   member and the body's digest (check 8).
+   does (check 7).  The record pins the library, its digest, the member and
+   the body's digest (check 8).
 
-   COM vtable calls.  ``call [reg+disp]`` whose address is one 32-bit load
-   (the vtable pointer, read from an object) plus a constant is an event
-   named like a direct call's, with its callee the slot's word (a term) and
-   the bytes it pops: two versions make the same indirect calls exactly
-   when they read the same slot of the same vtable from the same memory, in
-   the same order, with the same arguments.  After it EAX, ECX and EDX are
-   the call's results, EBX, ESI, EDI and EBP are preserved, memory is the
-   call's result and no x87 instruction may follow.  The pop is determined
-   per version (`indirect_call_pops`): the walk of its code gives ESP at
-   every instruction as a constant plus the unknown pops, equal wherever
-   edges meet and ESP0 at every return; every pop must be fixed uniquely,
-   a multiple of four, and it is part of the event's name, so versions that
-   disagree make different calls.  Two vtable calls on every path between
-   the same points fix only the sum of their pops and are refused; the
-   refusal states the one equation that binds them.  Nothing else fixes
-   them soundly: ESP is a known constant only at the entry and at every
-   ``ret`` (the walk's equations), a ``[esp+k]`` access between the calls
-   constrains nothing, and assuming the words pushed before a call are
-   exactly its arguments would be an assumption about the callee that a5
-   does not make.
+   A helper body may have relocated fields (`toolchain_helpers`): a DIR32
+   field is a data symbol's address, named as the linker resolves it (an
+   external by its name, which is the caller's own read of it too; a static
+   qualified by its member), so the helper's reads and writes of globals
+   (``__isctype``'s ``__pctype`` table) are loads and stores of the shared
+   memory like the caller's own, the same in both versions because the body
+   is the same; a REL32 field of a call or jump names another compiler
+   helper, which the library resolves too, transitively within bounds (at
+   most eight bodies, four calls deep), and the run enters its body (a
+   nested call pushes a fresh return address, a tail jump continues there).
+   A run that reaches a call to anything else -- a C function, an import,
+   a helper beyond the bounds -- reaches the environment and is refused.
+   The run still does not fork; besides constants and the path's facts, a
+   branch is decided when the compared values' terms bound them
+   (`region_simulation.interval_truth`: a zero-extended byte plus one lies
+   in [1, 256], so ``__isctype``'s ``cmp eax, 0x100; ja`` is not taken for
+   a character its caller zero-extends).  A helper call whose effect on ESP
+   the body does not show in isolation (it branches on its stack argument)
+   is an unknown of the stack walk, solved like an indirect call's pop, and
+   every run of it must change ESP by that solution.  The record pins the
+   digest of the body's relocated fields and of every body its closure
+   holds.  ``__CIacos`` is still refused: its body branches on its operand
+   (the exponent test of ``__checkTOS_withFB``), and the paths that branch
+   leads to reach the CRT's error handler (``__startOneArgErrorHandling``,
+   then ``__87except``: a switch table, ``__raise_exc``, the replaceable
+   ``__matherr`` hook, ``__set_errno``), the environment.  A call to a
+   helper is never an event: a ``__name`` decoration fixes no convention,
+   and an event would need one -- the registers the body reads, those it
+   keeps, its pop and its x87 effect -- proved on every path of the body;
+   across a call the body makes, keeping a saved register needs the callee
+   not to write its slot, which a frame that passes a stack address (as
+   ``__isctype``'s slow path does) cannot show without object extents.
+
+   Calls through a pointer.  ``call r/m32`` (``FF /2``) other than ``call
+   [abs32]`` -- a register (``call eax``), a COM vtable's slot, a structure
+   field, an argument -- is an event named like a direct call's, with its
+   callee the pointer's term (a register's term, or the word loaded from the
+   operand) and the bytes it pops: two versions make the same indirect calls
+   exactly when their pointers are equal terms (for a load: the same address
+   read from the same memory), in the same order, with the same arguments.
+   A pointer that is a code address of this function (``CODE_ENTRY`` plus an
+   offset) is refused.  After it EAX, ECX and EDX are the call's results,
+   EBX, ESI, EDI and EBP are preserved (a5 for a COM method, a12 for any
+   other pointer), memory is the call's result and no x87 instruction may
+   follow.  The pop is determined per version (`indirect_call_pops`): the
+   walk of its code gives ESP at every instruction as a constant plus the
+   unknown pops, equal wherever edges meet and ESP0 at every return; every
+   pop must be fixed uniquely, a multiple of four, and it is part of the
+   event's name, so versions that disagree make different calls.  Two
+   calls on every path between the same points fix only the sum of their
+   pops.  The argument pushes then separate them (a11,
+   `argument_push_equations`): for a call whose every path back reaches the
+   instruction after a previous call p (or after p's caller cleanup, ``add
+   esp, n`` or ``pop r`` straight after it) without another call, through
+   code that changes ESP only by ``push``, ESP after the call equals ESP
+   there -- the call pops exactly the words pushed since p returned.  That
+   holds when no word pushed in between belongs to another call and none
+   of the call's arguments precedes p, and both fail only for a call made
+   while another call's arguments are evaluated, whose value then reaches
+   them; so the call's and every p's results (EAX, ECX, EDX, the flags, an
+   x87 value) must be dead before the next call (`results_dead`), and at
+   the call none of the words its pop counts may hold a saved register's
+   entry value (a lazy ``push esi`` is not an argument).  The equations
+   join the walk's; a contradiction refuses the pushes, and a pop still not
+   fixed is refused with its one equation and why the pushes did not
+   apply.  Proofs whose pops the walk alone fixes are unchanged.
 3. Relocations.  D's relocated fields are 32-bit `DIR32` fields, a call's
    REL32 field naming a symbol outside the function's own section or the
    function itself (a recursive call: a call event naming the function's
@@ -336,7 +381,9 @@ Checks (each is a refusal):
       lie at or above the current ESP and wholly below E; a load must read
       exactly a slot the path stored or the relation carries, or a
       parameter word (k >= 0) neither version has written, which holds the
-      entry value; any other read is refused;
+      entry value -- and, in the equivalences pass, a word of the locals
+      block [B, ESP0) this version has not written, which holds its entry
+      value too (a13); any other read is refused;
    b. a private slot is disjoint from every address that is not a constant
       offset from ESP0: no such address can reach the private stack,
       because no value computed from ESP0 exists outside ESP (7, and the
@@ -350,7 +397,8 @@ Checks (each is a refusal):
    instruction count, the derived procedure range and collapsed line rows
    are pinned by the declaration and re-measured, and the derived donor
    object is re-parsed and checked before the same-slot delegate installs
-   it.  A proof the equivalences pass made (below) pins ``equivalences``.
+   it.  A proof the equivalences pass made (below) pins ``equivalences``,
+   one the entry-values pass made ``entry_values`` too.
 9. Install.  The image is P followed by MSVC 5.0's alignment fill; the
    donor object is re-seated around it (`rewriting_region_resize.
    resized_donor_object`: relocation offsets through the pairing, every
@@ -427,6 +475,38 @@ nor any callee changes the protection of the image's pages (no admitted
 instruction can; a callee would have to call ``VirtualProtect`` on them), so
 a load inside it reads its initial bytes whatever store comes first: a
 store that reached them faults, and the state at a fault is not compared.
+(a11) Argument pushes, for a call whose pop the stack walk leaves open
+(check 2): the donor -- compiled C -- pushes a call's arguments after the
+previous call returns, and every word it pushes between one call's return
+(and that call's caller cleanup) and the next call is an argument of the
+next call.  MSVC 5.0 evaluates a call's arguments right to left and pushes
+each as it is evaluated, immediately before the call; a word pushed for a
+later call can precede an earlier call only when the earlier call is made
+while the later call's arguments are evaluated -- a nested call -- and a
+call nested in an argument passes its value to that argument, which the
+checks refuse wherever the value is in a register or an x87 register
+(`results_dead`).  What a11 assumes is the rest: that no argument of the
+donor discards a nested call's value (the comma operator) or receives it
+only through memory (a structure returned through a hidden pointer and
+copied from the caller's temporary).  It is a statement about the
+caller's code, which both versions' bytes show, not about the callee.
+(a12) A function reached through a pointer that is not a COM vtable's slot
+(a structure field, a variable, an argument) is a C function: it takes no
+argument in a register and keeps EBX, ESI, EDI and EBP, as ``__cdecl`` and
+``__stdcall`` do; MSVC 5.0 C passes register arguments only to
+``__fastcall`` functions, whose pointer type must say so.  Its pop is
+determined as a vtable call's is.  (a13) Entry values: both versions run
+from one machine state, the stack below ESP0 included, so a byte of the
+locals block [B, ESP0) holds the same entry value in both until a version
+writes it; no callee writes it (a2: every call is made with ESP at or below
+B, and a callee writes only below its ESP and its arguments), an inlined
+helper's stores are the version's own (tracked), and no address that is not
+a constant offset from ESP0 can reach it in a private frame (7b).  A read of
+such a byte that neither path of this version wrote (an uninitialised
+local, C's undefined behaviour, compiled to a read of its slot) is the
+entry value ``("pld", k, width)``, equal in the two versions exactly when
+they read the same slot.  Below B a callee's frame may have overwritten the
+entry value, so such a read is still refused.
 No other assumption is made: the relation is inferred, nothing about the
 replacement is believed, and the simulator's term model is exact.
 
@@ -462,6 +542,16 @@ normal forms, each exact (`region_simulation._equivalences`):
   pointer, which a8 excludes, and the operand's value is already named.  So
   ``fcom m; fxch; fmul; fxch; fstp [esp+0x14]; fnstsw`` meets the same with
   ``fstp [esp+0x10]``.
+
+The entry-values pass.  When the equivalences pass refuses too, a
+private frame runs once more with one change: a read of an entry value
+(a parameter word or, by a13, a local) is carried as the slot it read
+(`FrameModel.load`), which it holds until a store.  So where one path
+writes ``p = f(p)`` and keeps it in a register and another reads ``p`` into
+the same register, the join relates the slot on both paths, and a later
+read of it is the related value (0x4512d0's shape).  Carried slots change
+the relations, so a record this pass made pins ``entry_values``; records
+of the first two passes keep theirs.
 
 Still refused, with the reason.  x87 operands are commuted only between
 registers (since `region_simulation`'s commutativity probe): a memory
@@ -677,6 +767,9 @@ class FrameFacts:
     objects: ObjectModel | None = None
     # The equivalences pass (`region_simulation._equivalences`, a10).
     equivalences: bool = False
+    # The entry-values pass (a13): a read of a word's entry value is carried
+    # as the slot it reads (`FrameModel.load`).
+    entry_values: bool = False
 
 
 _IMAGE_SCN_LNK_COMDAT = 0x1000
@@ -891,13 +984,39 @@ class FrameModel:
         overlapping = sorted(self._overlapping(offset, width))
         if overlapping:
             return self._split_read(offset, width, overlapping)
+        written = sorted(self.dirty & set(range(offset, offset + width)))
+        # The bytes' entry value (a13): a parameter word, or -- in the
+        # equivalences pass -- a word of the locals block [B, ESP0), neither
+        # written by this version since the entry.
+        in_locals = self.facts.base <= offset and offset + width <= 0
         require(
-            offset >= 0 and not self.dirty & set(range(offset, offset + width)),
+            not written and (offset >= 0 or (self.equivalences and in_locals)),
             f"{self.context}: a read of the stack slot ESP0{offset:+d} whose value the relation "
-            "does not carry",
+            "does not carry" + self._unread_reason(offset, width, written, in_locals),
         )
         atom = ("pld", offset, width)
-        return lin_atom(atom) if width == 4 else ("b", width * 8, atom)
+        value = lin_atom(atom) if width == 4 else ("b", width * 8, atom)
+        if self.facts.entry_values:
+            # The slot holds that value until a store: carried as a slot, the
+            # relation keeps it where another path wrote the same value.
+            self.slots[key] = value
+        return value
+
+    def _unread_reason(self, offset: int, width: int, written: list[int], in_locals: bool) -> str:
+        """Why a read of an unstored slot has no value (a refusal's note)."""
+        if written:
+            return (
+                f" (this version wrote its bytes {written[0]:+d}.. on a path that reaches here, "
+                "and the relation keeps no value for it)"
+            )
+        if offset < 0 and not in_locals:
+            return (
+                f" (it lies below the locals block, at or above ESP0{self.facts.base:+d}, where an "
+                "earlier callee's frame may have overwritten its entry value)"
+            )
+        if offset < 0:
+            return " (an entry value of the locals block is read only in the equivalences pass)"
+        return ""
 
     def _split_read(self, offset: int, width: int, overlapping: list[tuple[int, int]]) -> Term:
         """A read that one wider slot holds or narrower slots tile exactly.
@@ -941,7 +1060,12 @@ class FrameModel:
         for key in self._overlapping(offset, width):
             del self.slots[key]
         self.slots[(offset, width)] = value
-        self.dirty |= {byte for byte in range(offset, offset + width) if byte >= 0}
+        # Every byte written since the entry: the parameter words always, and
+        # in the equivalences pass the locals too (a13 reads the entry value
+        # only of a byte this version has not written).
+        self.dirty |= {
+            byte for byte in range(offset, offset + width) if byte >= 0 or self.equivalences
+        }
         return True
 
     def _window(self, state: PathState, context: str) -> tuple[int, int]:
@@ -1210,9 +1334,17 @@ class Program:
             self.successors[offset] = self._flow(item)
         self.reachable = self._reach()
         self.cuts = self._cut_points()
+        # The indirect calls whose pops a11's argument pushes fixed (set by
+        # :func:`indirect_call_pops`).
+        self.pushed_pops: frozenset[int] = frozenset()
+        # The helper calls whose effect on ESP the stack relation solved.
+        self.helper_changes: dict[int, int] = {}
         self.indirect_pops = indirect_call_pops(self)
+        for offset, change in self.helper_changes.items():
+            self.instructions[offset].helper_stack_change = change
         for offset, pop in self.indirect_pops.items():
             self.instructions[offset].indirect_pop = pop
+            self.instructions[offset].pushed_pop = offset in self.pushed_pops
 
     def _switches(self) -> dict[int, Switch]:
         """Every table read of the code, each table's extent, and the tail's shape (check 1).
@@ -1394,12 +1526,20 @@ class Program:
         return frozenset(cuts)
 
 
-def vtable_call(item: _Instruction) -> bool:
-    """Whether an instruction is ``call [reg+disp]`` (``FF /2``, memory, not ``[abs32]``)."""
+def indirect_call(item: _Instruction) -> bool:
+    """Whether an instruction is ``call r/m32`` through a pointer (``FF /2``, not ``[abs32]``).
+
+    A register operand (``call eax``) or a memory operand with a base or index
+    register (``call [ecx+0x10]``, a vtable slot or a structure field).  A
+    ``call [abs32]`` is an import slot's, whose symbol names the callee.
+    """
     if item.opcode != 0xFF or item.operand16:
         return False
     mod, digit, rm = item.modrm()
-    return digit == 2 and mod != 3 and not (mod == 0 and rm == 5)
+    return digit == 2 and not (mod == 0 and rm == 5)
+
+
+vtable_call = indirect_call
 
 
 MAX_INDIRECT_POP = 4096
@@ -1450,11 +1590,20 @@ def indirect_call_pops(program: Program) -> dict[int, int]:
     replacement's must agree, which the call events check (the pop is part
     of each event's name).
     """
-    sites = [offset for offset in program.reachable if vtable_call(program.instructions[offset])]
-    if not sites:
+    sites = [offset for offset in program.reachable if indirect_call(program.instructions[offset])]
+    # A helper call whose effect on ESP its body does not show in isolation
+    # (it branches on an argument the walk does not know) is an unknown too;
+    # the proof checks every run of it against the solution (`run_helper`).
+    solved_helpers = [
+        offset
+        for offset in program.reachable
+        if _helper_call(program, offset) and not _helper_change_known(program, offset)
+    ]
+    if not sites and not solved_helpers:
         return {}
-    index = {site: number for number, site in enumerate(sites)}
-    count = len(sites)
+    columns = sites + solved_helpers
+    index = {site: number for number, site in enumerate(columns)}
+    count = len(columns)
     forms: dict[int, tuple[Fraction, ...]] = {}
     equations: list[tuple[Fraction, ...]] = []
     eax_before: dict[int, int | None] = {}
@@ -1491,6 +1640,37 @@ def indirect_call_pops(program: Program) -> dict[int, int]:
         for target in program.successors[offset]:
             stack.append((target, after, known))
     values, links = _solve(equations, count)
+    undetermined = [site for site in sites if values[index[site]] is None]
+    notes: dict[int, str] = {}
+    pushed: set[int] = set()
+    if undetermined:
+        # a11: a call pops exactly the words pushed since the previous call
+        # returned, where both versions' code shows that no word pushed in
+        # between can belong to another call (`argument_push_equations`).
+        extra: list[tuple[Fraction, ...]] = []
+        for site in undetermined:
+            found = argument_push_equations(program, site, forms, index, count)
+            if isinstance(found, str):
+                notes[site] = found
+            else:
+                extra.extend(found)
+                pushed.add(site)
+        if extra:
+            try:
+                values, links = _solve(equations + extra, count)
+            except ByteIdentityError as error:
+                raise ByteIdentityError(
+                    f"{program.context}: the argument pushes before the indirect calls at "
+                    f"{sorted(pushed)} (a11) contradict the stack relation: {error}"
+                ) from error
+    for offset in solved_helpers:
+        solved = values[index[offset]]
+        require(
+            solved is not None and solved.denominator == 1,
+            f"{program.context}: the stack relation does not determine how the helper call at "
+            f"{offset} changes ESP (its body branches on a value the walk does not know)",
+        )
+        program.helper_changes[offset] = int(cast(Fraction, solved))
     pops = {}
     for site in sites:
         value = values[index[site]]
@@ -1501,15 +1681,26 @@ def indirect_call_pops(program: Program) -> dict[int, int]:
             else:
                 coefficients, total = linked
                 terms = " + ".join(
-                    ("" if k == 1 else f"{k} * ") + f"pop({sites[column]})"
+                    ("" if k == 1 else f"{k} * ") + f"pop({columns[column]})"
                     for column, k in coefficients
                 )
                 why = (
                     f"the only constraint is {terms} = {total} bytes: the calls "
-                    f"{', '.join(str(sites[column]) for column, _k in coefficients)} lie on the "
+                    f"{', '.join(str(columns[column]) for column, _k in coefficients)} lie on the "
                     "same paths, with no return, join or other known stack depth between them "
                     "to separate their pops"
                 )
+                unpushed = [
+                    f"{columns[column]}: {notes[columns[column]]}"
+                    for column, _k in coefficients
+                    if columns[column] in notes
+                ]
+                if unpushed:
+                    why += (
+                        "; the argument pushes (a11) do not fix them either ("
+                        + "; ".join(unpushed)
+                        + ")"
+                    )
             raise ByteIdentityError(
                 f"{program.context}: the stack relation does not determine the argument pop of "
                 f"the indirect call at {site}: {why}"
@@ -1520,7 +1711,262 @@ def indirect_call_pops(program: Program) -> dict[int, int]:
             f"{program.context}: the indirect call at {site} would pop {pop} bytes",
         )
         pops[site] = int(pop)
+    program.pushed_pops = frozenset(pushed)
     return pops
+
+
+# The pushes a11 counts: push r32, push imm32, push imm8 and push r/m32.
+_PUSH_OPCODES = frozenset({*range(0x50, 0x58), 0x68, 0x6A})
+MAX_PUSH_REGION = 512
+MAX_RESULT_STEPS = 2048
+
+
+def _is_call(program: Program, item: _Instruction) -> bool:
+    """Whether an instruction is a call of any kind (direct, helper, import slot or pointer)."""
+    return item.opcode in (0xE8, 0x9A) or (item.opcode == 0xFF and item.modrm()[1] in (2, 3))
+
+
+def _is_push(item: _Instruction) -> bool:
+    return not item.operand16 and (
+        item.opcode in _PUSH_OPCODES or (item.opcode == 0xFF and item.modrm()[1] == 6)
+    )
+
+
+def argument_push_equations(
+    program: Program,
+    site: int,
+    forms: Mapping[int, tuple[Fraction, ...]],
+    index: Mapping[int, int],
+    count: int,
+) -> list[tuple[Fraction, ...]] | str:
+    """a11's equations for the indirect call at ``site``, or why a11 does not apply there.
+
+    The *push region* of the call is every instruction from which the call is
+    reached without passing another call: walking back from the call, each
+    path must end just after a call p (the call's *previous call* on that
+    path) -- never at the function's entry.  The region must make no call,
+    read no switch table, and change ESP only by ``push``, but for p's caller
+    cleanup (``add esp, n`` or ``pop r``) straight after p, reached from p
+    alone.  Then, for each previous call p, ESP after the call equals ESP
+    just after p returned and was cleaned up: the call pops exactly the
+    words pushed since (one equation per p, in the walk's forms).
+
+    a11 says those words are this call's arguments and that no argument of
+    it was pushed before p.  A word pushed between p and the call belongs to
+    a later call only if the call is made while that later call's arguments
+    are evaluated, and an argument of the call precedes p only if p is made
+    while the call's arguments are evaluated: a nested call, whose value
+    then reaches the outer call's arguments.  So the call's and every p's
+    results must be dead (`results_dead`): what the callee leaves in EAX,
+    ECX, EDX, the flags and the x87 stack is read by nothing -- no store,
+    condition, call target or preserved register -- before the next call or
+    return.  A pushed word that is a saved register's entry value is checked
+    at the call itself (`region_simulation._require_pushed_arguments`).
+    """
+    predecessors: dict[int, list[int]] = {}
+    for offset in program.reachable:
+        for target in program.successors[offset]:
+            predecessors.setdefault(target, []).append(offset)
+    region: set[int] = set()
+    previous: set[int] = set()
+    stack = [site]
+    while stack:
+        here = stack.pop()
+        for before in predecessors.get(here, []):
+            item = program.instructions[before]
+            if _is_call(program, item):
+                previous.add(before)
+                continue
+            if before in region:
+                continue
+            region.add(before)
+            if len(region) > MAX_PUSH_REGION:
+                return "its push region is too large"
+            stack.append(before)
+        if here != site and not predecessors.get(here):
+            return "a path from the function's entry reaches it without a call before it"
+    # Each previous call's caller cleanup: the ``add esp, n`` or ``pop r``
+    # run straight after it, before the region's pushes (a cdecl callee's
+    # arguments, or an earlier call's whose cleanup MSVC deferred).
+    starts: dict[int, int] = {}
+    for call in sorted(previous):
+        start = call + program.instructions[call].length
+        while start in region and _is_cleanup(program.instructions[start]):
+            if len(predecessors.get(start, [])) != 1:
+                return f"the caller cleanup at {start} is also reached from elsewhere"
+            start += program.instructions[start].length
+        starts[call] = start
+    cleanups = {
+        offset
+        for call in previous
+        for offset in region
+        if call + program.instructions[call].length <= offset < starts[call]
+    }
+    for offset in sorted(region):
+        item = program.instructions[offset]
+        if offset in program.switches:
+            return f"its push region reads a switch table at {offset}"
+        if offset in cleanups:
+            continue
+        try:
+            change = _stack_change(program, item, None)
+        except ByteIdentityError:
+            return (
+                f"the instruction at {offset} in its push region changes ESP by an unknown amount"
+            )
+        if change != (-4 if _is_push(item) else 0):
+            return (
+                f"the instruction at {offset} in its push region changes ESP other than by a push"
+            )
+    for call in sorted({site} | previous):
+        why = results_dead(program, call)
+        if why is not None:
+            return why
+    equations = []
+    for call in sorted(previous):
+        after = forms[starts[call]]
+        following = list(forms[site])
+        following[1 + index[site]] += 1
+        equations.append(tuple(a - b for a, b in zip(following, after, strict=True)))
+    return equations
+
+
+def _is_cleanup(item: _Instruction) -> bool:
+    """``add esp, imm`` or ``pop r32`` (not ``pop esp``): a caller's argument cleanup."""
+    if item.operand16:
+        return False
+    if 0x58 <= item.opcode <= 0x5F:
+        return item.opcode != 0x5C
+    return item.opcode in (0x81, 0x83) and item.modrm() == (3, 0, 4)
+
+
+_KEPT_NAMES = ("ebx", "esi", "edi", "ebp")
+
+
+def _mentions_result(value: Any, call: int) -> bool:
+    """Whether a term mentions a result atom ``("result", call, ...)`` of the call."""
+    stack = [value]
+    seen: set[int] = set()
+    while stack:
+        current = stack.pop()
+        if isinstance(current, (tuple, list, frozenset, set)):
+            if id(current) in seen:
+                continue
+            seen.add(id(current))
+            if isinstance(current, tuple) and current[:2] == ("result", call):
+                return True
+            stack.extend(item for item in current if not isinstance(item, (str, int)))
+    return False
+
+
+def results_dead(program: Program, call: int) -> str | None:
+    """None when nothing reads the call's results before the next call or return, else why.
+
+    A scratch run from the instruction after the call follows every path
+    (both ways at every branch) to the next call or ``ret``.  What the callee
+    leaves is a result atom: EAX, ECX, EDX, every flag, and the x87 stack
+    below what the run pushes (a value returned in ST(0)).  The results are
+    dead when no condition, no store (address or value), no block string
+    operation, no next call's target and no preserved register (EBX, ESI,
+    EDI, EBP) at that point mentions one, and no helper is met with one in a
+    register.  A path that meets an instruction twice, or runs past
+    MAX_RESULT_STEPS, is refused (a loop without a call), as is a switch
+    table or an instruction the simulator refuses.
+    """
+    item = program.instructions[call]
+    start = _scratch_state(None)
+    for name in ("eax", "ecx", "edx"):
+        start.regs[name] = lin_atom(("result", call, name))
+    for name in FLAG_NAMES:
+        start.flags[name] = ("result", call, "flag", name)
+    start.fpu = X87State(base=("result", call, "x87"))
+    start.frame = FrameModel(FrameFacts(False), context=f"{program.context} after {call}")
+
+    def used(value: Any) -> bool:
+        return _mentions_result(value, call)
+
+    pending: list[tuple[int, PathState, frozenset[int]]] = [
+        (call + item.length, start, frozenset())
+    ]
+    steps = 0
+    undefined = _Undefined(f"{program.side}-results{call}")
+    while pending:
+        offset, state, seen = pending.pop()
+        while True:
+            steps += 1
+            if steps > MAX_RESULT_STEPS or offset in seen:
+                return f"the code after the call at {call} loops at {offset} before another call"
+            seen = seen | {offset}
+            here = program.instructions.get(offset)
+            if here is None:
+                return f"the code after the call at {call} leaves the function at {offset}"
+            if used([state.stores, state.conditions, state.events]):
+                return f"the results of the call at {call} are stored or tested before {offset}"
+            if program.is_return(here):
+                break
+            if _is_call(program, here):
+                target: Any = None
+                if here.opcode == 0xFF:
+                    target = (
+                        state.regs[_REGISTER_NAMES[here.modrm()[2]]]
+                        if here.modrm()[0] == 3
+                        else here.address(state.regs)
+                    )
+                if _helper_call(program, offset) and used([state.regs, state.fpu.slots]):
+                    return f"the results of the call at {call} reach the helper call at {offset}"
+                if used([[state.regs[name] for name in _KEPT_NAMES], target]):
+                    return (
+                        f"the results of the call at {call} are kept in a preserved register or "
+                        f"called through at {offset}"
+                    )
+                break
+            if offset in program.switches:
+                return f"the code after the call at {call} reads a switch table at {offset}"
+            try:
+                action, detail = _step(state, here, undefined, None, program.helpers)
+            except ByteIdentityError as error:
+                return f"the code after the call at {call} is not simulated: {error}"
+            if action == "fall":
+                offset += here.length
+                continue
+            if action == "jump":
+                offset = detail
+                continue
+            code_value, target_offset = detail
+            decided = condition(code_value, state.flags)
+            if not isinstance(decided, bool):
+                if used(decided):
+                    return f"the results of the call at {call} decide the branch at {offset}"
+                pending.append((offset + here.length, state.fork(), seen))
+                offset = target_offset
+                continue
+            offset = target_offset if decided else offset + here.length
+        if used([state.stores, state.conditions, state.events]):
+            return f"the results of the call at {call} are stored or tested before {offset}"
+    return None
+
+
+def _helper_change_known(program: Program, offset: int) -> bool:
+    """Whether the helper call's effect on ESP is its body's alone, as the walk runs it.
+
+    The walk knows EAX only after ``mov eax, imm32`` straight before the call
+    (``__chkstk``'s argument); with that, the body must run to its return.
+    """
+    before = program.instructions.get(offset - 5)
+    eax = None
+    if (
+        before is not None
+        and before.opcode == 0xB8
+        and not before.operand16
+        and offset - 4 not in program.relocations
+        and program.successors.get(offset - 5) == (offset,)
+    ):
+        eax = int.from_bytes(before.raw[before.cursor : before.cursor + 4], "little")
+    try:
+        _stack_change(program, program.instructions[offset], eax)
+    except ByteIdentityError:
+        return False
+    return True
 
 
 def _helper_call(program: Program, offset: int) -> bool:
@@ -2304,6 +2750,7 @@ def prove_function(
     donor_tail: Tail | None = None,
     image_tail: Tail | None = None,
     objects: ObjectModel | None = None,
+    entry_values: bool = False,
 ) -> ValidationProof:
     """Checks 2 and 4-7: a private frame when one is given and no stack address escapes.
 
@@ -2314,6 +2761,8 @@ def prove_function(
     ``objects``, the object model of a10 (its stack end is replaced by the
     frame's E), runs the proof's equivalences pass
     (`region_simulation._equivalences`); None runs the first pass.
+    ``entry_values`` (with ``objects``) runs the entry-values pass: a private
+    frame carries every entry value it reads as a slot (a13).
     """
 
     def programs() -> tuple[Program, Program]:
@@ -2330,7 +2779,9 @@ def prove_function(
     if objects is not None:
         objects = replace(objects, stack_end=params_end)
         if private_frame is not None:
-            private_frame = replace(private_frame, objects=objects, equivalences=True)
+            private_frame = replace(
+                private_frame, objects=objects, equivalences=True, entry_values=entry_values
+            )
     shared = FrameFacts(False, params_end=params_end, objects=objects, equivalences=equivalences)
     if private_frame is not None and locals_block_first(donor, private_frame.base):
         try:
@@ -2339,6 +2790,11 @@ def prove_function(
             )
         except EscapeRefusal:
             donor, image = programs()
+        except ByteIdentityError as error:
+            # The refusal came from the private frame, where the entry-values
+            # pass differs (`measure_function_validation`).
+            error.private_frame = True  # type: ignore[attr-defined]
+            raise
     return validate_function(donor, image, shared, x87_returns, f"{context} (shared frame)")
 
 
@@ -2834,7 +3290,7 @@ def measure_function_validation(
             )
     case_proofs: list[ValidationProof] = []
 
-    def summary(model: ObjectModel | None, tag: str) -> dict[str, Any]:
+    def summary(model: ObjectModel | None, tag: str, entry_values: bool = False) -> dict[str, Any]:
         case_proofs.clear()
 
         def prove_case(counts: Mapping[str, int], note: str) -> ValidationProof:
@@ -2850,6 +3306,7 @@ def measure_function_validation(
                 donor_tail=donor_tail,
                 image_tail=image_tail,
                 objects=model,
+                entry_values=entry_values,
             )
             case_proofs.append(case_proof)
             return case_proof
@@ -2863,7 +3320,18 @@ def measure_function_validation(
     try:
         proof_summary_pin = summary(None, "")
     except ByteIdentityError:
-        proof_summary_pin = {**summary(objects, " (equivalences pass)"), "equivalences": True}
+        try:
+            proof_summary_pin = {**summary(objects, " (equivalences pass)"), "equivalences": True}
+        except ByteIdentityError as error:
+            # The entry-values pass differs from the equivalences pass only in
+            # a private frame; its records pin that they needed it.
+            if not getattr(error, "private_frame", False):
+                raise
+            proof_summary_pin = {
+                **summary(objects, " (entry-values pass)", entry_values=True),
+                "equivalences": True,
+                "entry_values": True,
+            }
     for proof in case_proofs:
         for place in sorted(debug_labels):
             paired = proof.pairs.get(place)
