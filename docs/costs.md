@@ -46,6 +46,11 @@ intervention), the same class as `retail_exact_donor_rewriting`, so a length-cha
 replacement never costs less than a same-length reordering of the same donor. Its proof work
 (path simulation, relayout) is runtime work, not cost.
 
+A `retail_exact_function_translation_validation` record is a semantic rewrite as well (250
+points per intervention), the same class as `retail_exact_donor_rewriting`: replacing a whole
+function by a proved equivalent never costs less than reordering one. Its proof work (pairing,
+the relation fixpoint, path simulation) is runtime work, not cost.
+
 An oracle install costs 10,000 points per intervention unit, not per referenced byte. Exact range
 and byte counts remain separate authenticity evidence in the report; the cost score deliberately
 ranks any reference-byte installation as a large departure from an ordinary build.

@@ -157,6 +157,15 @@ more of a group's instructions than it breaks. A scope bound the image's own
 liveness refuses is marked live and the scopes chosen again. Relocated
 fields pair with the reference's by target symbol, not by order.
 
+When no region replacement proves either -- the two bodies differ across the
+whole function, in register allocation, spill slots and scheduling, with the
+same control flow -- grind tries a
+`retail_exact_function_translation_validation` record: the reference's whole
+code is the replacement, its relocated fields pair with the donor's by target
+symbol, and the producer proves it join by join
+(`reprobit.classic.function_validation`). It costs the same as a donor
+rewriting (a semantic rewrite).
+
 Each candidate is compiled through the project's locked compiler graph. A
 candidate can be saved as local progress only after a separate build from
 scratch proves the function and required logic checks. It is exact only when

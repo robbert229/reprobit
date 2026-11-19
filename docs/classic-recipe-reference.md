@@ -34,6 +34,7 @@ and [Costs](costs.md) for cost attribution.
 | `retail_exact_cross_tu_complete_target_resize` | `function` | Retail exact cross tu complete target resize adjustment | `cross_tu_or_overlay` (100) | `clean-candidate` | Available |
 | `retail_exact_register_bijection_reencoding` | `function` | Retail exact register bijection reencoding adjustment | `semantic_rewrite` (250) | `clean-candidate` | Available |
 | `retail_exact_region_resize_rewriting` | `function` | Retail exact region resize rewriting adjustment | `semantic_rewrite` (250) | `clean-candidate` | Available |
+| `retail_exact_function_translation_validation` | `function` | Retail exact function translation validation adjustment | `semantic_rewrite` (250) | `clean-candidate` | Available |
 | `retail_exact_same_tu_instruction_hybrid_resize` | `function` | Retail exact same tu instruction hybrid resize adjustment | `binary_surgery` (500) | `clean-candidate` | Available |
 | `retail_exact_simulated_elision` | — | — | Not costable as a classic recipe | `quarantine-only` | Use `legacy.oracle_install` |
 | `source_overlay_graph` | `project` | Source overlay graph adjustment | `cross_tu_or_overlay` (100) | `source-overlay` | Available |

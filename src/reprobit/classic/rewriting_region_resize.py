@@ -258,7 +258,7 @@ from .debug import (
     parse_fpo_data,
     shifted_pointer,
 )
-from .foundation import require_payload_free_declaration, sha256_bytes
+from .foundation import local_symbol_kind, require_payload_free_declaration, sha256_bytes
 from .region_simulation import (
     FLAG_NAMES,
     X87_CONDITION_BITS,
@@ -1578,6 +1578,8 @@ def resized_donor_object(
     image: bytes,
     proof: dict[str, Any],
     context: str,
+    *,
+    debug_range: tuple[int, int] | None = None,
 ) -> tuple[bytes, dict[str, Any]]:
     """Re-seat one COMDAT's dependent COFF records around a resized body.
 
@@ -1589,7 +1591,9 @@ def resized_donor_object(
     length and debug range, the FPO procedure size, the function's
     TotalSize, the COMDAT's Length, the ``.ef`` marker and every other
     symbol of the section.  It is re-parsed and re-checked before it is
-    handed to the installation delegate.
+    handed to the installation delegate.  ``debug_range``, when given, is the
+    image's CodeView debug range (start, end) in place of the donor's carried
+    through the offset map (a whole-function replacement declares its own).
     """
     donor = CoffObject(donor_bytes)
     primary = donor.function_section(mangled)
@@ -1657,15 +1661,23 @@ def resized_donor_object(
         code_length == proc_size and 0 <= debug_start <= debug_end <= code_length,
         f"{context}: the donor debug procedure range is stale",
     )
-    require(
-        debug_start in offset_map and debug_end in offset_map,
-        f"{context}: the debug range is not on boundaries outside every region interior",
-    )
+    if debug_range is None:
+        require(
+            debug_start in offset_map and debug_end in offset_map,
+            f"{context}: the debug range is not on boundaries outside every region interior",
+        )
+        image_range = (offset_map[debug_start], offset_map[debug_end])
+    else:
+        require(
+            0 <= debug_range[0] <= debug_range[1] <= image_proc,
+            f"{context}: the declared debug range lies outside the image's procedure",
+        )
+        image_range = debug_range
     rebuilt_debug = bytearray(debug_raw)
     rebuilt_debug[16:28] = (
         image_proc.to_bytes(4, "little")
-        + offset_map[debug_start].to_bytes(4, "little")
-        + offset_map[debug_end].to_bytes(4, "little")
+        + image_range[0].to_bytes(4, "little")
+        + image_range[1].to_bytes(4, "little")
     )
     closure = _comdat_child_closure(donor, primary)[1]
     replacements = [
@@ -1802,7 +1814,7 @@ def resized_donor_object(
     return derived, {
         "carried_code_symbols": carried_symbols,
         "collapsed_line_rows": collapsed,
-        "procedure_range": [image_proc, offset_map[debug_start], offset_map[debug_end]],
+        "procedure_range": [image_proc, image_range[0], image_range[1]],
     }
 
 
@@ -1842,6 +1854,25 @@ def protected_code_offsets(
     _length, start, end = coff_unpack("<III", debug_raw, 16, f"{context} debug range")
     offsets |= {start, end}
     return frozenset(offsets)
+
+
+def _composed_identity(row: dict[str, Any]) -> tuple[Any, ...]:
+    """A relocation as the composed object must carry it from the derived donor.
+
+    The same-slot composer names a compiler local (``$T<n>``, ``$L<n>``) by
+    the seed's symbol of the same kind at the same section and value, after
+    proving that section byte-identical in both objects; any declaration
+    added to the unit renumbers those serials, so only kind and place are
+    compared.  Every other target keeps its name.
+    """
+    kind = local_symbol_kind(str(row["target"]))
+    if kind is not None:
+        return (
+            row["offset"],
+            ("local", kind, row["target_section"], row["target_value"]),
+            row["type"],
+        )
+    return (row["offset"], row["target"], row["type"])
 
 
 def produce_region_resize_rewriting_candidate(
@@ -1998,8 +2029,8 @@ def produce_region_resize_rewriting_candidate(
         declared_donor_extras=function.get("expected_donor_extra_functions") or None,
     )
     require(
-        [(row["offset"], row["target"], row["type"]) for row in detailed_relocations(checked, cp)]
-        == [(row["offset"], row["target"], row["type"]) for row in installed_rows],
+        [_composed_identity(row) for row in detailed_relocations(checked, cp)]
+        == [_composed_identity(row) for row in installed_rows],
         "region-resize composed relocation table is not the proved reseat",
     )
     return composed, candidate_proof(

@@ -20,6 +20,7 @@ import reprobit.classic.composition as composition
 import reprobit.classic.composition_hybrid_resize as hybrid_resize
 import reprobit.classic.composition_mosaic as mosaic
 import reprobit.classic.composition_same_slot as same_slot
+import reprobit.classic.function_validation as function_validation
 import reprobit.classic.pe_imports as pe_imports
 import reprobit.classic.pe_metadata as pe_metadata
 import reprobit.classic.pe_rdata as pe_rdata
@@ -235,6 +236,10 @@ class ClassicFamilyDispatcher:
             )
         elif family is ClassicRecipeFamily.RETAIL_EXACT_REGION_RESIZE_REWRITING:
             output, proof = region_resize.produce_region_resize_rewriting_candidate(
+                seed, donor, function
+            )
+        elif family is ClassicRecipeFamily.RETAIL_EXACT_FUNCTION_TRANSLATION_VALIDATION:
+            output, proof = function_validation.produce_function_validation_candidate(
                 seed, donor, function
             )
         elif family is ClassicRecipeFamily.RETAIL_EXACT_SAME_TU_INSTRUCTION_HYBRID_RESIZE:
