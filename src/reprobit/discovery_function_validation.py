@@ -86,7 +86,14 @@ def _pair_relocations(
     donor_section: int | None = None,
     reference_section: int | None = None,
 ) -> list[list[int]]:
-    """Each reference field with the first unused donor record of the same symbol and type.
+    """Each reference field with an unused donor record of the same symbol and type.
+
+    Of those, the first whose addend is the field's own is taken, else the
+    first.  The proof names a relocated value by its target alone (the
+    addend is in the bytes), but the installed table's records are the
+    donor's re-seated and must match the image's fields addend for addend:
+    so when two fields of one symbol move past each other, each still takes
+    the record of its own displacement.
 
     A record naming the function's own section (a switch table's base or
     entry, a recursive call) takes the donor record of the same symbol name
@@ -118,14 +125,15 @@ def _pair_relocations(
         (row for row in reference_rows if row["target_section"] != reference_section),
         key=lambda item: item["offset"],
     ):
+        candidates = [
+            candidate
+            for candidate in unused
+            if _symbol_identity(candidate) == _symbol_identity(row)
+            and candidate["type"] == row["type"]
+        ]
         match = next(
-            (
-                candidate
-                for candidate in unused
-                if _symbol_identity(candidate) == _symbol_identity(row)
-                and candidate["type"] == row["type"]
-            ),
-            None,
+            (candidate for candidate in candidates if candidate["addend"] == row["addend"]),
+            candidates[0] if candidates else None,
         )
         if match is None:
             raise DiscoveryAuthoringError(
