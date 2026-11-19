@@ -52,7 +52,7 @@ address, the same x87 stack, and the same memory outside the dead stack (the
 words below the final ESP and the function's own parameter words), or
 neither does -- under the model every classic rewriting uses (one thread,
 ordinary memory, callees that honour the MSVC calling convention their
-decoration names), x1-x4 of `rewriting_region_resize`, and a1-a3 below.  An
+decoration names), x1-x4 of `rewriting_region_resize`, and a1-a9 below.  An
 access of D faults exactly when the corresponding access of P does, except
 an access to the function's own stack frame (a3); the state at a fault is
 not compared.
@@ -90,15 +90,49 @@ Checks (each is a refusal):
    is a direct call to a callee whose MSVC C decoration fixes a
    register-free convention (``call rel32`` with its REL32 record, ``call
    [abs32]``), exactly as in the region simulator, a call to a verified
-   compiler helper, or a COM vtable call (both below).  Two forms are admitted
-   here and not in a region proof (`region_simulation._Instruction`'s
-   ``extended``): ``lea r, [index*scale + disp32]`` with an unrelocated
-   displacement (arithmetic on a constant), and the string forms MSVC 5.0
-   emits inline -- ``stos``/``movs`` once or under ``rep`` with a constant
-   ECX of at most 1024 (exactly that many element loads and stores) and
-   ``repne scasb`` (one opaque term of AL, EDI, ECX and the memory state,
-   recorded in the footprint; `region_simulation._string_step`), with the
-   direction flag clear as the calling convention leaves it.
+   compiler helper, or a COM vtable call (both below).  Three groups of
+   forms are admitted here and not in a region proof (`region_simulation.
+   _Instruction`'s ``extended``): ``lea r, [index*scale + disp32]`` with an
+   unrelocated displacement (arithmetic on a constant); the string forms
+   MSVC 5.0 emits inline -- ``stos``/``movs`` once or under ``rep`` with a
+   constant ECX of at most 1024 (exactly that many element loads and
+   stores), ``rep stos``/``rep movs`` of any other count (one block event,
+   below) and ``repne scasb`` (one opaque term of AL, EDI, ECX and the
+   memory state, recorded in the footprint; `region_simulation.
+   _string_step`); and the x87 D9 forms beyond the region set
+   (`region_simulation._x87_extended`): ``fsin``, ``fcos``, ``f2xm1``,
+   ``frndint``, ``fpatan``, ``fyl2x``, ``fyl2xp1``, ``fscale``, ``fprem``,
+   ``fprem1``, ``fxtract``, ``ftst``, ``fxam``, the named constants and
+   ``fnop``, each an uninterpreted term of its exact operands (never
+   evaluated), its exception an event in the footprint, and the condition
+   bits it defines (C1 after a rounding, C2 "out of range" after ``fsin``/
+   ``fcos``, all four after ``fprem`` and ``fxam``) functions of the same
+   operands.  ``fptan`` and ``fsincos`` are refused: they push a second
+   value only when the operand is in range, so the stack depth after them
+   depends on the operand.  ``std``, ``cld``, ``popf`` and every other
+   instruction that could change the direction flag are outside the closed
+   set, so the direction flag is clear wherever a string form runs (the
+   calling convention clears it at every entry and after every call).
+
+   Block string moves.  ``rep stos``/``rep movs`` whose ECX is not a
+   constant of at most 1024 is one event (`region_simulation.
+   _block_string`): a term of its kind, element width, ECX, EDI, ESI (movs),
+   the value (stos), the canonical store log since the last event and that
+   event.  With the direction flag clear the block's effect on memory is a
+   function of exactly those, whether or not source and destination
+   overlap, so equal events leave equal memory; it joins the call events
+   (5a), so both versions must make the same block moves in the same order
+   relative to their calls.  Memory after it is the event's result (the
+   store log restarts, later loads name it); ECX is 0 and EDI (and ESI)
+   advance by ECX times the width.  Each pointer is checked by the frame
+   (`FrameModel.block_start`): a private frame admits no stack address (so
+   the block cannot reach a private slot, 7b); a shared frame admits a
+   stack address only at a constant offset at or above ESP, or at a small
+   constant from where an earlier block or scan from such an address ended
+   (an inline ``strcpy``'s second ``rep movsb``, an inline ``strcat``'s copy
+   after its scan): by a9 the block then lies at or above ESP, in the
+   compared memory.  ``repe``/``repne`` with ``movs``/``stos`` and every
+   ``cmps`` are refused.
 
    Compiler helpers.  A direct call to a compiler helper (``__ftol``,
    ``__chkstk``: a ``__name`` the decoration rules refuse) is admitted when
@@ -134,7 +168,13 @@ Checks (each is a refusal):
    edges meet and ESP0 at every return; every pop must be fixed uniquely,
    a multiple of four, and it is part of the event's name, so versions that
    disagree make different calls.  Two vtable calls on every path between
-   the same points fix only the sum of their pops and are refused.
+   the same points fix only the sum of their pops and are refused; the
+   refusal states the one equation that binds them.  Nothing else fixes
+   them soundly: ESP is a known constant only at the entry and at every
+   ``ret`` (the walk's equations), a ``[esp+k]`` access between the calls
+   constrains nothing, and assuming the words pushed before a call are
+   exactly its arguments would be an assumption about the callee that a5
+   does not make.
 3. Relocations.  D's relocated fields are 32-bit `DIR32` fields or a call's
    REL32 field naming a symbol outside the function's own section.  P
    declares its relocated fields, sorted, as a bijection onto D's records:
@@ -157,10 +197,11 @@ Checks (each is a refusal):
    are enumerated (at most 256 each, 20000 steps); for every pair of paths
    whose conditions do not contradict each other (`region_simulation.
    contradictory`):
-   a. they make the same calls: equal event terms in the same order (an
-      event names the callee, ESP, the canonical store log since the
-      previous event, that event, the x87 stack and exception set when
-      used, and in a private frame the argument words, check 7);
+   a. they make the same calls and block string moves: equal event terms in
+      the same order (a call event names the callee, ESP, the canonical
+      store log since the previous event, that event, the x87 stack and
+      exception set when used, and in a private frame the argument words,
+      check 7; a block event is described in check 2);
    b. they leave the same memory: the store logs are equal up to
       reordering provably disjoint stores (`stores_equivalent`) -- every
       store in a shared frame, every store outside the private stack in a
@@ -178,8 +219,19 @@ Checks (each is a refusal):
    f. x87: from a cut point of known depth d, the deepest entry register
       either path touches is below d and d plus its highest push is at most
       eight; a direct call of known x87 return count made from that frame
-      finds the stack empty (d plus its push is 0); no path reads a C0-C3
-      bit an x87 instruction left undefined.
+      finds the stack empty (d plus its push is 0).  A C0-C3 bit an x87
+      instruction leaves undefined (every non-compare that does not define
+      it, per Intel) is the term ``("x87cc", bit, name)``, ``name`` a digest
+      of the instruction's form (opcode and ModR/M register or digit), its
+      memory operand's address, the whole x87 state before it (the entry
+      depth, TOP, every written register, C0-C3, the exception set and the
+      control word) and the stack after it (`region_simulation._X87.
+      undefine`).  By a8 the two versions' bits are equal when these terms
+      are; such a bit is never equal to a compare's bit, a constant, or the
+      bit another instruction or another state leaves, so a version that
+      branches on one where the other branches on a compare's bit makes
+      the two paths of one side consistent with both of the other's, and
+      checks 4 and 5 refuse it (the refusal names the instruction).
 6. Relations.  R(0, 0) is the identity.  The relation a pair of paths
    ending at (x, x') *establishes* has one class per term that some of
    their end locations hold (keeping a class of two or more locations, or
@@ -247,7 +299,22 @@ returns (its return address, its own frame) are dropped from the store log
 -- as the return address and frame of every callee a call event stands for
 already are -- and in a private frame nothing below ESP is ever read.  (a7)
 The linked image's compiler helper is the library member's section
-unchanged (it has no relocation to apply).  No other assumption is made: the
+unchanged (it has no relocation to apply).  (a8) The x87 unit is
+deterministic: a condition bit Intel leaves undefined after an instruction
+holds, on a given processor, a fixed function of the instruction's form,
+its memory operand's address and the x87 state it runs from and leaves
+(the registers, TOP and tags, C0-C3, the exception flags and the control
+word) -- not of the code address it runs at, the last-instruction
+pointers, or any integer state; the same instruction from the same state
+leaves the same bit.  (Real
+processors keep C0, C2 and C3 across ``fld``, ``fst``, ``fxch`` and the
+arithmetic, which MSVC 5.0's scheduling relies on, but no such value is
+assumed: the bit is related only to the same instruction's from the same
+state.)  (a9) A string instruction with the direction flag clear never
+wraps around the address space: the top 64 KiB is never accessible (Win32
+reserves it and the system half below it), so an operation running upward
+from an address faults before it could wrap, and every address it touches
+lies at or above where it started.  No other assumption is made: the
 relation is inferred, nothing about the replacement is believed, and the
 simulator's term model is exact.
 """
@@ -362,6 +429,31 @@ def mentions_stack_address(term: Term) -> bool:
     return False
 
 
+def computed_from_stack(term: Term) -> bool:
+    """Whether a value is computed from ESP0 (not merely loaded from a stack address).
+
+    Like :func:`mentions_stack_address`, but a load's address is not part of
+    its value: a word read from the stack is whatever was stored there, and
+    a term that names ESP0 only inside load addresses (and event names) is
+    not a stack address by its computation.
+    """
+    stack = [term]
+    seen: set[int] = set()
+    while stack:
+        current = stack.pop()
+        if isinstance(current, (tuple, list, frozenset, set)):
+            if id(current) in seen:
+                continue
+            seen.add(id(current))
+            if isinstance(current, tuple):
+                if current == ESP0:
+                    return True
+                if current and current[0] in ("call", "call#", "ld"):
+                    continue
+            stack.extend(item for item in current if not isinstance(item, (str, int)))
+    return False
+
+
 def _shaped(atom: Term, shape: Any) -> Term:
     if shape == "lin":
         return lin_atom(atom)
@@ -429,6 +521,7 @@ class FrameModel:
         slots: dict[tuple[int, int], Term] | None = None,
         dirty: Iterable[int] = (),
         context: str = "",
+        cc_sites: dict[Term, str] | None = None,
     ) -> None:
         self.facts = facts
         self.slots = dict(slots or {})
@@ -437,9 +530,77 @@ class FrameModel:
         # While an inlined compiler helper runs (`region_simulation.
         # run_helper`), the source of fresh values for its stack probes.
         self.helper_reads: Any = None
+        # The instruction behind each named set of undefined x87 condition
+        # bits (`region_simulation._X87.undefine`), shared by the paths of one
+        # run; it only words refusals.
+        self.cc_sites: dict[Term, str] = {} if cc_sites is None else cc_sites
+        # Pointers a block string operation left, each with the constant k
+        # such that the pointer lies at or above ESP0 + k (`block_end`).
+        self.block_floors: dict[Term, int] = {}
 
     def fork(self) -> FrameModel:
-        return FrameModel(self.facts, self.slots, self.dirty, self.context)
+        forked = FrameModel(self.facts, self.slots, self.dirty, self.context, self.cc_sites)
+        forked.block_floors = dict(self.block_floors)
+        return forked
+
+    def block_start(self, state: PathState, pointer: Term, context: str) -> None:
+        """Check one pointer of a block string operation (`region_simulation._block_string`).
+
+        A private frame admits no stack address: none exists outside ESP
+        there (check 7), so the block, which starts at a non-stack address
+        and runs upward, cannot reach a private slot (7b).  A shared frame
+        admits a stack address only at a constant offset at or above ESP: the
+        block then lies wholly at or above ESP (a9), in the compared memory.
+        """
+        if not computed_from_stack(pointer):
+            return
+        if self.facts.private:
+            raise EscapeRefusal(f"{context} is a stack address")
+        offset = self._floor(pointer)
+        require(
+            offset is not None,
+            f"{context} is a stack address at a variable offset, which a block string operation "
+            "is not admitted from",
+        )
+        current = self._current(state)
+        require(
+            cast(int, offset) >= current,
+            f"{context} ESP0{offset:+d} lies below ESP (ESP0{current:+d})",
+        )
+
+    def _floor(self, pointer: Term) -> int | None:
+        """The k with the pointer at or above ESP0 + k, when this path knows one.
+
+        ESP0 + k itself, or a recorded block end T (``block_end``) plus a
+        constant c with |c| < 2**16: T + c >= ESP0 + k + c, since T + c does
+        not wrap (a9: T is one past an accessed byte, and the top 64 KiB of
+        the address space is never accessible).
+        """
+        offset = _esp_offset(pointer)
+        if offset is not None:
+            return offset
+        floors = [
+            floor + _signed(difference)
+            for known, floor in self.block_floors.items()
+            if (difference := const_of(lin_sub(pointer, known))) is not None
+            and abs(_signed(difference)) < 1 << 16
+        ]
+        return max(floors) if floors else None
+
+    def block_end(self, start: Term, end: Term) -> None:
+        """Record that a string operation's end pointer lies at or above its start (a9).
+
+        A ``rep movs``/``rep stos`` block or a ``repne scasb`` scan that
+        started at a stack address known to be at or above ESP0 + k leaves
+        its pointer at or above ESP0 + k: it ran upward over accessed bytes
+        without wrapping, or it faulted and nothing follows.  A later block
+        may start there (``block_start``), as the second half of an inline
+        ``strcpy`` (``rep movsd`` then ``rep movsb``) and an inline
+        ``strcat`` (a scan to the end, ``dec edi``, then the copy) do.
+        """
+        offset = self._floor(start)
+        if offset is not None:
+            self.block_floors[end] = offset
 
     def _current(self, state: PathState) -> int:
         offset = _esp_offset(state.regs["esp"])
@@ -884,16 +1045,31 @@ def indirect_call_pops(program: Program) -> dict[int, int]:
             known = int.from_bytes(item.raw[item.cursor : item.cursor + 4], "little")
         for target in program.successors[offset]:
             stack.append((target, after, known))
-    values = _solve(equations, count)
+    values, links = _solve(equations, count)
     pops = {}
     for site in sites:
         value = values[index[site]]
-        require(
-            value is not None,
-            f"{program.context}: the stack relation does not determine the argument pop of the "
-            f"indirect call at {site}",
-        )
-        pop = cast(Fraction, value)
+        if value is None:
+            linked = links.get(index[site])
+            if linked is None:
+                why = "no return or join constrains it"
+            else:
+                coefficients, total = linked
+                terms = " + ".join(
+                    ("" if k == 1 else f"{k} * ") + f"pop({sites[column]})"
+                    for column, k in coefficients
+                )
+                why = (
+                    f"the only constraint is {terms} = {total} bytes: the calls "
+                    f"{', '.join(str(sites[column]) for column, _k in coefficients)} lie on the "
+                    "same paths, with no return, join or other known stack depth between them "
+                    "to separate their pops"
+                )
+            raise ByteIdentityError(
+                f"{program.context}: the stack relation does not determine the argument pop of "
+                f"the indirect call at {site}: {why}"
+            )
+        pop = value
         require(
             pop.denominator == 1 and 0 <= pop <= MAX_INDIRECT_POP and int(pop) % 4 == 0,
             f"{program.context}: the indirect call at {site} would pop {pop} bytes",
@@ -913,8 +1089,15 @@ def _helper_call(program: Program, offset: int) -> bool:
     )
 
 
-def _solve(equations: list[tuple[Fraction, ...]], count: int) -> list[Fraction | None]:
-    """The unknowns c + sum(k_i n_i) = 0 fix uniquely (None for one they do not), or refuse."""
+def _solve(
+    equations: list[tuple[Fraction, ...]], count: int
+) -> tuple[list[Fraction | None], dict[int, tuple[list[tuple[int, Fraction]], Fraction]]]:
+    """The unknowns c + sum(k_i n_i) = 0 fix uniquely (None for one they do not), or refuse.
+
+    The second result words a refusal: for each unknown left undetermined,
+    one reduced equation that mentions it, as its (unknown, coefficient)
+    terms (scaled so the first is 1) and the constant they sum to.
+    """
     rows = [list(row) for row in equations]
     pivots: list[tuple[int, int]] = []
     rank = 0
@@ -943,7 +1126,17 @@ def _solve(equations: list[tuple[Fraction, ...]], count: int) -> list[Fraction |
             rows[row][other] == 0 for other in range(1, count + 1) if other not in pivot_columns
         ):
             values[column - 1] = -rows[row][0]
-    return values
+    links: dict[int, tuple[list[tuple[int, Fraction]], Fraction]] = {}
+    for row, _column in pivots:
+        terms = [(other - 1, rows[row][other]) for other in range(1, count + 1) if rows[row][other]]
+        if len(terms) < 2:
+            continue
+        lead = terms[0][1]
+        scaled = [(unknown, k / lead) for unknown, k in terms]
+        for unknown, _k in terms:
+            if values[unknown] is None:
+                links.setdefault(unknown, (scaled, -rows[row][0] / lead))
+    return values, links
 
 
 def _displacement(item: _Instruction, size: int) -> int:
@@ -1103,6 +1296,7 @@ def entry_state(
             {name: ("flag0", name) for name in FLAG_NAMES},
         )
         state.frame = FrameModel(frame, context=context)
+        state.fpu.origin = 0
         return state, ("depth", 0)
     terms: dict[Member, Term] = {}
     for index, cls in enumerate(
@@ -1125,7 +1319,9 @@ def entry_state(
     cc = {name: ("free", side, key, ("cc", name)) for name in X87_CONDITION_BITS}
     if facts.x87[0] == "depth":
         depth = facts.x87[1]
-        fpu = X87State(slots={i: value(("st", i), "x87") for i in range(depth)}, cc=cc)
+        fpu = X87State(
+            slots={i: value(("st", i), "x87") for i in range(depth)}, cc=cc, origin=depth
+        )
     else:
         fpu = X87State(base=value(("x87",), "x87"), cc=cc, after_call=True)
     slots = {}
@@ -1292,13 +1488,60 @@ def _footprint(path: PathState, frame: FrameFacts) -> frozenset[Term]:
     return frozenset(kept)
 
 
-def _compare_pair(left: PathEnd, right: PathEnd, frame: FrameFacts, context: str) -> None:
-    """Check 5 for one consistent pair of paths."""
-    where = f"{context} (the donor's path to {left.at}, the replacement's to {right.at})"
-    require(
-        left.state.events == right.state.events,
-        f"{where}: the two versions make different calls",
+def _undefined_bits(end: PathEnd) -> list[str]:
+    """Where the path's conditions read x87 condition bits an instruction left undefined."""
+    found: list[str] = []
+    stack: list[Any] = [end.state.conditions]
+    seen: set[int] = set()
+    sites = end.state.frame.cc_sites if end.state.frame is not None else {}
+    while stack:
+        current = stack.pop()
+        if isinstance(current, (tuple, list)):
+            if id(current) in seen:
+                continue
+            seen.add(id(current))
+            if isinstance(current, tuple) and len(current) == 3 and current[0] == "x87cc":
+                site = sites.get(current[2], "an earlier instruction")
+                note = f"{current[1].upper()} as {site} left it"
+                if note not in found:
+                    found.append(note)
+                continue
+            stack.extend(current)
+    return found
+
+
+def _undefined_bits_note(left: PathEnd, right: PathEnd) -> str:
+    """A refusal's note on branches that read undefined x87 condition bits (a8)."""
+    parts = []
+    for name, end in (("donor", left), ("replacement", right)):
+        found = _undefined_bits(end)
+        if found:
+            parts.append(f"the {name} branches on {', '.join(sorted(found))}")
+    if not parts:
+        return ""
+    return (
+        "; " + " and ".join(parts) + " (Intel leaves C0-C3 undefined after it: such a bit is "
+        "related only to the bit the same instruction leaves from the same x87 state, never to "
+        "a compare's)"
     )
+
+
+def _compare_pair(left: PathEnd, right: PathEnd, frame: FrameFacts, context: str) -> None:
+    """Check 5 for one consistent pair of paths; a refusal notes undefined x87 bits read (a8)."""
+    try:
+        _compare_paths(left, right, frame, context)
+    except ByteIdentityError as error:
+        raise ByteIdentityError(f"{error}{_undefined_bits_note(left, right)}") from error
+
+
+def _compare_paths(left: PathEnd, right: PathEnd, frame: FrameFacts, context: str) -> None:
+    where = f"{context} (the donor's path to {left.at}, the replacement's to {right.at})"
+    if left.state.events != right.state.events:
+        blocks = any(event[0] == "rep" for end in (left, right) for event in end.state.events)
+        raise ByteIdentityError(
+            f"{where}: the two versions make different calls"
+            + (" or block string moves" if blocks else "")
+        )
     returning = left.kind == "ret"
     require(
         left.kind == right.kind,
@@ -1397,7 +1640,8 @@ def validate_function(
         require(
             pair_of_donor.get(x, y) == y and pair_of_image.get(y, x) == x,
             f"{here}: the control-flow graphs differ (the donor's {x} meets the replacement's "
-            f"{y}, but they are paired with {pair_of_donor.get(x)} and {pair_of_image.get(y)})",
+            f"{y}, but they are paired with {pair_of_donor.get(x)} and {pair_of_image.get(y)})"
+            + _undefined_bits_note(left, right),
         )
         pair_of_donor[x] = y
         pair_of_image[y] = x

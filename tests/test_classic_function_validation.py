@@ -209,9 +209,10 @@ def test_a_constant_rep_stos_is_its_stores() -> None:
     assert _prove(MEMSET_D, MEMSET_P).returns == 1
 
 
-def test_a_rep_stos_of_unknown_count_is_refused() -> None:
-    with pytest.raises(ByteIdentityError, match="count is not a constant"):
-        _prove(MEMSET_VARIABLE, MEMSET_VARIABLE)
+def test_a_rep_stos_of_unknown_count_is_one_block_event() -> None:
+    # A whole-function proof models it as one event
+    # (tests/test_classic_block_strings_and_x87.py); a region proof still refuses it.
+    assert _prove(MEMSET_VARIABLE, MEMSET_VARIABLE).returns == 1
 
 
 def test_an_inline_strlen_is_one_scan_on_both_sides() -> None:
