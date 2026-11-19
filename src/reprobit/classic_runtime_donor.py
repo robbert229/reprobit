@@ -921,6 +921,7 @@ class ClassicDonorComposition:
             source_inputs=donor.request.files,
             compiler_statement=compile_statement,
             _issuer=_CLASSIC_SEMANTIC_ISSUER,
+            donor_type_server=invocation.pdb_payload,
         )
         self._progress.emit("donor-compile", step_id)
         self._progress.emit("input-namespace", namespace_step.step_id)

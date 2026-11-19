@@ -103,6 +103,10 @@ class ClassicDispatchMaterials:
     # The authenticated toolchain library compiler-helper bodies are read
     # from (reprobit.classic.toolchain_helpers); None when not supplied.
     helper_library: HelperLibrary | None = None
+    # The PDB the primary donor's compile wrote its types to (``/Zi``), which
+    # a function-validation record of the frame-objects pass reads (a14);
+    # None when not supplied.
+    donor_type_server: bytes | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +127,16 @@ def _required_bytes(value: bytes | None, label: str) -> bytes:
 
 def _present_bytes(**values: bytes | None) -> dict[str, bytes]:
     return {name: value for name, value in values.items() if value is not None}
+
+
+def _reads_donor_types(family: ClassicRecipeFamily, function: Mapping[str, object]) -> bool:
+    """Whether a proved record pins the frame-objects pass (a14), which reads the type server."""
+    if family is not ClassicRecipeFamily.RETAIL_EXACT_FUNCTION_TRANSLATION_VALIDATION:
+        return False
+    spec = function.get("function_validation")
+    proof = spec.get("expected_proof") if isinstance(spec, Mapping) else None
+    assumptions = proof.get("assumptions") if isinstance(proof, Mapping) else None
+    return isinstance(assumptions, list) and "a14" in assumptions
 
 
 class ClassicFamilyDispatcher:
@@ -244,7 +258,7 @@ class ClassicFamilyDispatcher:
             )
         elif family is ClassicRecipeFamily.RETAIL_EXACT_FUNCTION_TRANSLATION_VALIDATION:
             output, proof = function_validation.produce_function_validation_candidate(
-                seed, donor, function, materials.helper_library
+                seed, donor, function, materials.helper_library, materials.donor_type_server
             )
         elif family is ClassicRecipeFamily.RETAIL_EXACT_SAME_TU_INSTRUCTION_HYBRID_RESIZE:
             output, proof = hybrid_resize.produce_same_tu_instruction_hybrid_resize_candidate(
@@ -281,6 +295,11 @@ class ClassicFamilyDispatcher:
                 for name, payload in materials.additional_donor_objects.items()
             },
         }
+        if _reads_donor_types(family, function) and materials.donor_type_server is not None:
+            # A record of the frame-objects pass read the donor's type server.
+            binary_inputs[f"dependency_types:{intervention.dependencies[0]}"] = (
+                materials.donor_type_server
+            )
         source_inputs = _present_bytes(
             seed_source=materials.seed_source,
             donor_source=materials.donor_source,

@@ -380,9 +380,13 @@ class ObjectModel:
     undefined external names, or the section of this object a defined
     symbol lies in.  Two accesses in different objects are disjoint; two in
     one section are related by their offsets in it, when both lie wholly
-    inside its size.  Every other address -- a pointer, an index, the stack
-    above the parameter words -- has no object, and its relation to another
-    address stays unknown.  Region proofs never construct one, so
+    inside its size.  A frame object of a14 (``("fobj", s, n)`` plus a
+    constant, the frame-objects pass's name for an escaping local's bytes)
+    is an object of its own, disjoint from every other one and from the
+    symbols; its relation to an access at a constant offset from the entry
+    ESP is left unknown.  Every other address -- a pointer, an index, the
+    stack above the parameter words -- has no object, and its relation to
+    another address stays unknown.  Region proofs never construct one, so
     :func:`address_relation` without it is unchanged.
     """
 
@@ -413,6 +417,12 @@ class ObjectModel:
             if offset + width > self.stack_end:
                 return None
             return ("stack",), offset
+        if isinstance(atom, tuple) and len(atom) == 3 and atom[0] == "fobj":
+            # A frame object of a14 (`function_validation.frame_object_atom`):
+            # one local's bytes of the own frame, at its start, of its size.
+            if not (offset >= 0 and offset + width <= atom[2]):
+                return None
+            return ("fobj", atom[1]), offset
         if not (isinstance(atom, tuple) and len(atom) == 2 and atom[0] == "sym"):
             return None
         found = self.symbols.get(atom[1])
@@ -427,6 +437,10 @@ class ObjectModel:
         """The relation of two accesses by their objects, or None when either has none."""
         first, second = self.locate(left, left_width), self.locate(right, right_width)
         if first is None or second is None:
+            return None
+        if {first[0][0], second[0][0]} == {"fobj", "stack"}:
+            # A frame object lies in the own frame: its relation to an access
+            # at a constant offset from the entry ESP is that offset's.
             return None
         if first[0] != second[0]:
             return "disjoint"
@@ -941,6 +955,9 @@ def _load(state: PathState, address: Term, width: int) -> Term:
         routed = state.frame.load(state, address, width)
         if routed is not None:
             return routed
+        # The frame-objects pass names an escaping local's bytes by its
+        # object's address (`function_validation.FrameModel.memory_address`).
+        address = state.frame.memory_address(state, address, width)
     state.footprint.add((address, width))
     deps: list[tuple[Term, int, Term]] = []
     objects = _objects(state)
@@ -969,8 +986,11 @@ def _load(state: PathState, address: Term, width: int) -> Term:
 
 
 def _store(state: PathState, address: Term, width: int, value: Term) -> None:
-    if state.frame is not None and state.frame.store(state, address, width, value):
-        return
+    if state.frame is not None:
+        if state.frame.store(state, address, width, value):
+            return
+        address = state.frame.memory_address(state, address, width)
+        value = state.frame.memory_value(value)
     state.footprint.add((address, width))
     if _equivalences(state):
         # A whole-function proof drops every earlier store whose bytes this
