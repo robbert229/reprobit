@@ -129,6 +129,24 @@ relocation, and the ordinary producer must compose the reference body before
 the record is a candidate. It costs more (a semantic rewrite), so it is tried
 only after the splices fail.
 
+When no reordering reaches the reference -- typically because the two bodies
+differ in length, the compiler having kept a value in a register where the
+reference reloads it -- grind tries a `retail_exact_region_resize_rewriting`
+record next. It aligns the donor's instructions with the reference object's,
+takes each maximal run of differing instructions as a region, and offers the
+reference's instructions for that run as its replacement. A region that the
+proof refuses is tried again with up to sixteen equal instructions of context
+on either side, and then merged with its neighbouring run, while it stays
+within 64 instructions. The replacement is proved by the strict path
+simulator of `reprobit.classic.region_simulation`, the function is laid out
+again at its new length (branches, relocations, switch-table entries, line
+rows and debug records re-seated), and the ordinary producer must compose the
+reference body. Such a record costs the same as a donor rewriting (a semantic
+rewrite) and is tried only after the reordering fails. The simulator never
+assumes two different pointers are disjoint, so a reload past a store through
+another pointer is refused: that difference is a source difference (one
+version caches a member in a local) that no binary proof can settle.
+
 Each candidate is compiled through the project's locked compiler graph. A
 candidate can be saved as local progress only after a separate build from
 scratch proves the function and required logic checks. It is exact only when

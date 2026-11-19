@@ -1,0 +1,1184 @@
+"""Classic compiler algorithms: a length-changing region rewrite proved by simulation.
+
+`retail_exact_region_resize_rewriting` installs a declared replacement for one
+or more regions of a freshly compiled donor body.  A replacement may be longer
+or shorter than the region it replaces; the function is then laid out again at
+its new length and installed through the same-slot resize delegate.  The
+record carries each replacement as a list of instruction encodings (hex
+text).  Those bytes are untrusted input: nothing about them is believed
+except what the checks below measure, and every check compares them with the
+donor the build compiles from source.  The build never reads a reference
+image.
+
+Theorem.  Let D be the donor body, R_1..R_n disjoint donor regions
+[s_i, e_i), P_i the declared replacements, and I the image
+``D[:s_1] P_1 D[e_1:s_2] ... P_n D[e_n:]`` laid out by the offset map M of
+check 6.  If checks 1 to 9 hold, then for every entry state, D and I, run from
+the function's entry or from any of its external entries, perform the same
+sequence of memory writes and calls with the same arguments, and return with
+the same EAX, the same callee-saved registers, the same ESP and the same
+memory -- under the model every classic rewriting uses: one thread, ordinary
+(non-volatile, non-device) memory, and callees that honour the MSVC calling
+convention.  A region of D faults exactly when its replacement does; the
+state at a fault is not compared.
+
+Proof sketch.  Outside the regions D and I execute the same instructions
+(check 6), so an invariant "the two states agree on memory, ESP, and every
+register and flag live at this point in D or in I" is preserved by each of
+them: a live set computed by backward liveness satisfies
+``L(p) >= use(p) | (L(succ) - def(p))`` on its own control-flow graph, the two
+graphs are equal outside the regions under M, and so is the union of the two
+live sets.  At a region entry the states agree on the union live set there,
+and every entry value a region reads before writing it is in that set
+(check 8f).  Check 8 then shows, for every pair of paths through R_i and P_i
+that the same entry state can take, that the two exit states agree on
+memory, ESP, and every register and flag live at the exit in D or in I.  So
+the invariant holds again after the region, and at every return it covers
+EAX, the callee-saved registers and ESP, which the liveness treats as read by
+``ret``.
+
+Checks (each is a refusal):
+
+1. Shape.  Every region lies on instruction boundaries of D's code, inside
+   the code (before any switch table or fill), after the FPO prologue, and
+   does not reach the code end; regions are sorted and disjoint.
+2. Single entry.  No branch outside a region targets its interior, no
+   external entry (an entry the flow walk finds, or an in-body relocated
+   target) lies in its interior, and no symbol of the function's section,
+   line-independent debug offset (the CodeView procedure range) or
+   closure-child code reference names an interior offset.
+3. Single exit, forward CFG.  Inside R_i and P_i every instruction falls
+   through or branches strictly forward to an instruction of the same region
+   or to its end; there is no call, return, indirect transfer or
+   relocated branch.  The CFG is therefore a DAG with one entry (the start)
+   and one exit (the end), and its paths are enumerated (at most 64).
+4. Decoding.  P_i decodes, instruction by instruction, to exactly the
+   declared encodings, and I re-decodes to exhaustion with each P_i on its
+   own boundaries.
+5. Relocations.  R_i's relocated fields are all 32-bit `DIR32` fields that
+   name a symbol outside the function's own section.  P_i declares its
+   relocated fields as an order-preserving bijection onto them: field k of
+   P_i takes field k of R_i's relocation record (same type, same target
+   symbol).  The simulator reads every relocated field of R_i and P_i as
+   that symbol plus the field's own addend, and refuses any relocated field
+   it does not consume as an address displacement or an immediate.
+6. Layout.  M is the identity before s_1 and shifts by the accumulated
+   length change after each region; the code's data tail (switch tables)
+   moves with the last instruction.  A relative call without a relocation
+   (a call to a label of this body) is refused.  Every relative branch outside the
+   regions keeps its encoding width and is re-encoded for M; one that no
+   longer fits is refused (a short branch is never widened: that would be a
+   code change no region proves).  Every in-body relocation (a switch table
+   entry, a table base) has its addend re-encoded for M and must name an
+   instruction boundary or a tail offset.  The re-decoded image keeps every
+   outside instruction's length, opcode, flow class and mapped target.
+7. Liveness.  Register and per-flag liveness are computed on D and on I.
+8. Simulation (`region_simulation`).  R_i and P_i are executed from one
+   symbolic entry state.  For every pair of paths whose conditions do not
+   contradict each other (two paths of a deterministic run from one entry
+   state never do):
+   a. ESP is equal;
+   b. every register with an atom live at the exit in D or in I is equal;
+   c. every flag live at the exit in D or in I is equal;
+   d. the two store sequences are equal up to reordering provably disjoint
+      stores (pushes included);
+   e. the two memory footprints (address and width of every access) are
+      equal, so one faults exactly when the other does; and
+   f. every entry register and flag that any compared term, store, access
+      or path condition mentions is live at the region entry in D or in I
+      (all of its atoms), so the symbolic entry state stands for values the
+      two programs really share; a register both versions leave exactly at
+      its entry value needs only its exit-live atoms live at the entry.
+9. Pins.  The image digest and length, the per-region length change, the
+   branch re-encodings, relocation reseats, addend repairs, path counts and
+   the derived donor's procedure range are all pinned by the declaration and
+   re-measured here, and the derived donor object is re-parsed and checked
+   before the same-slot delegate installs it.
+
+Line rows inside a region interior are carried to the replacement's first
+byte: rows are debug metadata only, and the count is kept.
+"""
+
+from __future__ import annotations
+
+import itertools
+from collections.abc import Iterator
+from contextlib import contextmanager
+from typing import Any, cast
+
+from reprobit.binary import ByteIdentityError, require
+from reprobit.coff_format import (
+    CoffObject,
+    coff_auxiliary,
+    coff_body,
+    coff_unpack,
+    detailed_relocations,
+)
+from reprobit.ia32_decode import supported_ia32_instruction_length
+
+from .candidate_recipe import (
+    CandidateRecipe,
+    candidate_proof,
+    candidate_relocation_semantics,
+    install_same_slot,
+    internal_relocation_targets,
+    open_candidate_seats,
+    pin_candidate_bodies,
+    relocation_symbol_map,
+    require_declared_internal_targets,
+    require_pinned_length,
+    same_slot_effective,
+)
+from .coff import (
+    _coff_marker,
+    _coff_section_symbol,
+    _coff_table_bytes,
+    _comdat_child,
+    _comdat_child_closure,
+    comdat_primary_identity_multiset,
+    function_multiset,
+    function_symbol,
+)
+from .debug import (
+    CODEVIEW_PROCEDURE_RECORD_TYPES,
+    MSVC50_FUNCTION_FILL_BYTE,
+    _apply_replacements,
+    parse_codeview_symbol_stream,
+    parse_fpo_data,
+    shifted_pointer,
+)
+from .foundation import require_payload_free_declaration, sha256_bytes
+from .region_simulation import (
+    FLAG_NAMES,
+    contradictory,
+    lin_atom,
+    simulate_region,
+    stores_equivalent,
+    term_atoms,
+)
+from .register_semantics import (
+    _IA32_ATOMS_OF,
+    IA32_GENERAL_REGISTER_NAMES,
+    _register_bijection_live_sets,
+    decode_ia32_bijection_body,
+)
+from .relational import (
+    ia32_relational_flag_liveness,
+    ia32_relational_flow_walk,
+    relational_form_external_entries,
+)
+
+REGION_RESIZE_KIND = "simulated_region_resize_v1"
+REGION_RESIZE_CLASS = "retail_exact_region_resize_rewriting"
+_DIR32 = 0x0006
+_DIR32NB = 0x0007
+_CODE_RELOCATION_TYPES = frozenset({_DIR32, _DIR32NB, 0x0014})
+# CodeView records that carry no code offset of their own: the procedure
+# record (handled), locals, register and constant records, UDTs, the end.
+_OFFSET_FREE_CODEVIEW_TYPES = frozenset(
+    {0x0001, 0x0002, 0x0003, 0x0004, 0x0006, 0x0200, 0x1001, 0x1002, 0x1003, 0x1006}
+)
+_BRANCH_FORMS = {**{0x70 | code: 1 for code in range(16)}, 0xEB: 1, 0xE9: 4}
+
+
+class RegionRefusal(ByteIdentityError):
+    """A refusal that one declared region (``region``, its ordinal) caused."""
+
+    def __init__(self, message: str, region: int) -> None:
+        super().__init__(message)
+        self.region = region
+
+
+@contextmanager
+def _region_refusals(ordinal: int) -> Iterator[None]:
+    """Name the region a refusal inside its own checks belongs to."""
+    try:
+        yield
+    except RegionRefusal:
+        raise
+    except ByteIdentityError as exc:
+        raise RegionRefusal(str(exc), ordinal) from exc
+
+
+def _hex_instruction(text: object, context: str) -> bytes:
+    require(
+        isinstance(text, str) and bool(text) and len(text) % 2 == 0 and len(text) <= 30,
+        f"{context}: an encoding is not a hex instruction",
+    )
+    try:
+        raw = bytes.fromhex(cast(str, text))
+    except ValueError as exc:
+        raise ByteIdentityError(f"{context}: an encoding is not a hex instruction") from exc
+    require(
+        cast(str, text) == raw.hex(),
+        f"{context}: an encoding is not canonical lowercase hex",
+    )
+    length = supported_ia32_instruction_length(raw, context)
+    require(length == len(raw), f"{context}: an encoding is not exactly one instruction")
+    return raw
+
+
+def _branch_width(body: bytes, item: dict[str, Any], context: str) -> int:
+    opcode = body[item["offset"]]
+    if opcode == 0x0F:
+        require(
+            0x80 <= body[item["offset"] + 1] <= 0x8F,
+            f"{context}: the branch at {item['offset']} has an unknown form",
+        )
+        return 4
+    width = _BRANCH_FORMS.get(opcode)
+    require(
+        width is not None, f"{context}: the branch at {item['offset']} has a prefix or unknown form"
+    )
+    return cast(int, width)
+
+
+def _validate_regions(regions: object, context: str) -> list[dict[str, Any]]:
+    require_payload_free_declaration(regions, f"{context} region-resize declaration")
+    require(isinstance(regions, list) and bool(regions), f"{context}: no region is declared")
+    validated = []
+    for ordinal, item in enumerate(cast(list[Any], regions)):
+        item_context = f"{context} region {ordinal}"
+        require(isinstance(item, dict), f"{item_context}: the region is not an object")
+        require(
+            set(item)
+            == {
+                "region_start",
+                "region_end",
+                "replacement_instructions",
+                "replacement_relocations",
+            },
+            f"{item_context}: the region names an unknown or missing field",
+        )
+        start, end = item["region_start"], item["region_end"]
+        require(
+            type(start) is int and type(end) is int and 0 <= start < end,
+            f"{item_context}: bounds are invalid",
+        )
+        encodings = item["replacement_instructions"]
+        require(
+            isinstance(encodings, list) and len(encodings) <= 256,
+            f"{item_context}: the replacement is not a list of encodings",
+        )
+        pieces = [_hex_instruction(text, item_context) for text in encodings]
+        pairs = item["replacement_relocations"]
+        require(
+            isinstance(pairs, list)
+            and all(
+                isinstance(pair, list)
+                and len(pair) == 2
+                and all(type(value) is int and value >= 0 for value in pair)
+                for pair in pairs
+            ),
+            f"{item_context}: the replacement relocations are invalid",
+        )
+        validated.append(
+            {
+                "start": start,
+                "end": end,
+                "replacement": b"".join(pieces),
+                "boundaries": [sum(len(piece) for piece in pieces[:k]) for k in range(len(pieces))],
+                "relocations": [tuple(pair) for pair in pairs],
+            }
+        )
+    for left, right in itertools.pairwise(validated):
+        require(left["end"] <= right["start"], f"{context}: regions are unsorted or overlapping")
+    return validated
+
+
+def apply_region_resize(
+    body: bytes,
+    regions: list[Any],
+    rows: list[dict[str, Any]],
+    section_number: int,
+    context: str,
+    *,
+    code_length: int | None = None,
+    proc_size: int | None = None,
+    external_entries: frozenset[int] = frozenset(),
+    protected_offsets: frozenset[int] = frozenset(),
+    prologue_length: int = 0,
+) -> tuple[bytes, dict[str, Any]]:
+    """Install each declared replacement, relay the body out, and prove it (checks 1-8).
+
+    ``rows`` are the donor's detailed relocation records; ``code_length`` the
+    end of its code (before any switch table), ``proc_size`` the end of its
+    procedure (before MSVC 5.0's alignment fill; the body's length when
+    None).  ``protected_offsets`` are offsets other records name (section
+    symbols, the CodeView procedure range, closure-child references), none of
+    which may lie in a region interior.  Returns the unpadded image (code and
+    tail) and the proof; the caller pads it.
+    """
+    body = bytes(body)
+    require(bool(body), f"{context}: body is empty")
+    declared = _validate_regions(regions, context)
+    proc = len(body) if proc_size is None else proc_size
+    limit = proc if code_length is None else code_length
+    require(
+        0 < limit <= proc <= len(body), f"{context}: the code and procedure extents are invalid"
+    )
+    require(
+        all(byte == MSVC50_FUNCTION_FILL_BYTE for byte in body[proc:]),
+        f"{context}: the bytes after the procedure are not alignment fill",
+    )
+    for row in rows:
+        require(
+            row["type"] in _CODE_RELOCATION_TYPES or row["offset"] >= limit,
+            f"{context}: the relocation at {row['offset']} has a type outside the closed set",
+        )
+    relocated_fields = {row["offset"] for row in rows}
+    relocation_view = relocation_symbol_map(rows)
+    decode_view = None if limit == len(body) else limit
+    donor_body = body[:proc]
+    instructions = decode_ia32_bijection_body(
+        body, f"{context} donor", relocation_view, decode_view
+    )
+    index_of = {item["offset"]: index for index, item in enumerate(instructions)}
+    for item in instructions:
+        # A relative call without a relocation names an offset of this body
+        # that the decoder does not report as a branch target, so the layout
+        # could neither repair nor check it.
+        require(
+            not (item["flow"] == "call" and body[item["offset"]] == 0xE8)
+            or item["offset"] + 1 in relocated_fields,
+            f"{context}: the relative call at {item['offset']} has no relocation; a layout change "
+            "would retarget it",
+        )
+    internal_targets = internal_relocation_targets(rows, section_number)
+    items, successors, entries = ia32_relational_flow_walk(
+        body, relocation_view, f"{context} donor flow", decode_view, external_entries
+    )
+    entry_offsets = {items[index]["offset"] for index in entries[1:]}
+    own_rows = [row for row in rows if row["target_section"] == section_number]
+    # Checks 1-3 on the donor side.
+    for ordinal, region in enumerate(declared):
+        with _region_refusals(ordinal):
+            region_context = f"{context} region {ordinal}"
+            start, end = region["start"], region["end"]
+            require(
+                start in index_of and end in index_of and end < limit,
+                f"{region_context}: the region is not on instruction boundaries inside the code",
+            )
+            require(
+                start >= prologue_length, f"{region_context}: the region overlaps the FPO prologue"
+            )
+
+            def interior(offset: int, start: int = start, end: int = end) -> bool:
+                return start < offset < end
+
+            for item in instructions:
+                if item["target"] is not None and not start <= item["offset"] < end:
+                    require(
+                        not interior(item["target"]),
+                        f"{region_context}: the branch at {item['offset']} targets the region "
+                        "interior",
+                    )
+            for offset in entry_offsets | set(internal_targets):
+                require(
+                    not interior(offset),
+                    f"{region_context}: an external entry or relocated target at {offset} lies "
+                    "inside the region",
+                )
+            for offset in protected_offsets:
+                require(
+                    not interior(offset),
+                    f"{region_context}: a symbol or debug record names the region interior at "
+                    f"{offset}",
+                )
+            for item in instructions:
+                if not start <= item["offset"] < end:
+                    continue
+                require(
+                    item["flow"] in ("fall", "jcc", "jmp") and not item["indirect"],
+                    f"{region_context}: the region holds a {item['flow']} at {item['offset']}",
+                )
+                if item["flow"] in ("jcc", "jmp"):
+                    require(
+                        item["target"] is not None and item["offset"] < item["target"] <= end,
+                        f"{region_context}: the branch at {item['offset']} leaves the region or "
+                        "goes backward",
+                    )
+            region_rows = [row for row in rows if start <= row["offset"] < end]
+            for row in region_rows:
+                require(
+                    row["offset"] + row["width"] <= end
+                    and row["type"] == _DIR32
+                    and row["width"] == 4
+                    and row["target_section"] != section_number,
+                    f"{region_context}: the relocation at {row['offset']} is not an external "
+                    "DIR32 field",
+                )
+            # Check 5: the order-preserving bijection of relocated fields.
+            pairs = region["relocations"]
+            require(
+                [donor for _local, donor in pairs] == [row["offset"] for row in region_rows],
+                f"{region_context}: the replacement's relocations are not the region's, in order",
+            )
+            locals_ = [local for local, _donor in pairs]
+            require(
+                locals_ == sorted(set(locals_))
+                and all(local + 4 <= len(region["replacement"]) for local in locals_),
+                f"{region_context}: the replacement's relocated fields are unsorted or out of "
+                "range",
+            )
+            region["rows"] = region_rows
+    # Check 6: the layout.
+    shifts: list[tuple[int, int, int]] = []
+    delta = 0
+    for region in declared:
+        growth = len(region["replacement"]) - (region["end"] - region["start"])
+        region["image_start"] = region["start"] + delta
+        delta += growth
+        region["growth"] = growth
+        shifts.append((region["start"], region["end"], delta))
+
+    def mapped(offset: int) -> int:
+        """M on every offset outside a region interior (and region starts)."""
+        moved = 0
+        for start, end, accumulated in shifts:
+            if offset >= end:
+                moved = accumulated
+            elif offset > start:
+                raise ByteIdentityError(f"{context}: offset {offset} lies inside a region")
+        return offset + moved
+
+    pieces: list[bytes] = []
+    cursor = 0
+    for region in declared:
+        pieces.append(donor_body[cursor : region["start"]])
+        pieces.append(region["replacement"])
+        cursor = region["end"]
+    pieces.append(donor_body[cursor:])
+    image = bytearray(b"".join(pieces))
+    image_limit = mapped(limit)
+    image_proc = mapped(proc)
+    require(
+        len(image) == image_proc and image_proc > 0,
+        f"{context}: the image is not the concatenation of its pieces",
+    )
+    branch_repairs = []
+    for item in instructions:
+        if item["flow"] not in ("jcc", "jmp") or item["target"] is None:
+            continue
+        if any(region["start"] <= item["offset"] < region["end"] for region in declared):
+            continue
+        width = _branch_width(body, item, context)
+        new_at = mapped(item["offset"])
+        new_end = new_at + item["length"]
+        displacement = mapped(item["target"]) - new_end
+        require(
+            -(1 << (8 * width - 1)) <= displacement < 1 << (8 * width - 1),
+            f"{context}: the branch at {item['offset']} no longer reaches its target in "
+            f"{width} displacement byte(s); widening it is a code change no region proves",
+        )
+        encoded = displacement.to_bytes(width, "little", signed=True)
+        if bytes(image[new_end - width : new_end]) != encoded:
+            image[new_end - width : new_end] = encoded
+            branch_repairs.append(new_at)
+    reseat: list[list[int]] = []
+    image_view: dict[int, dict[str, Any]] = {}
+    region_maps: list[dict[int, str]] = [{} for _region in declared]
+    for row in rows:
+        owner = next(
+            (
+                position
+                for position, region in enumerate(declared)
+                if region["start"] <= row["offset"] < region["end"]
+            ),
+            None,
+        )
+        if owner is None:
+            new_offset = mapped(row["offset"]) if row["offset"] < limit else row["offset"] + delta
+        else:
+            region = declared[owner]
+            local = next(local for local, donor in region["relocations"] if donor == row["offset"])
+            new_offset = region["image_start"] + local
+            region_maps[owner][local] = row["target"]
+        if new_offset != row["offset"]:
+            reseat.append([row["offset"], new_offset])
+        image_view[new_offset] = {"width": row["width"], "target": row["target"]}
+    require(len(image_view) == len(rows), f"{context}: the reseat collides two relocation records")
+    moved = {old: new for old, new in reseat}
+    addend_repairs = []
+    symbol_values = {row["target"]: row["target_value"] for row in own_rows}
+    for row in own_rows:
+        require(
+            row["type"] in (_DIR32, _DIR32NB) and row["width"] == 4,
+            f"{context}: the in-body relocation at {row['offset']} is not a 32-bit absolute field",
+        )
+        at = moved.get(row["offset"], row["offset"])
+        addend = int.from_bytes(image[at : at + 4], "little", signed=True)
+        base = symbol_values[row["target"]]
+        target = base + addend
+        require(
+            0 <= target < proc
+            and (target in index_of or target >= limit)
+            and not any(region["start"] < target < region["end"] for region in declared),
+            f"{context}: the in-body relocation at {row['offset']} names {target}, not an "
+            "instruction or table offset outside every region",
+        )
+        new_target = mapped(target) if target < limit else target + delta
+        new_base = mapped(base) if base < limit else base + delta
+        new_addend = new_target - new_base
+        if new_addend != addend:
+            image[at : at + 4] = new_addend.to_bytes(4, "little", signed=True)
+            addend_repairs.append([at, addend, new_addend])
+    image_bytes = bytes(image)
+    # Check 4: the image re-decodes on the layout's boundaries.
+    image_instructions = decode_ia32_bijection_body(
+        image_bytes,
+        f"{context} image",
+        image_view,
+        None if image_limit == len(image_bytes) else image_limit,
+    )
+    image_index = {item["offset"]: index for index, item in enumerate(image_instructions)}
+    for region in declared:
+        starts = [region["image_start"] + local for local in region["boundaries"]]
+        inside = [
+            item["offset"]
+            for item in image_instructions
+            if region["image_start"]
+            <= item["offset"]
+            < region["image_start"] + len(region["replacement"])
+        ]
+        require(
+            inside == starts,
+            f"{context}: the image does not decode the replacement on its own boundaries",
+        )
+    for item in instructions:
+        if any(region["start"] <= item["offset"] < region["end"] for region in declared):
+            continue
+        new_at = mapped(item["offset"])
+        require(
+            new_at in image_index,
+            f"{context}: the instruction at {item['offset']} did not land where M says",
+        )
+        other = image_instructions[image_index[new_at]]
+        require(
+            other["length"] == item["length"]
+            and other["opcode"] == item["opcode"]
+            and other["flow"] == item["flow"]
+            and other["indirect"] == item["indirect"]
+            and other["target"] == (None if item["target"] is None else mapped(item["target"])),
+            f"{context}: the image changed the instruction at {item['offset']}",
+        )
+        raw = body[item["offset"] : item["offset"] + item["length"]]
+        new_raw = image_bytes[new_at : new_at + item["length"]]
+        if raw != new_raw:
+            allowed = set()
+            if new_at in branch_repairs:
+                width = _branch_width(body, item, context)
+                allowed |= set(range(item["length"] - width, item["length"]))
+            for at, _old, _new in addend_repairs:
+                if new_at <= at < new_at + item["length"]:
+                    allowed |= set(range(at - new_at, at - new_at + 4))
+            changed = {index for index in range(item["length"]) if raw[index] != new_raw[index]}
+            require(
+                changed <= allowed,
+                f"{context}: the instruction at {item['offset']} changed outside a branch or "
+                "addend repair",
+            )
+    tail_changes = {
+        index for index in range(limit, proc) if body[index] != image_bytes[index + delta]
+    }
+    tail_allowed = {
+        at - delta + k for at, _old, _new in addend_repairs if at >= image_limit for k in range(4)
+    }
+    require(
+        tail_changes <= tail_allowed,
+        f"{context}: the image changed the data tail outside an addend repair",
+    )
+    # Check 7: liveness on both bodies.
+    donor_live, _ = _register_bijection_live_sets(instructions, f"{context} donor liveness")
+    image_live, _ = _register_bijection_live_sets(image_instructions, f"{context} image liveness")
+    donor_flag_live = ia32_relational_flag_liveness(items, successors, f"{context} donor flags")
+    donor_item_index = {item["offset"]: index for index, item in enumerate(items)}
+    image_items, image_successors, _image_entries = ia32_relational_flow_walk(
+        image_bytes,
+        image_view,
+        f"{context} image flow",
+        None if image_limit == len(image_bytes) else image_limit,
+        frozenset(mapped(offset) for offset in external_entries),
+    )
+    image_flag_live = ia32_relational_flag_liveness(
+        image_items, image_successors, f"{context} image flags"
+    )
+    image_item_index = {item["offset"]: index for index, item in enumerate(image_items)}
+    # Check 8: the simulation.
+    proved = []
+    for ordinal, region in enumerate(declared):
+        with _region_refusals(ordinal):
+            region_context = f"{context} region {ordinal}"
+            start, end = region["start"], region["end"]
+            image_start = region["image_start"]
+            image_end = image_start + len(region["replacement"])
+            donor_paths = simulate_region(
+                donor_body,
+                start,
+                end,
+                {row["offset"]: row["target"] for row in region["rows"]},
+                "donor",
+                f"{region_context} donor",
+            )
+            image_paths = simulate_region(
+                region["replacement"],
+                0,
+                len(region["replacement"]),
+                region_maps[ordinal],
+                "replacement",
+                f"{region_context} replacement",
+            )
+            exit_atoms = donor_live[index_of[end]] | image_live[image_index[image_end]]
+            entry_atoms = donor_live[index_of[start]] | image_live[image_index[image_start]]
+            exit_flags = (
+                donor_flag_live[donor_item_index[end]]
+                | image_flag_live[image_item_index[image_end]]
+            )
+            entry_flags = (
+                donor_flag_live[donor_item_index[start]]
+                | image_flag_live[image_item_index[image_start]]
+            )
+            compared_registers = sorted(
+                name
+                for name in IA32_GENERAL_REGISTER_NAMES
+                if name != "esp" and _IA32_ATOMS_OF[name] & exit_atoms
+            )
+            compared_flags = sorted(name for name in FLAG_NAMES if name in exit_flags)
+            pairs = 0
+            mentioned: set[Any] = set()
+            passed_through: set[str] = set()
+            for left in donor_paths:
+                for right in image_paths:
+                    if contradictory(left.conditions, right.conditions):
+                        continue
+                    pairs += 1
+                    require(
+                        left.regs["esp"] == right.regs["esp"],
+                        f"{region_context}: the two versions leave a different stack pointer",
+                    )
+                    for name in compared_registers:
+                        require(
+                            left.regs[name] == right.regs[name],
+                            f"{region_context}: {name} is live at the exit and the two versions "
+                            "leave it different",
+                        )
+                    for name in compared_flags:
+                        require(
+                            left.flags[name] == right.flags[name],
+                            f"{region_context}: the flag {name} is live at the exit and the two "
+                            "versions leave it different",
+                        )
+                    why = stores_equivalent(left.stores, right.stores)
+                    require(
+                        why is None,
+                        f"{region_context}: the two versions leave different memory: {why}",
+                    )
+                    require(
+                        left.footprint == right.footprint,
+                        f"{region_context}: the two versions access different memory",
+                    )
+                    for path in (left, right):
+                        for name in ["esp", *compared_registers]:
+                            if name != "esp" and path.regs[name] == lin_atom(("reg0", name)):
+                                # A register both versions leave at its entry
+                                # value needs only its exit-live atoms shared.
+                                passed_through.add(name)
+                                continue
+                            term_atoms(path.regs[name], mentioned)
+                        for name in compared_flags:
+                            term_atoms(path.flags[name], mentioned)
+                        term_atoms(path.stores, mentioned)
+                        term_atoms(path.footprint, mentioned)
+                        term_atoms(path.conditions, mentioned)
+            require(pairs > 0, f"{region_context}: no pair of paths is consistent")
+            for name in sorted(passed_through):
+                missing = (_IA32_ATOMS_OF[name] & exit_atoms) - entry_atoms
+                require(
+                    not missing,
+                    f"{region_context}: {name} passes through the region but {sorted(missing)} is "
+                    "live only at its exit",
+                )
+            for kind, name in sorted(mentioned):
+                if kind == "reg0":
+                    if name == "esp":
+                        continue
+                    missing = _IA32_ATOMS_OF[name] - entry_atoms
+                    require(
+                        not missing,
+                        f"{region_context}: the entry value of {name} is read but "
+                        f"{sorted(missing)} is dead at the region entry",
+                    )
+                else:
+                    require(
+                        name in entry_flags,
+                        f"{region_context}: the entry flag {name} is read but dead at the region "
+                        "entry",
+                    )
+            proved.append(
+                {
+                    "region_start": start,
+                    "region_end": end,
+                    "image_start": image_start,
+                    "image_end": image_end,
+                    "growth": region["growth"],
+                    "donor_paths": len(donor_paths),
+                    "replacement_paths": len(image_paths),
+                    "path_pairs": pairs,
+                    "compared_registers": compared_registers,
+                    "compared_flags": compared_flags,
+                }
+            )
+    offset_map: dict[int, int] = {}
+    for item in instructions:
+        if not any(region["start"] < item["offset"] < region["end"] for region in declared):
+            offset_map[item["offset"]] = mapped(item["offset"])
+    for offset in range(limit, len(body) + 1):
+        offset_map[offset] = offset + delta
+    return image_bytes, {
+        "kind": REGION_RESIZE_KIND,
+        "regions": proved,
+        "growth": delta,
+        "code_length": limit,
+        "image_code_length": image_limit,
+        "proc_size": proc,
+        "image_proc_size": image_proc,
+        "branch_repairs": sorted(branch_repairs),
+        "relocation_reseat": sorted(reseat),
+        "addend_repairs": sorted(addend_repairs),
+        "instruction_count": len(image_instructions),
+        "offset_map": offset_map,
+        "interiors": [
+            [region["start"], region["end"], region["image_start"]] for region in declared
+        ],
+    }
+
+
+def _padded_length(proc_size: int, fill_alignment: int) -> int:
+    if fill_alignment == 1:
+        return proc_size
+    return (proc_size + fill_alignment - 1) // fill_alignment * fill_alignment
+
+
+def resized_donor_object(
+    donor_bytes: bytes,
+    mangled: str,
+    image: bytes,
+    proof: dict[str, Any],
+    context: str,
+) -> tuple[bytes, dict[str, Any]]:
+    """Re-seat one COMDAT's dependent COFF records around a resized body.
+
+    The donor is an authentic compiler object; the result is the same object
+    with ``image`` (code, tail and alignment fill) as the target body, and
+    every record that states a code offset carried through the proof's
+    offset map: COFF line rows (a row inside a region interior goes to the
+    replacement's first byte), relocation offsets, the CodeView procedure
+    length and debug range, the FPO procedure size, the function's
+    TotalSize, the COMDAT's Length, the ``.ef`` marker and every other
+    symbol of the section.  It is re-parsed and re-checked before it is
+    handed to the installation delegate.
+    """
+    donor = CoffObject(donor_bytes)
+    primary = donor.function_section(mangled)
+    offset_map = cast(dict[int, int], proof["offset_map"])
+    interiors = proof["interiors"]
+    proc_size, image_proc = proof["proc_size"], proof["image_proc_size"]
+    body_length = len(image)
+
+    def carried(offset: int) -> int | None:
+        if offset in offset_map:
+            return offset_map[offset]
+        for start, end, image_start in interiors:
+            if start < offset < end:
+                return cast(int, image_start)
+        return None
+
+    line_bytes = _coff_table_bytes(donor, primary, "lines")
+    require(
+        len(line_bytes) == primary["line_count"] * 6 and primary["line_count"] >= 1,
+        f"{context}: the donor line table is missing",
+    )
+    require(
+        coff_unpack("<IH", line_bytes, 0, f"{context} line sentinel")[1] == 0,
+        f"{context}: the donor line sentinel is invalid",
+    )
+    rebuilt_lines = bytearray(line_bytes[:6])
+    collapsed = 0
+    for position in range(1, primary["line_count"]):
+        offset, line = coff_unpack(
+            "<IH", line_bytes, position * 6, f"{context} line row {position}"
+        )
+        target = carried(offset)
+        require(
+            line != 0 and target is not None,
+            f"{context}: line row {position} at {offset} is not an instruction boundary of the "
+            "donor",
+        )
+        if offset not in offset_map:
+            collapsed += 1
+        rebuilt_lines += cast(int, target).to_bytes(4, "little") + line.to_bytes(2, "little")
+    relocation_bytes = _coff_table_bytes(donor, primary, "relocations")
+    moved = {old: new for old, new in proof["relocation_reseat"]}
+    rebuilt_relocations = bytearray(relocation_bytes)
+    for ordinal in range(primary["relocation_count"]):
+        at = ordinal * 10
+        offset = int.from_bytes(relocation_bytes[at : at + 4], "little")
+        rebuilt_relocations[at : at + 4] = moved.get(offset, offset).to_bytes(4, "little")
+    debug_child = _comdat_child(donor, primary, ".debug$S")
+    debug_raw = bytes(coff_body(donor, debug_child))
+    records = parse_codeview_symbol_stream(debug_raw, f"{context} debug$S")
+    procedures = [record for record in records if record["type"] in CODEVIEW_PROCEDURE_RECORD_TYPES]
+    require(
+        len(procedures) == 1 and procedures[0]["offset"] == 0,
+        f"{context}: the donor debug$S does not open with its one procedure record",
+    )
+    for record in records[1:]:
+        require(
+            record["type"] in _OFFSET_FREE_CODEVIEW_TYPES,
+            f"{context}: the debug$S record of type {record['type']:#x} may carry a code offset",
+        )
+    code_length, debug_start, debug_end = coff_unpack(
+        "<III", debug_raw, 16, f"{context} debug range"
+    )
+    require(
+        code_length == proc_size and 0 <= debug_start <= debug_end <= code_length,
+        f"{context}: the donor debug procedure range is stale",
+    )
+    require(
+        debug_start in offset_map and debug_end in offset_map,
+        f"{context}: the debug range is not on boundaries outside every region interior",
+    )
+    rebuilt_debug = bytearray(debug_raw)
+    rebuilt_debug[16:28] = (
+        image_proc.to_bytes(4, "little")
+        + offset_map[debug_start].to_bytes(4, "little")
+        + offset_map[debug_end].to_bytes(4, "little")
+    )
+    closure = _comdat_child_closure(donor, primary)[1]
+    replacements = [
+        (primary["raw_offset"], primary["raw_offset"] + primary["raw_size"], bytes(image)),
+        (primary["line_offset"], primary["line_offset"] + len(line_bytes), bytes(rebuilt_lines)),
+        (
+            primary["relocation_offset"],
+            primary["relocation_offset"] + len(relocation_bytes),
+            bytes(rebuilt_relocations),
+        ),
+        (
+            debug_child["raw_offset"],
+            debug_child["raw_offset"] + debug_child["raw_size"],
+            bytes(rebuilt_debug),
+        ),
+    ]
+    if ".debug$F" in closure:
+        fpo_child = _comdat_child(donor, primary, ".debug$F")
+        fpo_raw = bytes(coff_body(donor, fpo_child))
+        parse_fpo_data(
+            fpo_raw, expected_proc_size=primary["raw_size"], body=coff_body(donor, primary)
+        )
+        require(
+            int.from_bytes(fpo_raw[4:8], "little") == proc_size,
+            f"{context}: the FPO procedure size is not the donor's procedure",
+        )
+        rebuilt_fpo = bytearray(fpo_raw)
+        rebuilt_fpo[4:8] = image_proc.to_bytes(4, "little")
+        parse_fpo_data(bytes(rebuilt_fpo), expected_proc_size=body_length, body=image)
+        replacements.append(
+            (
+                fpo_child["raw_offset"],
+                fpo_child["raw_offset"] + fpo_child["raw_size"],
+                bytes(rebuilt_fpo),
+            )
+        )
+    replacements.sort()
+    output = bytearray(_apply_replacements(donor_bytes, replacements))
+
+    def shifted(pointer: int) -> int:
+        return shifted_pointer(pointer, replacements)
+
+    new_symbol_offset = shifted(donor.symbol_offset)
+    output[8:12] = new_symbol_offset.to_bytes(4, "little")
+    for section in donor.sections:
+        header = 20 + (section["number"] - 1) * 40
+        if section["number"] == primary["number"]:
+            output[header + 16 : header + 20] = body_length.to_bytes(4, "little")
+        for field, relative in (("raw_offset", 20), ("relocation_offset", 24), ("line_offset", 28)):
+            pointer = shifted(section[field])
+            if pointer != section[field]:
+                output[header + relative : header + relative + 4] = pointer.to_bytes(4, "little")
+    for symbol_index, item in donor.symbols.items():
+        if item["type"] == 32 and item["aux_count"] >= 1:
+            auxiliary = coff_auxiliary(donor, symbol_index, item)
+            line_pointer = int.from_bytes(auxiliary[8:12], "little")
+            mapped_pointer = shifted(line_pointer) if line_pointer else line_pointer
+            if mapped_pointer != line_pointer:
+                at = new_symbol_offset + (symbol_index + 1) * 18
+                output[at + 8 : at + 12] = mapped_pointer.to_bytes(4, "little")
+    function_index, function_record = function_symbol(donor, mangled, primary["number"])
+    function_aux = coff_auxiliary(donor, function_index, function_record)
+    require(
+        int.from_bytes(function_aux[4:8], "little") == proc_size,
+        f"{context}: the donor Function Definition TotalSize is not its procedure size",
+    )
+    at = new_symbol_offset + (function_index + 1) * 18
+    output[at + 4 : at + 8] = image_proc.to_bytes(4, "little")
+    section_index, section_record = _coff_section_symbol(donor, primary)
+    require(
+        int.from_bytes(coff_auxiliary(donor, section_index, section_record)[0:4], "little")
+        == primary["raw_size"],
+        f"{context}: the donor COMDAT auxiliary Length is stale",
+    )
+    aux_at = new_symbol_offset + (section_index + 1) * 18
+    output[aux_at : aux_at + 4] = body_length.to_bytes(4, "little")
+    end_index, end_symbol = _coff_marker(donor, ".ef", primary["number"])
+    require(end_symbol["value"] == proc_size, f"{context}: the donor .ef marker is stale")
+    output[new_symbol_offset + end_index * 18 + 8 : new_symbol_offset + end_index * 18 + 12] = (
+        image_proc.to_bytes(4, "little")
+    )
+    carried_symbols = []
+    for symbol_index, item in donor.symbols.items():
+        if item["section"] != primary["number"]:
+            continue
+        if symbol_index in (function_index, section_index, end_index):
+            continue
+        if item["name"] in (".bf", ".lf"):
+            continue
+        require(
+            item["value"] in offset_map,
+            f"{context}: the symbol {item['name']} at {item['value']} is not a boundary outside "
+            "every region",
+        )
+        target = offset_map[item["value"]]
+        if target != item["value"]:
+            at = new_symbol_offset + symbol_index * 18
+            output[at + 8 : at + 12] = target.to_bytes(4, "little")
+            carried_symbols.append([item["name"], item["value"], target])
+    derived = bytes(output)
+    checked = CoffObject(derived)
+    checked_primary = checked.function_section(mangled)
+    require(
+        coff_body(checked, checked_primary) == bytes(image),
+        f"{context}: the derived donor body is not the image",
+    )
+    require(
+        checked_primary["raw_size"] == body_length
+        and checked_primary["line_count"] == primary["line_count"]
+        and checked_primary["relocation_count"] == primary["relocation_count"]
+        and checked_primary["number"] == primary["number"]
+        and checked_primary["characteristics"] == primary["characteristics"],
+        f"{context}: the derived donor target header is inconsistent",
+    )
+    require(
+        function_multiset(checked) == function_multiset(donor)
+        and comdat_primary_identity_multiset(checked) == comdat_primary_identity_multiset(donor)
+        and len(checked.sections) == len(donor.sections),
+        f"{context}: the derived donor changed the object's topology",
+    )
+    require(
+        _comdat_child_closure(checked, checked_primary) == _comdat_child_closure(donor, primary),
+        f"{context}: the derived donor changed the target closure",
+    )
+    donor_rows = detailed_relocations(donor, primary)
+    checked_rows = detailed_relocations(checked, checked_primary)
+    require(
+        [row["target"] for row in checked_rows] == [row["target"] for row in donor_rows]
+        and [row["type"] for row in checked_rows] == [row["type"] for row in donor_rows]
+        and [row["offset"] for row in checked_rows]
+        == [moved.get(row["offset"], row["offset"]) for row in donor_rows],
+        f"{context}: the derived donor relocation table is not the proved reseat",
+    )
+    return derived, {
+        "carried_code_symbols": carried_symbols,
+        "collapsed_line_rows": collapsed,
+        "procedure_range": [image_proc, offset_map[debug_start], offset_map[debug_end]],
+    }
+
+
+REGION_RESIZE_CLOSURES = ((".debug$F", ".debug$S"), (".debug$S", ".xdata$x"))
+REGION_RESIZE_RECIPE = CandidateRecipe(
+    label="region-resize",
+    splice_class=REGION_RESIZE_CLASS,
+    spec_key="region_resize",
+    admissible_closures=REGION_RESIZE_CLOSURES,
+    declaration_label="region-resize rewriting",
+    kind=(REGION_RESIZE_KIND, "region-resize kind differs"),
+    donor_seat="optional",
+    declared_seat_message="region-resize declared donor seat changed",
+    donor_section_count="optional",
+    census="extras",
+    length_pins=("expected_seed_length", "expected_preimage_length"),
+    closure_message="region-resize target closure is neither the FPO debug pair nor the EH pair",
+)
+
+
+def protected_code_offsets(
+    donor: CoffObject, primary: dict[str, Any], context: str
+) -> frozenset[int]:
+    """Offsets of the target that a symbol, closure-child reference or debug range names."""
+    offsets = set()
+    values = {}
+    for item in donor.symbols.values():
+        if item["section"] == primary["number"] and item["name"] not in (".bf", ".lf", ".ef"):
+            offsets.add(item["value"])
+            values[item["name"]] = item["value"]
+    for child_name in _comdat_child_closure(donor, primary)[1]:
+        child = _comdat_child(donor, primary, child_name)
+        for row in detailed_relocations(donor, child):
+            if row["target"] in values:
+                offsets.add(values[row["target"]] + max(row["addend"], 0))
+    debug_raw = bytes(coff_body(donor, _comdat_child(donor, primary, ".debug$S")))
+    _length, start, end = coff_unpack("<III", debug_raw, 16, f"{context} debug range")
+    offsets |= {start, end}
+    return frozenset(offsets)
+
+
+def produce_region_resize_rewriting_candidate(
+    seed_bytes: bytes, donor_bytes: bytes, function: dict[str, Any]
+) -> tuple[bytes, dict[str, Any]]:
+    """Produce the resized REWRITE(donor body) of a fresh compiler artifact (check 9)."""
+    seats = open_candidate_seats(seed_bytes, donor_bytes, function, REGION_RESIZE_RECIPE)
+    donor, mangled = seats.donor, seats.mangled
+    dp, spec = seats.donor_section, seats.spec
+    _, donor_body = pin_candidate_bodies(seats, function, REGION_RESIZE_RECIPE)
+    donor_body = bytes(donor_body)
+    require(
+        set(spec)
+        <= {
+            "kind",
+            "regions",
+            "expected_code_length",
+            "expected_proc_size",
+            "expected_fill_alignment",
+            "expected_external_entries",
+            "expected_internal_relocation_targets",
+            "expected_growth",
+            "expected_region_proofs",
+            "expected_branch_repairs",
+            "expected_relocation_reseat",
+            "expected_addend_repairs",
+            "expected_instruction_count",
+            "expected_procedure_range",
+            "expected_carried_code_symbols",
+            "expected_collapsed_line_rows",
+        },
+        "region-resize declaration names an unknown field",
+    )
+    donor_rows = detailed_relocations(donor, dp)
+    internal_targets = internal_relocation_targets(donor_rows, dp["number"])
+    require_declared_internal_targets(spec, internal_targets, "region-resize")
+    external_entries = relational_form_external_entries(donor, dp, "region-resize external entries")
+    require(
+        sorted(external_entries) == spec["expected_external_entries"],
+        "region-resize external entry set differs from its declaration",
+    )
+    proc_size = spec["expected_proc_size"]
+    fill_alignment = spec["expected_fill_alignment"]
+    require(
+        fill_alignment in (1, 16)
+        and type(proc_size) is int
+        and 0 < proc_size <= len(donor_body)
+        and _padded_length(proc_size, fill_alignment) == len(donor_body),
+        "region-resize procedure size or fill alignment differs from the donor",
+    )
+    prologue = 0
+    if ".debug$F" in seats.expected_closure:
+        fpo = parse_fpo_data(
+            bytes(coff_body(donor, _comdat_child(donor, dp, ".debug$F"))),
+            expected_proc_size=dp["raw_size"],
+            body=donor_body,
+        )
+        require(fpo["cbProcSize"] == proc_size, "region-resize FPO procedure size differs")
+        prologue = fpo["cbProlog"]
+    image, proof = apply_region_resize(
+        donor_body,
+        spec["regions"],
+        donor_rows,
+        dp["number"],
+        "region-resize image",
+        code_length=spec.get("expected_code_length"),
+        proc_size=proc_size,
+        external_entries=frozenset(external_entries),
+        protected_offsets=protected_code_offsets(donor, dp, "region-resize"),
+        prologue_length=prologue,
+    )
+    padded = _padded_length(proof["image_proc_size"], fill_alignment)
+    image = image + bytes([MSVC50_FUNCTION_FILL_BYTE]) * (padded - len(image))
+    require(
+        proof["growth"] == spec["expected_growth"]
+        and proof["regions"] == spec["expected_region_proofs"]
+        and proof["branch_repairs"] == spec["expected_branch_repairs"]
+        and proof["relocation_reseat"] == spec["expected_relocation_reseat"]
+        and proof["addend_repairs"] == spec["expected_addend_repairs"]
+        and proof["instruction_count"] == spec["expected_instruction_count"],
+        "region-resize image differs from its declaration",
+    )
+    require(
+        sha256_bytes(image) == function["expected_body_sha256"],
+        "region-resize image differs from its pin",
+    )
+    require(
+        len(image) == function["expected_body_length"] == function["expected_donor_length"],
+        "region-resize image length differs from its pin",
+    )
+    require(image != donor_body, "region-resize image does not move the donor body")
+    require_pinned_length(function, image, "region-resize")
+    moved = dict((old, new) for old, new in proof["relocation_reseat"])
+    installed_rows = [
+        {**row, "offset": moved.get(row["offset"], row["offset"])} for row in donor_rows
+    ]
+    for at, _old, new in proof["addend_repairs"]:
+        for row in installed_rows:
+            if row["offset"] == at:
+                row["addend"] = new
+    semantic_detail = candidate_relocation_semantics(installed_rows, function, "region-resize")
+    derived, derived_detail = resized_donor_object(
+        donor_bytes, mangled, image, proof, "region-resize derived donor"
+    )
+    require(
+        derived_detail["procedure_range"] == spec["expected_procedure_range"]
+        and derived_detail["carried_code_symbols"] == spec["expected_carried_code_symbols"]
+        and derived_detail["collapsed_line_rows"] == spec["expected_collapsed_line_rows"],
+        "region-resize derived donor differs from its declaration",
+    )
+    effective = same_slot_effective(function, mangled)
+    if "expected_donor_section_number" in function:
+        effective["expected_donor_section_number"] = function["expected_donor_section_number"]
+    composed, detail, checked, cp = install_same_slot(
+        seed_bytes,
+        derived,
+        effective,
+        mangled,
+        image,
+        "region-resize",
+        declared_donor_extras=function.get("expected_donor_extra_functions") or None,
+    )
+    require(
+        [(row["offset"], row["target"], row["type"]) for row in detailed_relocations(checked, cp)]
+        == [(row["offset"], row["target"], row["type"]) for row in installed_rows],
+        "region-resize composed relocation table is not the proved reseat",
+    )
+    return composed, candidate_proof(
+        detail,
+        REGION_RESIZE_CLASS,
+        {
+            "region_resize": proof["regions"],
+            "growth": proof["growth"],
+            "branch_repairs": proof["branch_repairs"],
+            "relocation_reseat": proof["relocation_reseat"],
+            "addend_repairs": proof["addend_repairs"],
+            "instruction_count": proof["instruction_count"],
+            "carried_code_symbols": derived_detail["carried_code_symbols"],
+            "collapsed_line_rows": derived_detail["collapsed_line_rows"],
+            "procedure_range": derived_detail["procedure_range"],
+        },
+        semantic_detail,
+    )
+
+
+__all__ = [
+    "REGION_RESIZE_CLASS",
+    "REGION_RESIZE_KIND",
+    "apply_region_resize",
+    "produce_region_resize_rewriting_candidate",
+    "protected_code_offsets",
+    "resized_donor_object",
+]
