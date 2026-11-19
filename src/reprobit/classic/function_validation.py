@@ -236,7 +236,8 @@ Checks (each is a refusal):
       instruction leaves undefined (every non-compare that does not define
       it, per Intel) is the term ``("x87cc", bit, name)``, ``name`` a digest
       of the instruction's form (opcode and ModR/M register or digit), its
-      memory operand's address, the whole x87 state before it (the entry
+      memory operand's address (in the first pass only), the whole x87 state
+      before it (the entry
       depth, TOP, every written register, C0-C3, the exception set and the
       control word) and the stack after it (`region_simulation._X87.
       undefine`).  By a8 the two versions' bits are equal when these terms
@@ -291,7 +292,7 @@ Checks (each is a refusal):
    instruction count, the derived procedure range and collapsed line rows
    are pinned by the declaration and re-measured, and the derived donor
    object is re-parsed and checked before the same-slot delegate installs
-   it.
+   it.  A proof the equivalences pass made (below) pins ``equivalences``.
 9. Install.  The image is P followed by MSVC 5.0's alignment fill; the
    donor object is re-seated around it (`rewriting_region_resize.
    resized_donor_object`: relocation offsets through the pairing, every
@@ -328,7 +329,11 @@ its memory operand's address and the x87 state it runs from and leaves
 (the registers, TOP and tags, C0-C3, the exception flags and the control
 word) -- not of the code address it runs at, the last-instruction
 pointers, or any integer state; the same instruction from the same state
-leaves the same bit.  (Real
+leaves the same bit.  The equivalences pass (below) takes the address out
+of that list too: it is integer state, and the value it gives the
+last-data pointer, both of which a8 already excludes, and the value the
+operand carries is part of the x87 state (a load's value is the stack it
+leaves, a store's the register it stores).  (Real
 processors keep C0, C2 and C3 across ``fld``, ``fst``, ``fxch`` and the
 arithmetic, which MSVC 5.0's scheduling relies on, but no such value is
 assumed: the bit is related only to the same instruction's from the same
@@ -336,9 +341,83 @@ state.)  (a9) A string instruction with the direction flag clear never
 wraps around the address space: the top 64 KiB is never accessible (Win32
 reserves it and the system half below it), so an operation running upward
 from an address faults before it could wrap, and every address it touches
-lies at or above where it started.  No other assumption is made: the
-relation is inferred, nothing about the replacement is believed, and the
-simulator's term model is exact.
+lies at or above where it started.  (a10) Code addresses and objects, for
+the equivalences pass only (below): both versions run from one entry
+address -- the image is installed in the donor's own slot (check 9) -- so a
+code address of either is that address plus its offset; and the function's
+own frame and parameter words (ESP0 + c below E, the committed stack of a3)
+lie in the thread's stack, which no section of the image overlaps; an
+undefined external data symbol names one definition elsewhere (the linker
+resolves a name to one definition, and a common symbol to one merged
+block), which the donor -- compiled C -- accesses at a constant offset from
+the symbol only inside that object (a field or element its declared type
+fixes), so distinct definitions are distinct objects, disjoint from each
+other, from the stack and from every section this object defines; a symbol
+this object defines lies in its section at its value, and two sections of
+one object are placed apart.  Only identical read-only data may share an
+address (a linker folds no written object), and a store that reached it
+would fault.  The replacement's accesses are the donor's (5c compares the
+footprints path by path), so they too lie inside their objects.  A section
+without IMAGE_SCN_MEM_WRITE is mapped read-only, and neither the function
+nor any callee changes the protection of the image's pages (no admitted
+instruction can; a callee would have to call ``VirtualProtect`` on them), so
+a load inside it reads its initial bytes whatever store comes first: a
+store that reached them faults, and the state at a fault is not compared.
+No other assumption is made: the relation is inferred, nothing about the
+replacement is believed, and the simulator's term model is exact.
+
+The equivalences pass.  Every proof runs first exactly as the records made
+before this pass were proved, and its pins are theirs.  Only when that
+refuses does it run again (`measure_function_validation`), with these
+normal forms, each exact (`region_simulation._equivalences`):
+
+- A compiler helper's return address is the entry address plus the offset
+  after the call (a10), not a fresh atom of its version: ``mov eax, n; call
+  __chkstk`` at the entry of both leaves the same word in the frame it
+  allocates, where a shared frame's call events see it.  Calls that end at
+  different offsets leave different words.
+- The object model of a10 (`region_simulation.ObjectModel`): an access at
+  ESP0 + c below E and one through a relocated data symbol, or through two
+  symbols of different objects, are disjoint; two labels of one section are
+  related by their offsets in it when both accesses lie inside its size,
+  and refused (unknown) when those may overlap; a load from a read-only
+  section depends on no store.  An address that is not one of these -- a
+  pointer, an index, the stack above E -- keeps the old relation: unknown
+  unless its difference is a constant.
+- A product of two non-constant terms is normalised modulo 2**32
+  (`region_simulation.product`): constant factors commute out and nested
+  products flatten, so ``16 * (S * V)`` meets ``8 * (S * (2 * V))``.  No
+  distribution, and the flags stay named by the instruction's own operands.
+- A store drops every earlier logged store whose bytes it overwrites:
+  memory after it does not depend on them.  So the ECX of a ``push ecx``
+  that allocates an argument slot, then filled by ``mov [esp], x`` or
+  ``fstp [esp]`` before the call, is dead in both versions.  A word the
+  callee can read (no overwrite, or only part of it) is still compared.
+- An undefined x87 condition bit (check 5f, a8) is named without the memory
+  operand's address: that address is integer state and the new last-data
+  pointer, which a8 excludes, and the operand's value is already named.  So
+  ``fcom m; fxch; fmul; fxch; fstp [esp+0x14]; fnstsw`` meets the same with
+  ``fstp [esp+0x10]``.
+
+Still refused, with the reason.  x87 operands are commuted only between
+registers (since `region_simulation`'s commutativity probe): a memory
+operand is not the register a load of it gives, because ``fld m32`` quiets
+an SNaN and raises DE for a denormal before the operation, while ``fadd
+m32`` meets the raw operand -- with two NaNs the result's payload differs,
+and with a NaN and a denormal the DE flag does
+(`tests/fixtures/x87_probe/memory_operands.out`: 64 of 200 operand pairs
+differ under commuted memory operands, 32 between a memory operand and its
+loaded register, none under commuted registers; every one has a NaN).  So
+``fld A; fadd B`` never meets ``fld B; fadd A``, and nothing is
+reassociated.  In a shared frame (a stack address escapes) every frame byte
+is still memory, compared exactly, even a slot whose address is never
+taken: a callee holding an interior pointer may reach any byte of the
+object it points into, and the objects carry no object extents (the types
+live in a PDB type server), so a slot cannot be shown outside every escaped
+object.  ESP is part of every call event, so two frames of different sizes
+make different calls.  And EAX is compared at every return: no type in the
+object says a function is void (its S_GPROC32 names a type in the PDB type
+server), and a caller's use of EAX would be a whole-program fact.
 """
 
 from __future__ import annotations
@@ -346,7 +425,7 @@ from __future__ import annotations
 import hashlib
 from collections import Counter
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from typing import Any, cast
 
@@ -373,8 +452,10 @@ from .region_simulation import (
     FLAG_NAMES,
     X87_CONDITION_BITS,
     HelperCode,
+    ObjectModel,
     PathState,
     RelocationTarget,
+    SymbolObject,
     Term,
     X87State,
     _fcc_allowed,
@@ -517,11 +598,68 @@ def closed_term(term: Term) -> bool:
 
 @dataclass(frozen=True)
 class FrameFacts:
-    """The frame kind and, for a private frame, its base B and parameter end E (check 7)."""
+    """The frame kind and, for a private frame, its base B and parameter end E (check 7).
+
+    ``objects`` is the object model of a10 (`region_simulation.ObjectModel`),
+    or None to relate addresses by their constant differences alone.
+    """
 
     private: bool
     base: int = 0
     params_end: int = 4
+    objects: ObjectModel | None = None
+    # The equivalences pass (`region_simulation._equivalences`, a10).
+    equivalences: bool = False
+
+
+_IMAGE_SCN_LNK_COMDAT = 0x1000
+_IMAGE_SCN_MEM_WRITE = 0x80000000
+_STORAGE_EXTERNAL = 2
+_STORAGE_STATIC = 3
+
+
+def object_model(
+    coff: CoffObject, rows: Iterable[Mapping[str, Any]], stack_end: int
+) -> ObjectModel:
+    """The objects a10 relates the donor's relocated data symbols to.
+
+    Each symbol a relocation names is placed: an undefined external (or a
+    common symbol, whose value is its size) in the definition the linker
+    resolves its name to, ``("extern", name)``; a symbol this object defines
+    in its section, ``("section", number)``, at its value, bounded by the
+    section's size -- except an external defined in a COMDAT section, which
+    the linker may resolve to another object's copy, so it too is its own
+    ``("extern", name)``.  A non-COMDAT section without
+    IMAGE_SCN_MEM_WRITE (``.rdata``: the float literals) is read-only.  A
+    function symbol, a static label inside a COMDAT section, a weak external
+    and every other storage class is left out, so an address through it has
+    no object.  ``stack_end`` is E: the own frame
+    and parameter words, which a3 already takes as the committed stack.
+    """
+    symbols: dict[str, SymbolObject] = {}
+    read_only: set[Term] = set()
+    for row in rows:
+        name = row["target"]
+        storage, number, value = row["target_storage"], row["target_section"], row["target_value"]
+        if (row["target_type"] >> 4) & 3 == 2:
+            continue  # a function: code, never a data object
+        placed: SymbolObject | None = None
+        if storage == _STORAGE_EXTERNAL and number == 0:
+            placed = SymbolObject(("extern", name), 0, value or None)
+        elif storage in (_STORAGE_EXTERNAL, _STORAGE_STATIC) and 0 < number <= len(coff.sections):
+            section = coff.sections[number - 1]
+            if section["characteristics"] & _IMAGE_SCN_LNK_COMDAT:
+                if storage == _STORAGE_EXTERNAL:
+                    placed = SymbolObject(
+                        ("extern", name), 0, max(int(section["raw_size"]) - value, 0) or None
+                    )
+            else:
+                placed = SymbolObject(("section", number), value, int(section["raw_size"]))
+                if not section["characteristics"] & _IMAGE_SCN_MEM_WRITE:
+                    read_only.add(placed.base)
+        if placed is not None:
+            symbols[name] = placed
+    return ObjectModel(symbols, stack_end, frozenset(read_only))
 
 
 class FrameModel:
@@ -545,6 +683,10 @@ class FrameModel:
         cc_sites: dict[Term, str] | None = None,
     ) -> None:
         self.facts = facts
+        # The object model of a10 (`region_simulation.ObjectModel`) and
+        # whether the proof runs its equivalences pass.
+        self.objects = facts.objects
+        self.equivalences = facts.equivalences
         self.slots = dict(slots or {})
         self.dirty = set(dirty)
         self.context = context
@@ -1573,7 +1715,7 @@ def _compare_paths(left: PathEnd, right: PathEnd, frame: FrameFacts, context: st
         stores_right = tuple(s for s in right.state.stores if not _dead_stack_store(s, frame))
     else:
         stores_left, stores_right = tuple(left.state.stores), tuple(right.state.stores)
-    why = stores_equivalent(stores_left, stores_right)
+    why = stores_equivalent(stores_left, stores_right, frame.objects)
     require(why is None, f"{where}: the two versions leave different memory: {why}")
     require(
         _footprint(left.state, frame) == _footprint(right.state, frame),
@@ -1798,16 +1940,26 @@ def prove_function(
     *,
     private_frame: FrameFacts | None = None,
     helpers: Mapping[str, HelperCode] | None = None,
+    objects: ObjectModel | None = None,
 ) -> ValidationProof:
     """Checks 2 and 4-7: a private frame when one is given and no stack address escapes.
 
     A refusal of the private frame because a stack address escapes falls back
     to the shared frame; any other refusal stands.  ``helpers`` maps every
-    compiler helper either version calls to its verified body.
+    compiler helper either version calls to its verified body.  ``objects``,
+    the object model of a10 (its stack end is replaced by the frame's E),
+    runs the proof's equivalences pass (`region_simulation._equivalences`);
+    None runs the first pass.
     """
     donor = Program(donor_code, donor_relocations, "D", f"{context} donor", helpers)
     image = Program(image_code, image_relocations, "P", f"{context} replacement", helpers)
-    shared = FrameFacts(False, params_end=4 if private_frame is None else private_frame.params_end)
+    params_end = 4 if private_frame is None else private_frame.params_end
+    equivalences = objects is not None
+    if objects is not None:
+        objects = replace(objects, stack_end=params_end)
+        if private_frame is not None:
+            private_frame = replace(private_frame, objects=objects, equivalences=True)
+    shared = FrameFacts(False, params_end=params_end, objects=objects, equivalences=equivalences)
     if private_frame is not None and locals_block_first(donor, private_frame.base):
         try:
             return validate_function(
@@ -2082,27 +2234,40 @@ def measure_function_validation(
         require(fpo["cbProcSize"] == proc, f"{label} FPO procedure size differs")
         if fpo["cbFrame"] == 0 and not fpo["fHasSEH"]:
             private_frame = FrameFacts(True, -4 * fpo["cdwLocals"], 4 + 4 * fpo["cdwParams"])
+    objects = object_model(donor, rows, 4 if private_frame is None else private_frame.params_end)
     view = relocation_symbol_map(rows)
     items, successors, entries = ia32_relational_flow_walk(
         donor_body[:proc], view, f"{label} donor flow", None, frozenset()
     )
-    proof_summary_pin = _x87_case_proofs(
-        items,
-        successors,
-        entries,
-        donor_body[:proc],
-        view,
-        lambda counts, note: prove_function(
+
+    def summary(model: ObjectModel | None, tag: str) -> dict[str, Any]:
+        return _x87_case_proofs(
+            items,
+            successors,
+            entries,
             donor_body[:proc],
-            donor_targets,
-            code,
-            image_targets,
-            counts,
-            f"{label} proof{note}",
-            private_frame=private_frame,
-            helpers=helpers,
-        ),
-    )
+            view,
+            lambda counts, note: prove_function(
+                donor_body[:proc],
+                donor_targets,
+                code,
+                image_targets,
+                counts,
+                f"{label} proof{tag}{note}",
+                private_frame=private_frame,
+                helpers=helpers,
+                objects=model,
+            ),
+        )
+
+    # The first pass is the proof every record made before the equivalences
+    # pass pins; only when it refuses does the second run, under a10 and the
+    # normal forms of `region_simulation._equivalences`, and its summary
+    # then says so.  Each pass is sound alone.
+    try:
+        proof_summary_pin = summary(None, "")
+    except ByteIdentityError:
+        proof_summary_pin = {**summary(objects, " (equivalences pass)"), "equivalences": True}
     image = code + bytes([MSVC50_FUNCTION_FILL_BYTE]) * (
         _padded_length(len(code), fill_alignment) - len(code)
     )

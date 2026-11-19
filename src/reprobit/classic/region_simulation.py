@@ -163,6 +163,23 @@ so ``sbb r, r`` is ``-CF``); byte-wide ``not``, ``neg``, ``mul``, ``imul``,
 ``div`` and ``idiv`` (:func:`_byte_wide`); ``movzx``/``movsx`` into a 16-bit
 register; and, after ``call [__imp_X]``, the x87 return count the caller
 gives for the slot's symbol.
+
+A whole-function proof's second pass (:func:`_equivalences`, a10 of
+:mod:`reprobit.classic.function_validation`) also normalises: a helper's
+return address is the entry address ``CODE_ENTRY`` plus the offset after
+the call (:func:`run_helper`); a product of two non-constant terms has
+its constant factors and nested factors folded (:func:`product`); a store
+drops the logged stores whose bytes it overwrites (:func:`_store`); an
+undefined x87 bit is named without the memory operand's address
+(:meth:`_X87.undefine`); and addresses in distinct objects -- the own
+frame, an undefined external, a section of the object -- are disjoint,
+with a read-only section's data read past every store
+(:class:`ObjectModel`).  A memory operand of an x87 operation is still
+never the register a load of it gives (``("fmem", w, m)`` is not
+``("fld", w, m)``): ``fld`` quiets an SNaN and raises DE for a denormal
+before the operation, so the two differ in the result's NaN payload and in
+DE when the other operand is a NaN (``tests/fixtures/x87_probe/
+memory_operands.out``), and two memory operands never commute.
 """
 
 from __future__ import annotations
@@ -330,10 +347,120 @@ def _opaque(name: str, width: int, *operands: Term) -> Term:
     return lin_atom((name, width, operands)) if width == 32 else ("b", width, (name, operands))
 
 
-def address_relation(left: Term, left_width: int, right: Term, right_width: int) -> str:
-    """``same``, ``disjoint`` or ``unknown`` for two byte ranges at symbolic addresses."""
+_ENTRY_ESP: Term = ("reg0", "esp")
+
+
+@dataclass(frozen=True)
+class SymbolObject:
+    """Where a relocated symbol's address lies (:class:`ObjectModel`).
+
+    ``base`` names the object or section the symbol's address is in --
+    ``("extern", name)`` for a symbol another object defines,
+    ``("section", number)`` for one this object defines -- ``value`` is the
+    symbol's offset in it, and ``size`` the extent an access must lie in
+    (the section's size, a common symbol's size), or None when no size is
+    known (an undefined external).
+    """
+
+    base: Term
+    value: int
+    size: int | None
+
+
+@dataclass(frozen=True)
+class ObjectModel:
+    """Which symbolic addresses lie in distinct objects (a whole-function proof only).
+
+    A whole-function proof (:mod:`reprobit.classic.function_validation`,
+    a10) relates an address that is the entry ESP plus a constant c with
+    c + width <= ``stack_end`` (the function's own frame and parameter words:
+    the committed stack of a3), or a relocated data symbol of ``symbols``
+    plus a constant, to its *object*: the thread's stack, the definition an
+    undefined external names, or the section of this object a defined
+    symbol lies in.  Two accesses in different objects are disjoint; two in
+    one section are related by their offsets in it, when both lie wholly
+    inside its size.  Every other address -- a pointer, an index, the stack
+    above the parameter words -- has no object, and its relation to another
+    address stays unknown.  Region proofs never construct one, so
+    :func:`address_relation` without it is unchanged.
+    """
+
+    symbols: Mapping[str, SymbolObject]
+    stack_end: int
+    # The sections of this object mapped read-only (no IMAGE_SCN_MEM_WRITE).
+    read_only: frozenset[Term] = frozenset()
+
+    def constant(self, address: Term, width: int) -> bool:
+        """Whether an access lies wholly inside a read-only section of this object.
+
+        A load there reads the section's initial bytes whatever store comes
+        before it: a store that reached them would fault (the loader maps
+        such a section read-only, and under a10 neither the function nor a
+        callee changes the protection of the image's pages), and the state
+        at a fault is not compared.
+        """
+        found = self.locate(address, width)
+        return found is not None and found[0] in self.read_only
+
+    def locate(self, address: Term, width: int) -> tuple[Term, int] | None:
+        """(object, offset in it) for an access, or None when it has no known object."""
+        if address[0] != "lin" or len(address[2]) != 1 or address[2][0][1] != 1:
+            return None
+        atom = address[2][0][0]
+        offset = _signed(address[1], 32)
+        if atom == _ENTRY_ESP:
+            if offset + width > self.stack_end:
+                return None
+            return ("stack",), offset
+        if not (isinstance(atom, tuple) and len(atom) == 2 and atom[0] == "sym"):
+            return None
+        found = self.symbols.get(atom[1])
+        if found is None:
+            return None
+        start = found.value + offset
+        if found.size is not None and not (start >= 0 and start + width <= found.size):
+            return None
+        return found.base, start
+
+    def relation(self, left: Term, left_width: int, right: Term, right_width: int) -> str | None:
+        """The relation of two accesses by their objects, or None when either has none."""
+        first, second = self.locate(left, left_width), self.locate(right, right_width)
+        if first is None or second is None:
+            return None
+        if first[0] != second[0]:
+            return "disjoint"
+        if first[0][0] == "extern":
+            # One undefined external: its symbol's offsets are already the
+            # addresses' constant difference (handled by the caller).
+            return None
+        distance = second[1] - first[1]
+        if distance == 0 and left_width == right_width:
+            return "same"
+        if distance >= left_width or -distance >= right_width:
+            return "disjoint"
+        return "unknown"
+
+
+def address_relation(
+    left: Term,
+    left_width: int,
+    right: Term,
+    right_width: int,
+    objects: ObjectModel | None = None,
+) -> str:
+    """``same``, ``disjoint`` or ``unknown`` for two byte ranges at symbolic addresses.
+
+    ``objects`` (a whole-function proof's :class:`ObjectModel`) also relates
+    two addresses whose difference is not a constant when each lies in a
+    known object: different objects are disjoint (a10 of
+    :mod:`reprobit.classic.function_validation`).
+    """
     distance = const_of(lin_sub(right, left))
     if distance is None:
+        if objects is not None:
+            known = objects.relation(left, left_width, right, right_width)
+            if known is not None:
+                return known
         return "unknown"
     if distance == 0 and left_width == right_width:
         return "same"
@@ -785,6 +912,25 @@ def entry_state(entry_names: Mapping[str, str] | None = None) -> PathState:
     )
 
 
+def _objects(state: PathState) -> ObjectModel | None:
+    """A whole-function proof's object model (``FrameModel.objects``); None in a region proof."""
+    return None if state.frame is None else state.frame.objects
+
+
+def _equivalences(state: PathState) -> bool:
+    """Whether a whole-function proof runs with the equivalences of its second pass.
+
+    `function_validation.prove_function` runs every proof first exactly as
+    records made before them were proved, and only when that refuses with
+    these normal forms: a helper's return address as a code address
+    (:func:`run_helper`), products in their normal form (:func:`product`),
+    a covered store dropped from the log (:func:`_store`), undefined x87
+    condition bits named without the memory operand's address
+    (:meth:`_X87.undefine`), and the object model (:class:`ObjectModel`).
+    """
+    return state.frame is not None and bool(state.frame.equivalences)
+
+
 def _load(state: PathState, address: Term, width: int) -> Term:
     if state.frame is not None:
         # A whole-function proof's frame model may own the address (a
@@ -794,8 +940,12 @@ def _load(state: PathState, address: Term, width: int) -> Term:
             return routed
     state.footprint.add((address, width))
     deps: list[tuple[Term, int, Term]] = []
-    for entry in reversed(state.stores):
-        relation = address_relation(address, width, entry[0], entry[1])
+    objects = _objects(state)
+    stores = state.stores
+    if objects is not None and objects.constant(address, width):
+        stores = []  # read-only data: no store reaches it (ObjectModel.constant)
+    for entry in reversed(stores):
+        relation = address_relation(address, width, entry[0], entry[1], objects)
         if relation == "disjoint":
             continue
         if relation == "same" and not deps:
@@ -819,7 +969,23 @@ def _store(state: PathState, address: Term, width: int, value: Term) -> None:
     if state.frame is not None and state.frame.store(state, address, width, value):
         return
     state.footprint.add((address, width))
+    if _equivalences(state):
+        # A whole-function proof drops every earlier store whose bytes this
+        # one overwrites: memory after it does not depend on them (every byte
+        # they wrote is rewritten here, whatever lies between), so the log
+        # without them denotes the same memory, and a later load depends on
+        # exactly the stores still in it.  A load made before this store has
+        # already named them.  So a word written and then wholly overwritten
+        # -- the ECX a ``push ecx`` leaves in an argument slot that ``mov
+        # [esp], ...`` or ``fstp [esp]`` then fills -- leaves no trace.
+        state.stores = [entry for entry in state.stores if not _covered(entry, address, width)]
     state.stores.append((address, width, value))
+
+
+def _covered(entry: tuple[Term, int, Term], address: Term, width: int) -> bool:
+    """Whether a logged store's bytes all lie in [address, address + width)."""
+    distance = const_of(lin_sub(entry[0], address))
+    return distance is not None and distance + entry[1] <= width
 
 
 # movsb, movsd, stosb, stosd, scasb (the string forms MSVC 5.0 emits inline).
@@ -1211,12 +1377,42 @@ def _carry_alu(
     return result
 
 
+def product(left: Term, right: Term) -> Term:
+    """The low 32 bits of a product of two non-constant terms, in a normal form.
+
+    Multiplication modulo 2**32 is associative and commutative, and a
+    constant factor commutes out of a product: (k t) u = k (t u) in the ring.
+    So every factor that is a constant multiple of one atom, ``k * t``,
+    gives its constant to the product's coefficient, a factor that is
+    itself such a product gives its factors, and the factors are sorted:
+    ``16 * (S * V)`` and ``8 * (S * (2 * V))`` are one term.  A factor that
+    is a sum (or has a constant term) stays whole -- no distribution -- and
+    the flags of the instruction are not affected (they are named by its
+    own operands).  Whole-function proofs only (:func:`_multiply`).
+    """
+    scale = 1
+    factors: list[Term] = []
+    for value in (left, right):
+        if value[0] == "lin" and value[1] == 0 and len(value[2]) == 1:
+            atom, coefficient = value[2][0]
+            scale = scale * coefficient & _MASK
+            if isinstance(atom, tuple) and atom[:3] == ("op", "mul", 32):
+                factors.extend(atom[3])
+            else:
+                factors.append(lin_atom(atom))
+        else:
+            factors.append(value)
+    return lin_scale(lin_atom(("op", "mul", 32, tuple(sorted(factors, key=repr)))), scale)
+
+
 def _multiply(state: PathState, left: Term, right: Term, undefined: _Undefined) -> Term:
     a, b = const_of(left), const_of(right)
     if a is not None:
         result = lin_scale(right, a)
     elif b is not None:
         result = lin_scale(left, b)
+    elif _equivalences(state):
+        result = product(left, right)
     else:
         result = lin_atom(("op", "mul", 32, tuple(sorted((left, right), key=repr))))
     for name in ("cf", "of"):
@@ -1326,7 +1522,9 @@ def register_free_callee(symbol: object) -> bool:
     return callee_stack_pop(symbol) is not None
 
 
-def store_normal_form(stores: Iterable[tuple[Term, int, Term]]) -> tuple[Any, ...]:
+def store_normal_form(
+    stores: Iterable[tuple[Term, int, Term]], objects: ObjectModel | None = None
+) -> tuple[Any, ...]:
     """The canonical order of a store log up to swapping provably disjoint stores.
 
     Two logs leave the same memory under :func:`stores_equivalent` exactly
@@ -1334,7 +1532,8 @@ def store_normal_form(stores: Iterable[tuple[Term, int, Term]]) -> tuple[Any, ..
     byte ranges are disjoint" (symmetric and irreflexive), and the
     lexicographically least linearisation of a trace is unique: repeatedly
     take the least store (by its representation) that is disjoint from every
-    store still before it.
+    store still before it.  ``objects`` is a whole-function proof's object
+    model (:func:`address_relation`).
     """
     items = list(stores)
     keys = [repr(item) for item in items]
@@ -1344,7 +1543,8 @@ def store_normal_form(stores: Iterable[tuple[Term, int, Term]]) -> tuple[Any, ..
         {
             i
             for i in range(j)
-            if address_relation(items[j][0], items[j][1], items[i][0], items[i][1]) != "disjoint"
+            if address_relation(items[j][0], items[j][1], items[i][0], items[i][1], objects)
+            != "disjoint"
         }
         for j in range(count)
     ]
@@ -1451,7 +1651,7 @@ def _call(
         "call",
         callee,
         state.regs["esp"],
-        store_normal_form(state.stores),
+        store_normal_form(state.stores, _objects(state)),
         state.epoch,
     )
     if fpu.used or fpu.base is not None:
@@ -1621,13 +1821,22 @@ class _X87:
         In a region proof each bit is a fresh ``("x87undef", ...)`` term, which
         no read may use.  In a whole-function proof each bit is
         ``("x87cc", bit, name)``, where ``name`` digests the instruction's form
-        (opcode and ModR/M register or digit), its memory operand's address,
-        the whole x87 state before it (entry depth, TOP, every written
-        register, C0-C3, the exception set and the control word) and the
-        stack after it: under a8 the processor leaves in an undefined bit a
-        fixed function of exactly those, so the term equals only the bit the
-        same instruction leaves from the same state -- never a compare's
-        bit, a constant, or the bit of another instruction.
+        (opcode and ModR/M register or digit, and whether its operand is in
+        memory), the whole x87 state before it (entry depth, TOP, every
+        written register, C0-C3, the exception set and the control word) and
+        the stack after it: under a8 the processor leaves in an undefined bit
+        a fixed function of exactly those, so the term equals only the bit
+        the same instruction leaves from the same state -- never a compare's
+        bit, a constant, or the bit of another instruction.  The first pass of
+        a proof also names the memory operand's address (exactly as records
+        made before the equivalences pass were proved); the equivalences pass
+        (:func:`_equivalences`) does not: the address is integer state, the
+        new value of the last-data pointer, which a8 excludes, and the value
+        the operand carries is already named (a load's value is the stack
+        after it, a store's is the register before it).  So ``fstp
+        [esp+0x14]`` in one version and ``fstp [esp+0x10]`` in the other, the
+        same store of the same register to another frame slot, leave the
+        same bit.
         """
         if self.before is None:
             for name in X87_CONDITION_BITS:
@@ -1637,8 +1846,10 @@ class _X87:
         item = cast(_Instruction, self.item)
         mod, digit, index = item.modrm()
         form = (item.opcode, digit, index) if mod == 3 else (item.opcode, digit, "m")
-        address = item.address(self.state.regs) if mod != 3 else None
         frame = self.state.frame
+        address = None
+        if mod != 3 and not frame.equivalences:
+            address = item.address(self.state.regs)
         name = frame.digest(
             "x87cc", (form, address, self.before, self.fpu.push, self.fpu.view().slots)
         )
@@ -2075,7 +2286,7 @@ def _string_step(state: PathState, item: _Instruction, undefined: _Undefined) ->
             _get(state, 0, 8),
             state.regs["edi"],
             state.regs["ecx"],
-            store_normal_form(state.stores),
+            store_normal_form(state.stores, _objects(state)),
             state.epoch,
         )
         start = state.regs["edi"]
@@ -2163,7 +2374,7 @@ def _block_string(state: PathState, item: _Instruction, width: int) -> None:
         edi,
         esi,
         value,
-        store_normal_form(state.stores),
+        store_normal_form(state.stores, _objects(state)),
         state.epoch,
     )
     state.events.append(term)
@@ -2181,6 +2392,10 @@ def _block_string(state: PathState, item: _Instruction, width: int) -> None:
 
 
 HELPER_MAX_STEPS = 8192
+# The address of the function's entry in a whole-function proof: an atom
+# both versions share (a10 of :mod:`reprobit.classic.function_validation`),
+# so a code address in either is this atom plus its offset.
+CODE_ENTRY: Term = ("code0",)
 
 
 @dataclass(frozen=True)
@@ -2198,12 +2413,27 @@ class HelperCode:
     sha256: str
 
 
-def run_helper(state: PathState, helper: HelperCode, undefined: _Undefined, context: str) -> None:
+def run_helper(
+    state: PathState,
+    helper: HelperCode,
+    undefined: _Undefined,
+    context: str,
+    return_offset: int | None = None,
+) -> None:
     """A direct call to a compiler helper, run inline from the helper's own bytes.
 
-    The call pushes a return address: a fresh atom of this version (the two
-    versions' return addresses are different code addresses, so the atom
-    never equals the other version's), stored where the ``call`` stores it.
+    The call pushes a return address, stored where the ``call`` stores it.
+    In a region proof it is a fresh atom of this version: the two versions'
+    return addresses are different code addresses, so the atom never equals
+    the other version's.  In a whole-function proof (``state.frame`` set) it
+    is the code address it is: the function's entry address ``CODE_ENTRY``
+    plus ``return_offset``, the offset of the instruction after the call.
+    Both versions run from one entry address (a10 of
+    :mod:`reprobit.classic.function_validation`: the image is installed in
+    the donor's own slot), so the two return addresses are equal exactly
+    when the calls end at the same offset -- as ``mov eax, n; call
+    __chkstk`` at the entry of both does, whose return address is left in
+    the frame it allocates.
     The helper's instructions then run on the caller's state, on its own
     stack below the caller's ESP, through the same memory, frame and x87
     model as the caller's, with the helper forms of :class:`_Instruction`
@@ -2222,9 +2452,15 @@ def run_helper(state: PathState, helper: HelperCode, undefined: _Undefined, cont
     """
     where = f"{context}: the helper {helper.symbol}"
     undefined.count += 1
-    returned = lin_atom(("retaddr", undefined.tag, undefined.count))
+    if _equivalences(state) and return_offset is not None:
+        returned = lin(return_offset, ((CODE_ENTRY, 1),))
+    else:
+        returned = lin_atom(("retaddr", undefined.tag, undefined.count))
     before = state.regs["esp"]
-    logged = len(state.stores)
+    # The log entries before the call (a whole-function proof's store may
+    # drop a covered one, so they are known by identity, not by position).
+    prior = list(state.stores)
+    prior_ids = {id(entry) for entry in prior}
     _push(state, returned)
     frame = state.frame
     if frame is not None:
@@ -2286,8 +2522,10 @@ def run_helper(state: PathState, helper: HelperCode, undefined: _Undefined, cont
     # part of the compared state, exactly as the return address and frame of
     # every callee a call event stands for are not.  A frame model's private
     # slots are not in the log and stay as they are.
-    state.stores[logged:] = [
-        entry for entry in state.stores[logged:] if not _below(entry, state.regs["esp"])
+    state.stores = [
+        entry
+        for entry in state.stores
+        if id(entry) in prior_ids or not _below(entry, state.regs["esp"])
     ]
 
 
@@ -2650,7 +2888,7 @@ def _step(
             addend == 0, f"{context}: a call into the middle of a symbol is outside the closed set"
         )
         if helpers is not None and symbol in helpers:
-            run_helper(state, helpers[symbol], undefined, context)
+            run_helper(state, helpers[symbol], undefined, context, item.offset + item.length)
             return ("fall", None)
         _call(state, ("direct", symbol), symbol, undefined, context, x87_returns)
         return ("fall", None)
@@ -2948,7 +3186,9 @@ def term_atoms(value: Term, found: set[Term] | None = None) -> set[Term]:
 
 
 def stores_equivalent(
-    left: tuple[tuple[Term, int, Term], ...], right: tuple[tuple[Term, int, Term], ...]
+    left: tuple[tuple[Term, int, Term], ...],
+    right: tuple[tuple[Term, int, Term], ...],
+    objects: ObjectModel | None = None,
 ) -> str | None:
     """None when the two store sequences leave the same memory, else why not.
 
@@ -2956,6 +3196,8 @@ def stores_equivalent(
     value equal) in which every pair whose relative order differs is
     provably disjoint: such a permutation is a product of adjacent
     transpositions of disjoint stores, each of which leaves memory unchanged.
+    ``objects`` is a whole-function proof's object model
+    (:func:`address_relation`).
     """
     if len(left) != len(right):
         return f"they make {len(left)} and {len(right)} stores"
@@ -2973,12 +3215,13 @@ def stores_equivalent(
         for later in range(earlier + 1, len(right)):
             if position[earlier] > position[later]:
                 a, b = right[earlier], right[later]
-                if address_relation(a[0], a[1], b[0], b[1]) != "disjoint":
+                if address_relation(a[0], a[1], b[0], b[1], objects) != "disjoint":
                     return "two stores that may overlap are made in a different order"
     return None
 
 
 __all__ = [
+    "CODE_ENTRY",
     "FCMP_BITS",
     "FCMP_OUTCOMES",
     "FLAG_NAMES",
@@ -2987,8 +3230,10 @@ __all__ = [
     "SHARED_CONTROL_WORD",
     "X87_CONDITION_BITS",
     "HelperCode",
+    "ObjectModel",
     "PathResult",
     "RelocationTarget",
+    "SymbolObject",
     "X87State",
     "X87View",
     "address_relation",
@@ -2999,6 +3244,7 @@ __all__ = [
     "entry_state",
     "fcc_atom",
     "mentions_x87_undefined",
+    "product",
     "region_boundaries",
     "register_free_callee",
     "run_helper",
