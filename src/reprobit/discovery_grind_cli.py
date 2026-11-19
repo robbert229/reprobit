@@ -23,6 +23,7 @@ from reprobit.cli_paths import (
 from reprobit.discovery_contracts import enumerate_declaration_states
 from reprobit.discovery_grind import (
     ColdTrialEvidence,
+    DonorCompileProduct,
     ProjectGrindCallbacks,
     describe_state,
     require_single_acceptance,
@@ -205,7 +206,7 @@ def _probe_donors(
     staged_root: Path,
     donor_ids: tuple[str, ...],
     progress: Callable[[int, int, str], None] | None,
-) -> dict[str, bytes]:
+) -> dict[str, DonorCompileProduct]:
     prepared, session = _prepare_probe(
         options,
         staged_root=staged_root,
@@ -216,7 +217,12 @@ def _probe_donors(
             donor_ids,
             progress=progress,
         )
-        return {item.donor_id: item.object_payload for item in outputs}
+        # Each object with the type-server PDB the same compile wrote beside it
+        # in its private arena (``/Fdo.pdb``), which a14 reads.
+        return {
+            item.donor_id: DonorCompileProduct(item.object_payload, item.pdb_payload)
+            for item in outputs
+        }
     finally:
         prepared.close()
         shutil.rmtree(session, ignore_errors=True)

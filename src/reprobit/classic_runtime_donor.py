@@ -877,6 +877,8 @@ class ClassicDonorComposition:
             self.producer.logical_for_host_path(donor_object),
             Digest.from_bytes(payload),
             len(payload),
+            Digest.from_bytes(invocation.pdb_payload),
+            len(invocation.pdb_payload),
         )
         with self._evidence_lock:
             self._donor_outputs.append(donor_output_receipt)
@@ -908,6 +910,12 @@ class ClassicDonorComposition:
                 },
                 "object_digest": Digest.from_bytes(payload).model_dump(mode="json"),
                 "object_size": len(payload),
+                # The PDB the same compile wrote beside the object, which a
+                # frame-objects proof reads as the donor's type server (a14).
+                "type_server_digest": Digest.from_bytes(invocation.pdb_payload).model_dump(
+                    mode="json"
+                ),
+                "type_server_size": len(invocation.pdb_payload),
                 "input_namespace": {
                     "step_id": namespace_step.step_id,
                     "evidence_digest": namespace_step.output_digest.model_dump(mode="json"),
