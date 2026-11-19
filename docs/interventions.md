@@ -118,6 +118,7 @@ Contract `classic.binary-transform.<family>.v1`; obligations
 | `retail_exact_composed_rewriting` | Applies a reordering, then regional register bijections, then reversed compares (see `classic.rewriting.produce_composed_rewriting_candidate`). |
 | `retail_exact_register_bijection` | Fixed-width register renaming of a fresh donor body, proved sound against its control flow (see `classic.register_candidates.produce_register_bijection_candidate`). |
 | `retail_exact_register_bijection_reencoding` | Length-changing register renaming with EBP admitted (see `classic.register_candidates.produce_register_bijection_reencoding_candidate`). |
+| `retail_exact_region_resize_rewriting` | Replaces single-entry, single-exit regions of a fresh donor body with declared instructions of any length, proved equal by a strict path simulator, then lays the function out at its new length and installs it through the same-slot resize delegate (see `classic.rewriting_region_resize.produce_region_resize_rewriting_candidate`). |
 | `retail_exact_web_recolour` | Recolours a def-use web of the seed's own body; the donor is a provenance witness only (see `classic.scheduling.produce_web_recolour_candidate`). |
 | `retail_exact_instruction_mosaic` | Draws same-offset complete instructions from several declaration-carrier compiles of the same translation unit (see `classic.composition.produce_instruction_mosaic_candidate`). |
 | `retail_exact_same_tu_instruction_hybrid_resize` | Composes two source-identical, declaration-carrier same-TU donors (see `classic.composition.produce_same_tu_instruction_hybrid_resize_candidate`). |
@@ -130,6 +131,24 @@ becomes the test of `B` against `A` when `r` and every flag but ZF are dead
 after the branch), commutative x87 operand forms, x87 addend and fp-sum
 reassociations, ESP-argument and frame-pointer operand exchanges, and
 simulation-proved region rewrites.
+
+`retail_exact_region_resize_rewriting` is the length-changing counterpart of
+the simulation-proved region rewrite. Its record carries each replacement as
+a list of instruction encodings (hex text, the bytes it installs) and an
+order-preserving pairing of the replacement's relocated fields with the
+region's; nothing about the replacement is trusted. The producer proves it
+against the donor compiled from source: no branch or external entry enters a
+region's interior, its control flow is a forward DAG with one exit, the two
+versions agree on every path pair on the stack pointer, on every register and
+flag live at the exit (in either body's liveness), on memory (stores equal up
+to reordering provably disjoint ones) and on the accessed footprint, and every
+entry value either version reads is live on entry. The function is then laid
+out again: every branch keeps its encoding width (a short branch that no
+longer reaches is refused), relocations and switch-table addends move with
+their code, and the COFF line rows, CodeView procedure range, FPO size and
+symbol values follow the same offset map. The module docstring of
+`reprobit.classic.rewriting_region_resize` states the theorem and its nine
+checks.
 
 #### Project-level families (role `project`)
 

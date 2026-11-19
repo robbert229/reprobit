@@ -205,6 +205,13 @@ _CLASSIC: dict[ClassicRecipeFamily, _Mechanic] = {
         "Register changes alter instruction lengths, so branches and references move with them.",
         _REWRITE_STEPS,
     ),
+    ClassicRecipeFamily.RETAIL_EXACT_REGION_RESIZE_REWRITING: _Mechanic(
+        "Replace a region with a proved equivalent and resize",
+        "object",
+        "A region of the compiled function is replaced by instructions of another length that"
+        " a path simulation proves equivalent; branches and references move with it.",
+        _REWRITE_STEPS,
+    ),
     ClassicRecipeFamily.RETAIL_EXACT_SAME_TU_INSTRUCTION_HYBRID_RESIZE: _Mechanic(
         "Combine instruction donors and resize",
         "object",
