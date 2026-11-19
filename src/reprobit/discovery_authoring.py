@@ -755,6 +755,46 @@ def _measured_function(
         raise DiscoveryAuthoringError(f"cannot author {family.value} record: {exc}") from exc
 
 
+def donor_compiler_seat(
+    intervention: ClassicRecipeIntervention,
+    receipt: ClassicProofReceipt,
+) -> str:
+    """The case-folded compiler seat a donor record compiles in.
+
+    The seat comes from the validator that the classic orchestrator uses, so two
+    donors with one seat would share one private compiler arena.
+    """
+
+    try:
+        validation = validate_donor_recipe(
+            intervention, merge_candidate_constraints(intervention, receipt)
+        )
+    except DonorSourceError as exc:
+        raise DiscoveryAuthoringError(f"invalid donor {intervention.id!r}: {exc}") from exc
+    return validation.compiler_seat.casefold()
+
+
+def saved_donor_seats(
+    intervention_document: InterventionDocument,
+    proof_document: ProofDocument,
+) -> dict[str, ClassicRecipeIntervention]:
+    """The shard's saved donors keyed by their case-folded compiler seats."""
+
+    receipts = {item.intervention_id: item for item in proof_document.expected_observations}
+    seats: dict[str, ClassicRecipeIntervention] = {}
+    for intervention in intervention_document.interventions:
+        if not (
+            isinstance(intervention, ClassicRecipeIntervention)
+            and intervention.role is ClassicRecipeRole.DONOR
+        ):
+            continue
+        receipt = receipts.get(intervention.id)
+        if receipt is None:
+            raise DiscoveryAuthoringError(f"saved donor {intervention.id!r} has no proof receipt")
+        seats.setdefault(donor_compiler_seat(intervention, receipt), intervention)
+    return seats
+
+
 def merge_authored_records(
     intervention_document: InterventionDocument,
     proof_document: ProofDocument,
@@ -868,5 +908,7 @@ __all__ = [
     "build_declaration_shape_equal_body",
     "build_measured_function_record",
     "build_pad_shape_donor",
+    "donor_compiler_seat",
     "merge_authored_records",
+    "saved_donor_seats",
 ]
