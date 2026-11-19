@@ -15,6 +15,10 @@ recorded output and check the simulator against it:
   (dividend, divisor) whichever register holds which, NaN payloads and
   exception flags included -- the reason ``fsubr`` and ``fsub`` that compute
   the same difference meet;
+- add and multiply are one function of the unordered operand pair, in every
+  register encoding, under all four rounding modes and three precision
+  controls, NaN payloads, signed zeros, exception flags and C1 included --
+  the reason their terms sort their operands;
 - the register copies and sign operations (``fld st(i)``, ``fxch``,
   ``fst st(i)``, ``fchs``, ``fabs``, ``fld1``, ``fldz``) copy all 80 bits and
   raise no exception, even on an SNaN or a denormal, so they are no events;
@@ -42,6 +46,7 @@ from reprobit.classic.region_x87 import (
     x87_condition_liveness,
     x87_environment_exposures,
     x87_stack_depths,
+    x87_stack_solution,
 )
 from reprobit.classic.relational import ia32_relational_flow_walk
 from reprobit.classic.rewriting_region_resize import apply_region_resize
@@ -188,6 +193,44 @@ def test_subtract_and_divide_are_functions_of_their_operand_roles_on_the_probe()
             assert len({results[case] for case in cases}) == 1, line
 
 
+def _commute_rows():
+    rows = {}
+    for line in (PROBE / "commute.out").read_text().splitlines():
+        cw, i, j, add, mul = line.split()
+        assert add.startswith("add=") and mul.startswith("mul="), line
+        rows[(cw, int(i), int(j))] = (add[4:].split("|"), mul[4:].split("|"))
+    return rows
+
+
+def test_add_and_multiply_are_commutative_on_the_probe() -> None:
+    rows = _commute_rows()
+    control_words = {f"{0x7F | pc | rc << 10:04x}" for pc in (0, 0x200, 0x300) for rc in range(4)}
+    operands = 19
+    assert set(rows) == {
+        (cw, i, j) for cw in control_words for i in range(operands) for j in range(operands)
+    }
+    for key, (add, mul) in rows.items():
+        # One value over the six (encoding, operand order) runs of each operation...
+        assert len(add) == 1 and len(mul) == 1, key
+        # ... and the same value for the pair in the other order.
+        assert rows[(key[0], key[2], key[1])] == (add, mul), key
+    # The control word took effect: an exact zero sum is -0 only rounding down,
+    # and 1 * (1/3) keeps 24, 53 or 64 significand bits.
+    for cw in control_words:
+        rounding = int(cw, 16) >> 10 & 3
+        sign = "8000" if rounding == 1 else "0000"
+        assert rows[(cw, 8, 9)][0][0].startswith(sign), cw  # +0 + -0
+        assert rows[(cw, 10, 18)][0][0].startswith(sign), cw  # 1 + -1
+    third = {cw[:2]: rows[(cw, 10, 11)][1][0][4:20] for cw in control_words if cw[2:] == "7f"}
+    assert third["00"].endswith("0000000000") and third["03"] == "aaaaaaaaaaaaaaab"
+
+
+def test_the_commutativity_probe_ran_every_add_and_multiply_register_encoding() -> None:
+    encodings = (PROBE / "commute_encodings.txt").read_text()
+    for pair in ("d8 c1", "d8 c9", "dc c1", "dc c9", "de c1", "de c9", "d9 2d"):
+        assert re.search(rf"\b{pair}\b", encodings), pair
+
+
 def test_no_precision_control_makes_a_spill_the_identity_on_the_probe() -> None:
     differs = set()
     for row in _probe_lines("SPILL"):
@@ -258,6 +301,56 @@ def test_a_status_word_byte_combined_other_than_by_a_mask_is_refused() -> None:
 def test_an_x87_instruction_after_a_call_is_refused() -> None:
     with pytest.raises(ByteIdentityError, match="after a call"):
         _run("e800000000" + X, {1: ("rel32", "_f")})
+
+
+def _run_returns(hex_code, relocations, returns):
+    code = bytes.fromhex(hex_code)
+    return simulate_region(code, 0, len(code), relocations, "t", "x87", x87_returns=returns)
+
+
+def test_a_call_of_known_count_leaves_its_result_named_by_the_call() -> None:
+    [path] = _run_returns("e800000000" + "d9c0", {1: ("rel32", "_f")}, {"_f": 1})
+    [event] = path.events
+    assert path.x87.base == event
+    assert path.x87.slots == ((-2, ("fret", event)), (-1, ("fret", event)))
+    assert path.x87.call_pushes == (0,)
+    # need and peak bound the entry frame only.
+    assert (path.x87.need, path.x87.peak) == (0, 0)
+
+
+def test_a_call_of_unknown_count_or_through_an_import_slot_still_refuses_x87_after_it() -> None:
+    with pytest.raises(ByteIdentityError, match="after a call"):
+        _run_returns("e800000000" + X, {1: ("rel32", "_f")}, {"_g": 1})
+    with pytest.raises(ByteIdentityError, match="after a call"):
+        _run_returns("ff1500000000" + X, {2: "__imp__f"}, {"__imp__f": 1})
+
+
+def test_the_stack_below_a_call_result_is_empty() -> None:
+    with pytest.raises(ByteIdentityError, match="underflow"):
+        _run_returns("e800000000" + "d9c9", {1: ("rel32", "_f")}, {"_f": 1})
+    with pytest.raises(ByteIdentityError, match="underflow"):
+        _run_returns("e800000000" + "d95904", {1: ("rel32", "_g")}, {"_g": 0})
+
+
+def test_the_stack_after_a_call_overflows_at_nine() -> None:
+    loads = "".join(f"d941{4 * k:02x}" for k in range(7))
+    _run_returns("e800000000" + loads, {1: ("rel32", "_f")}, {"_f": 1})
+    with pytest.raises(ByteIdentityError, match="overflows after the call"):
+        _run_returns("e800000000" + loads + "d9411c", {1: ("rel32", "_f")}, {"_f": 1})
+
+
+def test_a_second_call_must_find_the_stack_empty() -> None:
+    relocations = {1: ("rel32", "_f"), 6: ("rel32", "_f")}
+    with pytest.raises(ByteIdentityError, match="1 x87 values on the stack"):
+        _run_returns("e800000000" + "e800000000", relocations, {"_f": 1})
+    relocations = {1: ("rel32", "_f"), 8: ("rel32", "_f")}
+    [path] = _run_returns("e800000000" + "ddd8" + "e800000000", relocations, {"_f": 1})
+    assert path.x87.push == 1 and path.x87.call_pushes == (0,)
+
+
+def test_a_call_from_the_entry_frame_records_its_push() -> None:
+    [path] = _run_returns("d95904" + "e800000000", {4: ("rel32", "_g")}, {"_g": 0})
+    assert path.x87.call_pushes == (-1,) and path.x87.need == 1
 
 
 @pytest.mark.parametrize("encoding", ["d9fe", "d9ff", "df1e", "db1e", "d9e4", "d93c24", "9b"])
@@ -335,6 +428,14 @@ def _family_region(loads, encoding, change, compare):
     return [*loads, encoding, *_drain(depth)]
 
 
+def _commutative(encoding):
+    """A popping add or multiply of two registers: swapping its operands leaves one stack.
+
+    The non-popping forms keep the other operand, which the swap changes.
+    """
+    return encoding in ("dec1", "dec9")
+
+
 @pytest.mark.parametrize(("encoding", "change", "compare"), _FAMILIES)
 def test_each_family_proves_under_an_fxch_schedule_and_refuses_swapped_operands(
     encoding: str, change: int, compare: bool
@@ -345,9 +446,14 @@ def test_each_family_proves_under_an_fxch_schedule_and_refuses_swapped_operands(
     [region] = proof["regions"]
     assert region["x87"]["entry_depths"] == [[0, 0]]
     assert region["x87"]["peak"] >= 2
+    swapped = _family_region([X, Y], encoding, change, compare)
+    if _commutative(encoding):
+        # Add and multiply of two registers: the swapped operands meet.
+        _prove(donor, swapped)
+        return
     # Without the exchange the operands are swapped: a different term.
     with pytest.raises(ByteIdentityError, match=r"different (memory|x87)"):
-        _prove(donor, _family_region([X, Y], encoding, change, compare))
+        _prove(donor, swapped)
 
 
 def test_fsub_and_fsubr_computing_one_difference_meet() -> None:
@@ -363,6 +469,26 @@ def test_a_different_association_is_refused() -> None:
     donor = [X, Y, "dec1", z, "dec1", "d95914"]  # (X + Y) + Z
     with pytest.raises(ByteIdentityError, match="different memory"):
         _prove(donor, [X, Y, z, "dec1", "dec1", "d95914"])  # X + (Y + Z)
+    with pytest.raises(ByteIdentityError, match="different memory"):
+        _prove(donor, [X, z, "dec1", Y, "dec1", "d95914"])  # (X + Z) + Y
+
+
+def test_commuted_operands_meet_at_every_level() -> None:
+    z = "d9410c"
+    donor = [X, Y, "dec1", z, "dec1", "d95914"]  # (X + Y) + Z
+    _prove(donor, [z, Y, X, "dec1", "dec1", "d95914"])  # Z + (Y + X)
+    _prove(donor, [Y, X, "d8c1", "ddd9", z, "d8c1", "ddd9", "d95914"])  # st0 forms
+    with pytest.raises(ByteIdentityError, match="different memory"):
+        _prove(donor, [z, Y, X, "dec9", "dec1", "d95914"])  # Z + (Y * X)
+
+
+def test_distribution_is_refused() -> None:
+    z = "d9410c"
+    donor = [X, Y, z, "dec1", "dec9", "d95914"]  # X * (Y + Z)
+    # X * Y + X * Z
+    distributed = [X, Y, "d8c9", X, z, "dec9", "dec1", "ddd9", "d95914"]
+    with pytest.raises(ByteIdentityError, match=r"different (memory|x87)"):
+        _prove(donor, distributed)
 
 
 def test_a_spill_whose_rounding_differs_is_refused() -> None:
@@ -387,8 +513,9 @@ def test_a_value_left_on_the_stack_must_be_equal() -> None:
         "peak": 1,
         "compared_condition_bits": [],
     }
+    _prove(donor, [Y, "d8c9", "ddd9"], pre=pre, post=post)  # Y * X: commutative
     with pytest.raises(ByteIdentityError, match="different x87 stacks"):
-        _prove(donor, [Y, "d8c9", "ddd9"], pre=pre, post=post)  # Y * X
+        _prove(donor, [Y, "d8c1", "ddd9"], pre=pre, post=post)  # Y + X
 
 
 def test_overflow_is_refused() -> None:
@@ -539,3 +666,128 @@ def test_condition_bits_are_live_up_to_fnstsw_and_killed_by_a_compare() -> None:
 def test_environment_stores_are_found() -> None:
     code, items, _successors, _entries = _walk("d93424" + "dd3424" + "d93c24" + "c3")
     assert x87_environment_exposures(items, code) == [0, 3]
+
+
+# --- x87 after a call inside a region ----------------------------------------------
+
+RELOAD = "8b4c2404"  # mov ecx, [esp+4]: the call clobbered ECX
+
+
+def _assemble(items, base):
+    """Hex of ``items`` (hex strings or ("call", symbol)) and its call fields."""
+    code, fields = "", []
+    for item in items:
+        if isinstance(item, tuple):
+            fields.append((base + len(code) // 2 + 1, item[1]))
+            code += "e800000000"
+        else:
+            code += item
+    return code, fields
+
+
+def _prove_calls(donor, replacement, pre=(PRE,), post=(POST,)):
+    pre_hex, pre_calls = _assemble(pre, 0)
+    start = len(pre_hex) // 2
+    donor_hex, donor_calls = _assemble(donor, start)
+    post_hex, post_calls = _assemble(post, start + len(donor_hex) // 2)
+    _replacement_hex, replacement_calls = _assemble(replacement, 0)
+    rows = [
+        {
+            "offset": offset,
+            "width": 4,
+            "type": 0x14,
+            "target": symbol,
+            "target_section": 0,
+            "target_value": 0,
+            "addend": 0,
+        }
+        for offset, symbol in (*pre_calls, *donor_calls, *post_calls)
+    ]
+    region = {
+        "region_start": start,
+        "region_end": start + len(donor_hex) // 2,
+        "replacement_instructions": [
+            "e800000000" if isinstance(item, tuple) else item for item in replacement
+        ],
+        "replacement_relocations": [
+            [local, donor_at]
+            for (local, _l), (donor_at, _d) in zip(replacement_calls, donor_calls, strict=True)
+        ],
+    }
+    body = bytes.fromhex(pre_hex + donor_hex + post_hex)
+    return apply_region_resize(body, [region], rows, 1, "x87")
+
+
+F = ("call", "_f")
+G = ("call", "_g")
+
+
+def test_a_call_result_stored_two_ways_proves_and_pins_the_callee_count() -> None:
+    donor = [F, RELOAD, "d95908"]  # fstp dword [ecx+8]
+    _image, proof = _prove_calls(donor, [F, RELOAD, "d95108", "ddd8"])  # fst; fstp st(0)
+    [region] = proof["regions"]
+    assert region["x87"] == {
+        "entry_depths": [[0, 0]],
+        "need": 0,
+        "peak": 0,
+        "compared_condition_bits": [],
+        "call_returns": {"_f": 1},
+    }
+    with pytest.raises(ByteIdentityError, match="different memory"):
+        _prove_calls(donor, [F, RELOAD, "ddd8", "d9ee", "d95908"])  # store 0 instead
+
+
+def test_a_call_result_multiplied_in_either_order_proves() -> None:
+    donor = [F, RELOAD, Y, "dec9", "d95914"]  # fret * Y, popped into ST(1)
+    _prove_calls(donor, [F, RELOAD, Y, "d8c9", "ddd9", "d95914"])  # Y * fret in ST(0)
+    with pytest.raises(ByteIdentityError, match="different memory"):
+        _prove_calls(donor, [F, RELOAD, Y, "dee9", "d95914"])  # fret - Y
+
+
+def test_a_call_from_a_nonempty_entry_frame_proves() -> None:
+    pre = (PRE, X)  # the region's entry holds X
+    donor = ["d95910", F, RELOAD, "d95914"]
+    _image, proof = _prove_calls(donor, ["d95110", "ddd8", F, RELOAD, "d95914"], pre=pre)
+    assert proof["regions"][0]["x87"]["entry_depths"] == [[1, 1]]
+    assert proof["regions"][0]["x87"]["call_returns"] == {"_f": 1}
+
+
+def test_two_versions_disagreeing_on_the_stack_at_a_call_are_refused() -> None:
+    pre = (PRE, X)
+    donor = ["d95910", F, RELOAD, "d95914"]
+    # The replacement calls with X still on the stack: the donor's depths
+    # put the entry at 1, so its stack is not empty at the call.
+    with pytest.raises(ByteIdentityError, match="do not allow"):
+        _prove_calls(donor, [F, RELOAD, "d95914"], pre=pre)
+    # Storing X after the call instead underflows the frame the call leaves.
+    with pytest.raises(ByteIdentityError, match="underflow"):
+        _prove_calls(donor, [F, RELOAD, "d95914", "d95910"], pre=pre)
+
+
+def test_a_callee_whose_count_the_donor_leaves_open_still_refuses() -> None:
+    donor = [G, RELOAD, Y, "d95914"]
+    with pytest.raises(ByteIdentityError, match="after a call"):
+        _prove_calls(donor, donor)
+    # A later call to _g needs an empty stack: _g returns nothing.
+    _image, proof = _prove_calls(donor, donor, post=(G, POST))
+    assert proof["regions"][0]["x87"]["call_returns"] == {"_g": 0}
+
+
+def test_the_solver_reports_the_counts_it_determines() -> None:
+    code = "e800000000" + "d95908" + "e800000000" + "e800000000" + "c3"
+    relocations = {**_call(0, "_f"), **_call(8, "_g"), **_call(13, "_h")}
+    code_bytes, items, successors, entries = _walk(code, relocations)
+    solution = x87_stack_solution(items, successors, entries, code_bytes, relocations)
+    assert solution is not None
+    depths, returns = solution
+    # _f feeds an fstp; _g is followed by a call; _h's count stays open at the ret.
+    assert returns == {"_f": 1, "_g": 0}
+    assert depths == x87_stack_depths(items, successors, entries, code_bytes, relocations)
+
+
+def test_a_helper_count_is_never_reported() -> None:
+    code = "d901" + "e800000000" + "e800000000" + "c3"
+    relocations = {**_call(2, "__ftol"), **_call(7, "_h")}
+    code_bytes, items, successors, entries = _walk(code, relocations)
+    solution = x87_stack_solution(items, successors, entries, code_bytes, relocations)
+    assert solution is not None and "__ftol" not in solution[1]
