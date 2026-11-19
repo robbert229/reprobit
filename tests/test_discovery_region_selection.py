@@ -251,3 +251,35 @@ def test_a_region_reading_al_starts_where_all_of_eax_is_live() -> None:
     found = selection.verdict((1, 2, 1, 2), (1, 2, 1, 2))
     assert found is not None and found[0] == "entry" and "dead at the region entry" in found[1]
     assert selection.verdict((0, 2, 0, 2), (1, 2, 1, 2)) is None
+
+
+# --- compiler temporaries renumbered by the donor's declarations ---------------------------
+
+
+def _row(target: str, section: int = 6, value: int = 64, storage: int = 3) -> dict[str, Any]:
+    return {
+        "offset": 49,
+        "type": 6,
+        "target": target,
+        "target_section": section,
+        "target_value": value,
+        "target_type": 0,
+        "target_storage": storage,
+    }
+
+
+def test_a_renumbered_compiler_temporary_keeps_its_identity() -> None:
+    # Any declaration added to the unit, even at its end, renumbers $T and $L.
+    identity = search_module._symbol_identity
+    assert identity(_row("$T8101")) == identity(_row("$T8102"))
+    assert identity(_row("$T8101")) != identity(_row("$T8102", value=68))
+    assert identity(_row("$T8101")) != identity(_row("$L8101"))
+    assert identity(_row("_legoGlobs", 2, 0, 2)) != identity(_row("_other", 2, 0, 2))
+
+
+def test_the_composed_table_names_a_temporary_by_its_kind_and_place() -> None:
+    from reprobit.classic.rewriting_region_resize import _composed_identity
+
+    assert _composed_identity(_row("$T8101")) == _composed_identity(_row("$T8102"))
+    assert _composed_identity(_row("$T8101")) != _composed_identity(_row("$T8102", value=68))
+    assert _composed_identity(_row("_a", 2, 0, 2)) != _composed_identity(_row("_b", 2, 0, 2))

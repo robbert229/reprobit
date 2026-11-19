@@ -37,7 +37,7 @@ from reprobit.classic.coff import (
 )
 from reprobit.classic.composition_mosaic import instruction_mosaic_metadata_sha256
 from reprobit.classic.debug import parse_fpo_data
-from reprobit.classic.foundation import sha256_bytes
+from reprobit.classic.foundation import local_symbol_kind, sha256_bytes
 from reprobit.classic.register_reencoding import require_frame_pointer_free_frame
 from reprobit.classic.register_semantics import (
     IA32_GENERAL_REGISTER_NAMES,
@@ -208,10 +208,26 @@ def _instruction_keys(
 
 
 def _symbol_identity(row: dict[str, Any]) -> tuple[Any, ...]:
-    """A relocation target's identity across two compiles of one unit."""
+    """A relocation target's identity across two compiles of one unit.
+
+    A file static ``<name>$S<serial>`` keeps its base name; a compiler local
+    (``$T<n>``, ``$L<n>``) keeps its kind and its place in its section, as
+    the relocation-layout splice identifies it: any declaration added to the
+    unit, even at its end, renumbers both serials.
+    """
     base, separator, serial = str(row["target"]).rpartition("$S")
     if row["target_storage"] == 3 and separator and base and serial.isdigit():
         return ("static", base, row["target_type"])
+    kind = local_symbol_kind(str(row["target"]))
+    if kind is not None:
+        return (
+            "local",
+            kind,
+            row["target_section"],
+            row["target_value"],
+            row["target_type"],
+            row["target_storage"],
+        )
     return ("named", row["target"], row["target_type"], row["target_storage"])
 
 
