@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 from collections.abc import Iterable
 from typing import Any, cast
 
@@ -80,10 +81,13 @@ CODEVIEW_X86_REGISTER_NUMBERS = {
 CODEVIEW_REGISTER_RECORD_TYPE = 2
 
 
+_BYTE_REGISTERS = frozenset({"eax", "ecx", "edx", "ebx"})
+
+
 def apply_register_bijection(
     body: bytes,
     mapping: dict[str, Any],
-    region: tuple[int, int],
+    region: tuple[int, int] | list[tuple[int, int]],
     relocation_offsets: frozenset[int],
     context: str,
     relocations: dict[int, Any] | None = None,
@@ -99,19 +103,41 @@ def apply_register_bijection(
     """
     require_payload_free_declaration(mapping, f"{context} register mapping")
     body = bytes(body)
-    start, end = region
+    # One region, or several sharing the mapping: control may pass between
+    # them (an edge from one region into another is internal), while every
+    # edge to code outside all of them is a boundary.  Several regions let a
+    # body with more than one epilogue keep each epilogue's restores outside.
+    if isinstance(region, list):
+        regions = sorted((int(left), int(right)) for left, right in region)
+        require(bool(regions), f"{context}: no region is declared")
+    else:
+        regions = [(int(region[0]), int(region[1]))]
+    for (_left_start, left_end), (right_start, _right_end) in itertools.pairwise(regions):
+        require(left_end <= right_start, f"{context}: regions overlap or are unsorted")
+    start, end = regions[0][0], regions[-1][1]
+
+    def in_regions(offset: int) -> bool:
+        return any(left <= offset < right for left, right in regions)
+
     instructions = decode_ia32_bijection_body(body, context, relocations, code_length)
     limit = len(body) if code_length is None else code_length
     boundaries = {item["offset"] for item in instructions}
     boundaries.add(limit)
     require(end <= limit, f"{context}: region reaches past the body's code")
+    for region_start, region_end in regions:
+        require(
+            region_start in boundaries and region_end in boundaries and region_start < region_end,
+            f"{context}: region does not span whole instructions",
+        )
     if any(item["indirect"] for item in instructions):
         require(
             internal_targets is not None,
             f"{context}: a computed jump requires the relocated in-body target set",
         )
         entered = sorted(
-            target for target in cast(frozenset[int], internal_targets) if start < target < end
+            target
+            for target in cast(frozenset[int], internal_targets)
+            if in_regions(target) and not any(target == left for left, _right in regions)
         )
         require(
             not entered,
@@ -142,38 +168,53 @@ def apply_register_bijection(
         f"{context}: mapping touches ESP, whose encodings carry ModRM/SIB structure",
     )
     live, successors = _register_bijection_live_sets(instructions, context)
-    inside = [item for item in instructions if start <= item["offset"] < end]
+    inside = [item for item in instructions if in_regions(item["offset"])]
     require(bool(inside), f"{context}: region contains no instruction")
-    require(
-        inside[-1]["offset"] + inside[-1]["length"] == end,
-        f"{context}: region does not end on an instruction boundary",
-    )
-    entry = instructions.index(inside[0])
+    index_of = {item["offset"]: index for index, item in enumerate(instructions)}
+    entries = {index_of[region_start] for region_start, _region_end in regions}
     for item in inside:
-        blocked = support & set(item.get("frozen", frozenset()))
+        byte_only = set(item.get("byte_frozen", frozenset()))
+        blocked = support & (set(item.get("frozen", frozenset())) - byte_only)
         require(
             not blocked,
             f"{context}: {sorted(blocked)} is named by a sub-register field at {item['offset']} that sigma cannot rewrite",
         )
+        # An 8-bit field names AL..BL (0..3) or AH..BH (4..7), the low and
+        # high bytes of EAX..EBX.  A permutation among those four keeps every
+        # such field encodable, so it is rewritten like a 32-bit field with
+        # its high-byte bit kept; one that leaves them is refused.
+        stranded = sorted(
+            name
+            for name in support & byte_only
+            if name not in _BYTE_REGISTERS or mapping.get(name, name) not in _BYTE_REGISTERS
+        )
+        require(
+            not stranded,
+            f"{context}: {stranded} is named by a byte field at {item['offset']} that sigma would move off a byte register",
+        )
+    entered_from_outside = set()
     for index, item in enumerate(instructions):
         for edge in successors[index]:
-            crosses_in = (
-                not start <= item["offset"] < end and start <= instructions[edge]["offset"] < end
-            )
+            crosses_in = not in_regions(item["offset"]) and in_regions(instructions[edge]["offset"])
             if crosses_in:
                 require(
-                    edge == entry,
+                    edge in entries,
                     f"{context}: control enters the region other than at its first instruction",
                 )
+                entered_from_outside.add(edge)
     support_atoms = ia32_register_atoms(support)
-    dead_in = support_atoms & set(live[entry])
-    require(
-        not dead_in, f"{context}: {_ia32_atom_registers(dead_in)} is live on entry to the region"
-    )
+    # The first region is entered from the prologue; any other region entered
+    # from outside every region is a boundary too.
+    for entry in entered_from_outside | {index_of[regions[0][0]]}:
+        dead_in = support_atoms & set(live[entry])
+        require(
+            not dead_in,
+            f"{context}: {_ia32_atom_registers(dead_in)} is live on entry to the region",
+        )
     affected = {
         index
         for index, item in enumerate(instructions)
-        if start <= item["offset"] < end
+        if in_regions(item["offset"])
         and item["flow"] not in ("ret", "exit")
         and support_atoms & (set(item["read_atoms"]) | set(item["write_atoms"]))
     }
@@ -186,10 +227,10 @@ def apply_register_bijection(
                 sigma_reachable.add(edge)
                 frontier.append(edge)
     for index, item in enumerate(instructions):
-        if not start <= item["offset"] < end:
+        if not in_regions(item["offset"]):
             continue
         for edge in successors[index]:
-            if start <= instructions[edge]["offset"] < end:
+            if in_regions(instructions[edge]["offset"]):
                 continue
             leaking = support_atoms & set(live[edge])
             require(
@@ -215,6 +256,20 @@ def apply_register_bijection(
             )
             image[byte_index] = (image[byte_index] & ~(7 << shift) | numbers[value] << shift) & 255
             rewritten.append(byte_index)
+        for byte_index, shift in item.get("byte_fields", ()):
+            value = image[byte_index] >> shift & 7
+            if value & 3 not in numbers:
+                continue
+            require(
+                byte_index not in relocation_offsets,
+                f"{context}: a rewritten byte overlaps a relocation",
+            )
+            replacement = numbers[value & 3]
+            require(replacement < 4, f"{context}: a byte field would leave AL..BL")
+            image[byte_index] = (
+                image[byte_index] & ~(7 << shift) | (replacement | value & 4) << shift
+            ) & 255
+            rewritten.append(byte_index)
     require(bool(rewritten), f"{context}: the bijection rewrites nothing")
     output = bytes(image)
     require(len(image) == len(body), f"{context}: the image changed the body length")
@@ -238,11 +293,11 @@ def apply_register_bijection(
         )
     for left, right in zip(image_instructions, instructions, strict=True):
         expected_reads = frozenset(
-            mapping.get(name, name) if start <= right["offset"] < end else name
+            mapping.get(name, name) if in_regions(right["offset"]) else name
             for name in right["reads"]
         )
         expected_writes = frozenset(
-            mapping.get(name, name) if start <= right["offset"] < end else name
+            mapping.get(name, name) if in_regions(right["offset"]) else name
             for name in right["writes"]
         )
         require(

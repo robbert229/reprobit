@@ -241,6 +241,13 @@ class RelocSide:
     xdata: int
 
 
+# The procedure records a same-slot composition rewrites: S_GPROC32 and
+# S_LPROC32 (MSVC 4.20), and their 32-bit type-index forms S_GPROC32_ST and
+# S_LPROC32_ST (MSVC 5.0). A static function carries the local form; all four
+# keep the length and debug range at payload offset 12.
+SAME_SLOT_PROCEDURE_RECORD_KINDS = (b"\x05\x02", b"\x04\x02", b"\x0b\x10", b"\x0a\x10")
+
+
 def _pair_reloc_divergent(
     seed_side: RelocSide, donor_side: RelocSide, mapping: dict[int, int], context: str
 ) -> tuple[
@@ -742,12 +749,9 @@ def compose_same_slot_resize(
     donor_lines = bytes(donor_line_buffer)
     seed_debug_raw = coff_body(seed, sd)
     donor_debug_raw = coff_body(donor, dd)
-    # S_GPROC32 (MSVC 4.20) or its 32-bit type-index form S_GPROC32_ST (MSVC
-    # 5.0); both keep the length and debug range at payload offset 12.
-    global_procedure = (b"\x05\x02", b"\x0b\x10")
     require(
         len(seed_debug_raw) >= 28
-        and seed_debug_raw[2:4] in global_procedure
+        and seed_debug_raw[2:4] in SAME_SLOT_PROCEDURE_RECORD_KINDS
         and (donor_debug_raw[2:4] == seed_debug_raw[2:4]),
         "debug$S is not an S_*PROC32 record",
     )
@@ -756,7 +760,7 @@ def compose_same_slot_resize(
     )
     require(
         fpo_proc_size_fits(donor_cbproc, dp["raw_size"], donor_code)
-        and 0 <= donor_dbgstart <= donor_dbgend < donor_cbproc,
+        and 0 <= donor_dbgstart <= donor_dbgend <= donor_cbproc,
         "donor debug procedure range is stale",
     )
     expected_debug_raw = bytearray(

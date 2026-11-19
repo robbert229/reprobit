@@ -107,3 +107,11 @@ def test_msvc50_alignment_fill_after_the_procedure_is_admitted() -> None:
     assert not fpo_proc_size_fits(313, 320, b"\xc3" * 314 + b"\x90" * 6)
     assert not fpo_proc_size_fits(304, 320, b"\xc3" * 304 + b"\x90" * 16)
     assert not fpo_proc_size_fits(313, 319, b"\xc3" * 313 + b"\x90" * 6)
+
+
+def test_same_slot_composition_admits_local_procedures() -> None:
+    from reprobit.classic.composition_same_slot import SAME_SLOT_PROCEDURE_RECORD_KINDS
+
+    kinds = {int.from_bytes(kind, "little") for kind in SAME_SLOT_PROCEDURE_RECORD_KINDS}
+    assert kinds == {0x0205, 0x0204, 0x100B, 0x100A}
+    assert kinds <= set(CODEVIEW_PROCEDURE_RECORD_TYPES)

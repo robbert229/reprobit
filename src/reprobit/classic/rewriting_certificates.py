@@ -455,7 +455,9 @@ def _validate_register_bijections(
         }
         if composed:
             keys.add("debug_s_register_map")
-        exact_audit_keys(item, keys, item_context)
+            exact_audit_keys(item, keys, item_context)
+        else:
+            exact_audit_keys(item, keys | {"regions"}, item_context, optional={"regions"})
         mapping = item.get("mapping")
         require(
             isinstance(mapping, dict)
@@ -503,12 +505,40 @@ def _validate_register_bijections(
                         not set(mapping) & set(earlier["mapping"]),
                         f"{item_context}: overlapping regions rename a common register",
                     )
+        spans = [[start, end]]
+        if "regions" in item:
+            # Several regions share the mapping (a body with more than one
+            # epilogue); region_start/region_end are their overall span.
+            raw_regions = item.get("regions")
+            require(
+                isinstance(raw_regions, list) and 2 <= len(raw_regions) <= 16,
+                f"{item_context}.regions is invalid",
+            )
+            spans = []
+            cursor = start
+            for position, pair in enumerate(raw_regions):
+                require(
+                    isinstance(pair, list)
+                    and len(pair) == 2
+                    and all(type(value) is int for value in pair)
+                    and cursor <= pair[0] < pair[1] <= end,
+                    f"{item_context}.regions[{position}] is invalid or out of order",
+                )
+                spans.append([pair[0], pair[1]])
+                cursor = pair[1]
+            require(
+                spans[0][0] == start and spans[-1][1] == end,
+                f"{item_context}.regions do not span region_start..region_end",
+            )
         offsets = item.get("expected_rewritten_offsets")
         require(
             isinstance(offsets, list)
             and bool(offsets)
             and (offsets == sorted(set(offsets)))
-            and all(type(offset) is int and start <= offset < end for offset in offsets),
+            and all(
+                type(offset) is int and any(left <= offset < right for left, right in spans)
+                for offset in offsets
+            ),
             f"{item_context}.expected_rewritten_offsets is invalid",
         )
         bijection_bytes.extend(offsets)
@@ -559,6 +589,8 @@ def _validate_register_bijections(
             ),
             "expected_rewritten_offsets": list(offsets),
         }
+        if len(spans) > 1:
+            normalized_item["regions"] = spans
         if composed:
             normalized_item["debug_s_register_map"] = normalized_map
         normalized_bijections.append(normalized_item)
@@ -1169,6 +1201,7 @@ def validate_donor_rewriting(value: object, context: str, body_length: int) -> d
             "slot_bijections",
             "x87_squared_addend_exchanges",
             "equality_load_exchanges",
+            "sib_operand_swaps",
             "expected_instruction_count",
             "expected_changed_offsets",
             "expected_procedure_range",
@@ -1190,6 +1223,7 @@ def validate_donor_rewriting(value: object, context: str, body_length: int) -> d
             "slot_bijections",
             "x87_squared_addend_exchanges",
             "equality_load_exchanges",
+            "sib_operand_swaps",
             "expected_code_length",
             "expected_internal_relocation_targets",
         },
@@ -1288,6 +1322,31 @@ def validate_donor_rewriting(value: object, context: str, body_length: int) -> d
     normalized_forms, form_bytes = _validate_commutative_operand_forms(
         document, context, body_length
     )
+    normalized_swaps: list[dict[str, Any]] = []
+    for index, site in enumerate(document.get("sib_operand_swaps") or []):
+        site_context = f"{context}.sib_operand_swaps[{index}]"
+        require(isinstance(site, dict), f"{site_context} must be an object")
+        exact_audit_keys(site, {"instruction_offset", "expected_rewritten_offsets"}, site_context)
+        at = require_exact_int(
+            site.get("instruction_offset"),
+            f"{site_context}.instruction_offset",
+            minimum=0,
+            maximum=body_length - 1,
+        )
+        rewritten = site.get("expected_rewritten_offsets")
+        require(
+            isinstance(rewritten, list)
+            and len(rewritten) == 1
+            and type(rewritten[0]) is int
+            and at < rewritten[0] < min(at + 15, body_length),
+            f"{site_context}.expected_rewritten_offsets is invalid",
+        )
+        normalized_swaps.append(
+            {"instruction_offset": at, "expected_rewritten_offsets": list(rewritten)}
+        )
+    form_bytes = list(form_bytes) + [
+        offset for site in normalized_swaps for offset in site["expected_rewritten_offsets"]
+    ]
     require(
         bool(
             normalized_windows
@@ -1298,6 +1357,7 @@ def validate_donor_rewriting(value: object, context: str, body_length: int) -> d
             or normalized_sites
             or normalized_equalities
             or normalized_forms
+            or normalized_swaps
             or normalized_slots
             or normalized_x87
         ),
@@ -1435,6 +1495,8 @@ def validate_donor_rewriting(value: object, context: str, body_length: int) -> d
         "slot_bijections": normalized_slots,
         "x87_squared_addend_exchanges": normalized_x87,
     }
+    if normalized_swaps:
+        normalized["sib_operand_swaps"] = normalized_swaps
     if normalized_equalities:
         normalized["equality_load_exchanges"] = normalized_equalities
     if code_length is not None:

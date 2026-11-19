@@ -18,7 +18,12 @@ from reprobit.authority_snapshot import (
     JsonAuthorityDirectorySnapshot,
     assert_json_authority_unchanged,
 )
-from reprobit.classic_donors import generate_declaration_shape, generate_extern_run
+from reprobit.classic_donors import (
+    generate_declaration_shape,
+    generate_extern_run,
+    merge_candidate_constraints,
+)
+from reprobit.classic_project import ClassicDispatchMaterials, ClassicFamilyDispatcher
 from reprobit.costs import calculate_cost
 from reprobit.discovery_authoring import (
     AuthoredClassicRecord,
@@ -29,6 +34,7 @@ from reprobit.discovery_authoring import (
     build_donor_equal_body,
     build_donor_reloc_layout_equal_body,
     build_extern_run_donor,
+    build_measured_function_record,
     merge_authored_records,
 )
 from reprobit.discovery_contracts import (
@@ -44,6 +50,7 @@ from reprobit.discovery_project import (
     resolve_project_grind_context,
     stage_grind_project,
 )
+from reprobit.discovery_rewriting import build_donor_schedule_rewriting
 from reprobit.execution import classic_semantic_obligation_name
 from reprobit.intervention_metadata import (
     ClassicRecipeFamily,
@@ -333,7 +340,74 @@ def _state_equal_body(
                 donor_object=donor_object,
             )
         except DiscoveryAuthoringError:
+            pass
+        # A donor whose body has a different length still fits its slot when
+        # the same-slot resize family's closed checks hold.
+        try:
+            record = build_measured_function_record(
+                target_id=unit.target_id,
+                translation_unit_id=unit.id,
+                build_target=unit.build_target,
+                symbol=context.symbol,
+                family=ClassicRecipeFamily.SAME_SLOT_RESIZE,
+                donor_id=donor.intervention.id,
+                seed_object=seed_object,
+                donor_object=donor_object,
+            )
+        except DiscoveryAuthoringError:
             raise strict_error from None
+        candidate = ClassicFamilyDispatcher().dispatch(
+            record.intervention,
+            ClassicDispatchMaterials(
+                seed_object=seed_object,
+                donor_object=donor_object,
+                candidate_constraints=merge_candidate_constraints(
+                    record.intervention, record.receipt
+                ).materialize(),
+            ),
+        )
+        return DeclarationShapeEqualBodyAuthoring(
+            donor=donor, function=record, candidate_object=candidate.output, composition_proof=None
+        )
+
+
+def _state_rewriting(
+    state: DeclarationState,
+    context: ProjectGrindContext,
+    *,
+    seed_object: bytes,
+    donor_object: bytes,
+    reference_object: bytes,
+) -> DeclarationShapeEqualBodyAuthoring:
+    """Author the state's extern-run donor and a donor rewriting reaching the reference."""
+
+    _require_grind_family(state)
+    if state.family is not DeclarationFamily.EXTERN_RUN_PAIR:
+        raise DiscoveryAuthoringError("donor rewriting is authored for extern-run donors only")
+    unit = context.unit
+    run = _extern_run(state)
+    donor = build_extern_run_donor(
+        target_id=unit.target_id,
+        translation_unit_id=unit.id,
+        build_target=unit.build_target,
+        header_prefix=run.header_prefix,
+        header_count=run.header_count,
+        seat_prefix=run.seat_prefix,
+        seat_count=run.seat_count,
+        width=run.width,
+        beneficiary_symbols=(context.symbol,),
+        header_placement=_header_placement(context),
+    )
+    return build_donor_schedule_rewriting(
+        donor=donor,
+        target_id=unit.target_id,
+        translation_unit_id=unit.id,
+        build_target=unit.build_target,
+        symbol=context.symbol,
+        seed_object=seed_object,
+        donor_object=donor_object,
+        reference_object=reference_object,
+    )
 
 
 def describe_state(state: DeclarationState) -> str:
@@ -636,19 +710,39 @@ def run_project_grind(
             state_id = declaration_state_id(state)
             rejected = False
             try:
-                authored = _state_equal_body(
-                    state,
-                    context,
-                    seed_object=seed_object,
-                    donor_object=donor_objects[provisional_record.intervention.id],
-                )
+                donor_object = donor_objects[provisional_record.intervention.id]
+                try:
+                    authored = _state_equal_body(
+                        state,
+                        context,
+                        seed_object=seed_object,
+                        donor_object=donor_object,
+                    )
+                    qualify_msvc_reference_object(
+                        reference_object=reference_object,
+                        candidate_object=authored.candidate_object,
+                        symbol=context.symbol,
+                    )
+                except (DiscoveryAuthoringError, DiscoveryError) as splice_error:
+                    # The donor holds the reference's instructions in another
+                    # order: a proved reorder of its body reaches the reference.
+                    try:
+                        authored = _state_rewriting(
+                            state,
+                            context,
+                            seed_object=seed_object,
+                            donor_object=donor_object,
+                            reference_object=reference_object,
+                        )
+                    except DiscoveryAuthoringError:
+                        raise splice_error from None
+                    qualify_msvc_reference_object(
+                        reference_object=reference_object,
+                        candidate_object=authored.candidate_object,
+                        symbol=context.symbol,
+                    )
                 if authored.donor.intervention.id != provisional_record.intervention.id:
                     raise GrindError("final donor identity differs from its compiler probe")
-                qualify_msvc_reference_object(
-                    reference_object=reference_object,
-                    candidate_object=authored.candidate_object,
-                    symbol=context.symbol,
-                )
                 final_documents = merge_authored_records(
                     context.intervention_document,
                     context.proof_document,

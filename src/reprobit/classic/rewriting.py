@@ -8,6 +8,7 @@ from typing import Any, cast
 from reprobit.binary import ByteIdentityError, require
 from reprobit.coff_format import CoffObject, coff_body, detailed_relocations
 
+from .address_forms import apply_sib_operand_swaps
 from .candidate_recipe import (
     CandidateRecipe,
     candidate_proof,
@@ -708,7 +709,9 @@ def produce_donor_rewriting_candidate(
         image, proof = apply_register_bijection(
             image,
             item["mapping"],
-            (item["region_start"], item["region_end"]),
+            [tuple(pair) for pair in item["regions"]]
+            if item.get("regions")
+            else (item["region_start"], item["region_end"]),
             relocation_offsets,
             f"donor-rewriting bijection {index}",
             relocation_symbols,
@@ -731,6 +734,17 @@ def produce_donor_rewriting_candidate(
                 "region_instruction_count": proof["region_instruction_count"],
             }
         )
+    sib_detail: list[Any] = []
+    if spec.get("sib_operand_swaps"):
+        image, sib_proof = apply_sib_operand_swaps(
+            image,
+            spec["sib_operand_swaps"],
+            relocation_offsets,
+            "donor-rewriting SIB swaps",
+            relocation_symbols,
+            code_length,
+        )
+        sib_detail = sib_proof["sites"]
     slot_detail = []
     for index, item in enumerate(spec.get("slot_bijections") or []):
         image, proof = apply_slot_bijection(
@@ -1077,6 +1091,7 @@ def produce_donor_rewriting_candidate(
             "slot_bijections": slot_detail,
             "relational_form": relational_detail,
             **({"equality_load_exchanges": equality_detail} if equality_detail else {}),
+            **({"sib_operand_swaps": sib_detail} if sib_detail else {}),
             "instruction_count": len(image_instructions),
             "changed_offsets": changed,
             "debug_fidelity": debug_detail,

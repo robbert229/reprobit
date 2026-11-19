@@ -567,8 +567,16 @@ class WindowImageTests(unittest.TestCase):
             self.apply(body, windows)
         self.assertIn("outside the instruction-schedule table", str(caught.exception))
 
-    def test_an_x87_form_inside_the_window_is_refused(self):
+    def test_an_x87_load_aliasing_a_moved_store_is_ordered_by_memory(self):
+        # fld dword [esp+0x18] reads the slot the moved store writes, so the
+        # x87 load joins the DAG with a memory edge and the reorder is refused.
         body = PROLOGUE + bytes.fromhex("d9442418") + WINDOW_SOURCE[4:] + EPILOGUE
+        with self.assertRaises(ByteIdentityError) as caught:
+            self.apply(body)
+        self.assertIn("dependence DAG", str(caught.exception))
+
+    def test_an_unlisted_x87_form_inside_the_window_is_refused(self):
+        body = PROLOGUE + bytes.fromhex("d97424ff") + WINDOW_SOURCE[4:] + EPILOGUE
         with self.assertRaises(ByteIdentityError) as caught:
             self.apply(body)
         self.assertIn("outside the instruction-schedule table", str(caught.exception))
@@ -650,6 +658,11 @@ class DebugFidelityTests(unittest.TestCase):
         detail = self.check(make_coff(), IMAGE, schedule_spec())
         self.assertEqual(detail["window_line_rows"], [[8, 12, 3]])
         self.assertEqual(detail["procedure_range"], [SIZE, 2, SIZE - 5])
+
+    def test_a_function_with_only_the_line_sentinel_has_no_rows_to_keep(self):
+        seed = make_coff(line_rows=())
+        detail = self.check(seed, IMAGE, schedule_spec(windows=[window_declaration(line_rows=[])]))
+        self.assertEqual(detail["window_line_rows"], [])
 
     def test_a_line_row_left_off_a_boundary_is_refused(self):
         # offset 15 begins an instruction in the SOURCE order and does not in
