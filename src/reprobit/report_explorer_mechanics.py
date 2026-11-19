@@ -212,6 +212,13 @@ _CLASSIC: dict[ClassicRecipeFamily, _Mechanic] = {
         " a path simulation proves equivalent; branches and references move with it.",
         _REWRITE_STEPS,
     ),
+    ClassicRecipeFamily.RETAIL_EXACT_FUNCTION_TRANSLATION_VALIDATION: _Mechanic(
+        "Replace the whole function with a proved equivalent",
+        "object",
+        "The compiled function is replaced by the original's instructions, proved equivalent"
+        " join by join with an inferred register and stack-slot correspondence.",
+        _REWRITE_STEPS,
+    ),
     ClassicRecipeFamily.RETAIL_EXACT_SAME_TU_INSTRUCTION_HYBRID_RESIZE: _Mechanic(
         "Combine instruction donors and resize",
         "object",

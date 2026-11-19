@@ -46,6 +46,7 @@ from reprobit.discovery_contracts import (
     declaration_state_id,
     enumerate_declaration_states,
 )
+from reprobit.discovery_function_validation import build_function_validation_rewriting
 from reprobit.discovery_project import (
     ProjectGrindContext,
     capture_project_grind_inputs,
@@ -367,7 +368,8 @@ def _state_rewriting(
     """Author the state's extern-run donor and a donor rewriting reaching the reference.
 
     A reordering is tried first; when none reaches the reference, a
-    region-resize rewriting (whose replacements may change the length).
+    region-resize rewriting (whose replacements may change the length); when
+    no region replacement proves, a whole-function translation validation.
     """
 
     _require_grind_family(state)
@@ -413,9 +415,25 @@ def _state_rewriting(
                 donor_object=donor_object,
                 reference_object=reference_object,
             )
-        except DiscoveryAuthoringError as resize_error:
+        except DiscoveryAuthoringError as error:
+            resize_error = error
+        # The difference spans the function (registers, spill slots and
+        # scheduling across joins and loops): prove the whole body join by join.
+        try:
+            return build_function_validation_rewriting(
+                donor=donor,
+                target_id=unit.target_id,
+                translation_unit_id=unit.id,
+                build_target=unit.build_target,
+                symbol=context.symbol,
+                seed_object=seed_object,
+                donor_object=donor_object,
+                reference_object=reference_object,
+            )
+        except DiscoveryAuthoringError as validation_error:
             raise DiscoveryAuthoringError(
-                f"{rewriting_error}; region resize: {resize_error}"
+                f"{rewriting_error}; region resize: {resize_error}; "
+                f"function validation: {validation_error}"
             ) from None
 
 
