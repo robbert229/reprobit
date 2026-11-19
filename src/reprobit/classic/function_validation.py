@@ -114,6 +114,19 @@ Checks (each is a refusal):
    set, so the direction flag is clear wherever a string form runs (the
    calling convention clears it at every entry and after every call).
 
+   Further forms.  Also admitted here, each with its exact semantics
+   (`region_simulation`'s module docstring): x87 arithmetic and compares on
+   an integer in memory (``fiadd`` ... ``fidivr``, ``ficom``/``ficomp``,
+   m32int and m16int), whose integer converts exactly, so the operand is the
+   term ``fild`` gives the same load; shifts of 8- and 16-bit operands and by
+   CL, the count masked to five bits and never assumed non-zero (the flags
+   are functions of the value, the masked count and the flag before; CF of
+   a narrow shift by CL, OF and AF are undefined); ``adc`` and ``sbb``, the
+   carry the canonical CF bit (``sbb r, r`` is ``-CF``); byte-wide ``not``,
+   ``neg``, ``mul``, ``imul``, ``div`` and ``idiv`` (a division an event in
+   the footprint); and ``movzx``/``movsx`` into a 16-bit register.  Every
+   other operand-size-prefixed form is refused.
+
    Block string moves.  ``rep stos``/``rep movs`` whose ECX is not a
    constant of at most 1024 is one event (`region_simulation.
    _block_string`): a term of its kind, element width, ECX, EDI, ESI (movs),
@@ -232,6 +245,15 @@ Checks (each is a refusal):
       branches on one where the other branches on a compare's bit makes
       the two paths of one side consistent with both of the other's, and
       checks 4 and 5 refuse it (the refusal names the instruction).
+      Return counts.  The donor's stack-depth solver (`region_x87`) fixes
+      some callees' x87 return counts; a callee it leaves open still
+      leaves one fixed count (x1), so the proof is run once for every
+      assignment of the open counts that propagation does not refute
+      (`region_x87.x87_return_cases`, at most 2**4 cases) and must hold in
+      each: the true assignment is among them.  Both versions make the same
+      calls (5a), so the case gives both the same counts.  A call through an
+      import slot takes its slot symbol's count, as the solver keys it.  The
+      pins record each case and its proof.
 6. Relations.  R(0, 0) is the identity.  The relation a pair of paths
    ending at (x, x') *establishes* has one class per term that some of
    their end locations hold (keeping a class of two or more locations, or
@@ -370,7 +392,7 @@ from .region_simulation import (
     region_boundaries,
     stores_equivalent,
 )
-from .region_x87 import x87_stack_solution
+from .region_x87 import x87_return_cases, x87_stack_solution
 from .relational import ia32_relational_flow_walk, relational_form_external_entries
 from .rewriting_region_resize import (
     _composed_identity,
@@ -1798,6 +1820,59 @@ def prove_function(
     return validate_function(donor, image, shared, x87_returns, f"{context} (shared frame)")
 
 
+def _x87_case_proofs(
+    items: list[dict[str, Any]],
+    successors: list[list[int]],
+    entries: list[int],
+    code: bytes,
+    view: Mapping[int, Any],
+    prove: Any,
+) -> dict[str, Any]:
+    """Check 5f's x87 return counts: the proof's pinned summary.
+
+    First the proof under the counts the donor's solver determines, without
+    an import slot's (exactly the proof records made before the case split
+    pin).  Only when that refuses: once for every case of
+    `region_x87.x87_return_cases`, each with every count it determines, an
+    import slot's included; every case must prove, and the summary then pins
+    each case and its proof.  Each is sound alone: a count left out of a
+    proof makes the x87 stack after that call unknown.
+    """
+    solution = x87_stack_solution(items, successors, entries, code, view)
+    determined = {} if solution is None else solution[1]
+    plain = {s: n for s, n in determined.items() if not s.startswith("__imp_")}
+    try:
+        return proof_summary(prove(plain, ""))
+    except ByteIdentityError:
+        cases = x87_return_cases(items, successors, entries, code, view) or [{}]
+        if cases == [plain]:
+            raise
+    varying = sorted(
+        symbol
+        for symbol in {name for case in cases for name in case}
+        if len({case.get(symbol) for case in cases}) > 1
+    )
+    proofs = [prove(case, f" ({_case_note(case, varying)})" if varying else "") for case in cases]
+    summary = proof_summary(proofs[0])
+    if len(proofs) > 1:
+        summary["x87_return_cases"] = [
+            {
+                "x87_returns": [[symbol, case.get(symbol)] for symbol in varying],
+                "proof": proof_summary(case_proof),
+            }
+            for case, case_proof in zip(cases, proofs, strict=True)
+        ]
+    return summary
+
+
+def _case_note(case: Mapping[str, int], symbols: Iterable[str]) -> str:
+    """The x87 return counts one case of check 5f assumes, for a refusal's context."""
+    return "the case where " + ", ".join(
+        f"{symbol} returns {case.get(symbol, 'an undetermined number of')} x87 values"
+        for symbol in symbols
+    )
+
+
 def proof_summary(proof: ValidationProof) -> dict[str, Any]:
     """The pinned measurements of a proof (check 8)."""
     return {
@@ -2012,17 +2087,22 @@ def measure_function_validation(
     items, successors, entries = ia32_relational_flow_walk(
         donor_body[:proc], view, f"{label} donor flow", None, frozenset()
     )
-    solution = x87_stack_solution(items, successors, entries, donor_body[:proc], view)
-    x87_returns = {} if solution is None else solution[1]
-    proof = prove_function(
+    proof_summary_pin = _x87_case_proofs(
+        items,
+        successors,
+        entries,
         donor_body[:proc],
-        donor_targets,
-        code,
-        image_targets,
-        x87_returns,
-        f"{label} proof",
-        private_frame=private_frame,
-        helpers=helpers,
+        view,
+        lambda counts, note: prove_function(
+            donor_body[:proc],
+            donor_targets,
+            code,
+            image_targets,
+            counts,
+            f"{label} proof{note}",
+            private_frame=private_frame,
+            helpers=helpers,
+        ),
     )
     image = code + bytes([MSVC50_FUNCTION_FILL_BYTE]) * (
         _padded_length(len(code), fill_alignment) - len(code)
@@ -2044,7 +2124,7 @@ def measure_function_validation(
     )
     moved = {old: new for old, new in reseat}
     pins: dict[str, Any] = {
-        "expected_proof": proof_summary(proof),
+        "expected_proof": proof_summary_pin,
         "expected_relocation_reseat": reseat,
         "expected_instruction_count": len(boundaries),
         "expected_procedure_range": derived_detail["procedure_range"],
