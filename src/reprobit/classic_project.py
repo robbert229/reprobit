@@ -26,6 +26,7 @@ import reprobit.classic.pe_rdata as pe_rdata
 import reprobit.classic.pe_text as pe_text
 import reprobit.classic.register_candidates as register_candidates
 import reprobit.classic.rewriting as rewriting
+import reprobit.classic.rewriting_region_resize as region_resize
 import reprobit.classic.scheduling as scheduling
 from reprobit.classic.compiler_identity import Msvc420CompilerIdentity
 from reprobit.classic.semantic_contracts import (
@@ -230,6 +231,10 @@ class ClassicFamilyDispatcher:
             )
         elif family is ClassicRecipeFamily.RETAIL_EXACT_REGISTER_BIJECTION_REENCODING:
             output, proof = register_candidates.produce_register_bijection_reencoding_candidate(
+                seed, donor, function
+            )
+        elif family is ClassicRecipeFamily.RETAIL_EXACT_REGION_RESIZE_REWRITING:
+            output, proof = region_resize.produce_region_resize_rewriting_candidate(
                 seed, donor, function
             )
         elif family is ClassicRecipeFamily.RETAIL_EXACT_SAME_TU_INSTRUCTION_HYBRID_RESIZE:

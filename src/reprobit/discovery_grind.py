@@ -50,6 +50,7 @@ from reprobit.discovery_project import (
     resolve_project_grind_context,
     stage_grind_project,
 )
+from reprobit.discovery_region_resize import build_region_resize_rewriting
 from reprobit.discovery_rewriting import build_donor_schedule_rewriting
 from reprobit.execution import classic_semantic_obligation_name
 from reprobit.intervention_metadata import (
@@ -379,7 +380,11 @@ def _state_rewriting(
     donor_object: bytes,
     reference_object: bytes,
 ) -> DeclarationShapeEqualBodyAuthoring:
-    """Author the state's extern-run donor and a donor rewriting reaching the reference."""
+    """Author the state's extern-run donor and a donor rewriting reaching the reference.
+
+    A reordering is tried first; when none reaches the reference, a
+    region-resize rewriting (whose replacements may change the length).
+    """
 
     _require_grind_family(state)
     if state.family is not DeclarationFamily.EXTERN_RUN_PAIR:
@@ -398,16 +403,34 @@ def _state_rewriting(
         beneficiary_symbols=(context.symbol,),
         header_placement=_header_placement(context),
     )
-    return build_donor_schedule_rewriting(
-        donor=donor,
-        target_id=unit.target_id,
-        translation_unit_id=unit.id,
-        build_target=unit.build_target,
-        symbol=context.symbol,
-        seed_object=seed_object,
-        donor_object=donor_object,
-        reference_object=reference_object,
-    )
+    try:
+        return build_donor_schedule_rewriting(
+            donor=donor,
+            target_id=unit.target_id,
+            translation_unit_id=unit.id,
+            build_target=unit.build_target,
+            symbol=context.symbol,
+            seed_object=seed_object,
+            donor_object=donor_object,
+            reference_object=reference_object,
+        )
+    except DiscoveryAuthoringError as rewriting_error:
+        # No reordering reaches the reference, typically because the bodies
+        # differ in length: replace the differing regions by the reference's
+        # instructions where a path simulation proves them equivalent.
+        try:
+            return build_region_resize_rewriting(
+                donor=donor,
+                target_id=unit.target_id,
+                translation_unit_id=unit.id,
+                build_target=unit.build_target,
+                symbol=context.symbol,
+                seed_object=seed_object,
+                donor_object=donor_object,
+                reference_object=reference_object,
+            )
+        except DiscoveryAuthoringError:
+            raise rewriting_error from None
 
 
 def describe_state(state: DeclarationState) -> str:

@@ -41,6 +41,11 @@ beneficiary list but does not charge the donor again; only newly added intervent
 the project total. Each beneficiary's exposure still shows the donor's full cost, and remains a
 non-additive diagnostic.
 
+A `retail_exact_region_resize_rewriting` record is a semantic rewrite (250 points per
+intervention), the same class as `retail_exact_donor_rewriting`, so a length-changing region
+replacement never costs less than a same-length reordering of the same donor. Its proof work
+(path simulation, relayout) is runtime work, not cost.
+
 An oracle install costs 10,000 points per intervention unit, not per referenced byte. Exact range
 and byte counts remain separate authenticity evidence in the report; the cost score deliberately
 ranks any reference-byte installation as a large departure from an ordinary build.
