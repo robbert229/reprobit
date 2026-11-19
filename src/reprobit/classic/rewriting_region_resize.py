@@ -57,11 +57,15 @@ Checks (each is a refusal):
    own boundaries.
 5. Relocations.  R_i's relocated fields are all 32-bit `DIR32` fields that
    name a symbol outside the function's own section.  P_i declares its
-   relocated fields as an order-preserving bijection onto them: field k of
-   P_i takes field k of R_i's relocation record (same type, same target
-   symbol).  The simulator reads every relocated field of R_i and P_i as
-   that symbol plus the field's own addend, and refuses any relocated field
-   it does not consume as an address displacement or an immediate.
+   relocated fields, sorted by offset, as a bijection onto them: each field
+   of P_i takes one of R_i's relocation records whole (its type and target
+   symbol), and every record is taken once.  The order is free because the
+   simulator names a relocated value by its target alone: it reads every
+   relocated field of R_i and P_i as ``("sym", target)`` plus the field's
+   own inline addend, so a field paired with another record of the same
+   target denotes the same value and one paired with another target a
+   different atom.  It refuses any relocated field it does not consume as
+   an address displacement or an immediate, so every record is read.
 6. Layout.  M is the identity before s_1 and shifts by the accumulated
    length change after each region; the code's data tail (switch tables)
    moves with the last instruction.  A relative call without a relocation
@@ -79,7 +83,8 @@ Checks (each is a refusal):
    state never do):
    a. ESP is equal;
    b. every register with an atom live at the exit in D or in I is equal;
-   c. every flag live at the exit in D or in I is equal;
+   c. every flag live at the exit in D or in I is equal (ZF compared by its
+      exact normal form, see `region_simulation.canonical_flag`);
    d. the two store sequences are equal up to reordering provably disjoint
       stores (pushes included);
    e. the two memory footprints (address and width of every access) are
@@ -90,10 +95,59 @@ Checks (each is a refusal):
       two programs really share; a register both versions leave exactly at
       its entry value needs only its exit-live atoms live at the entry.
 9. Pins.  The image digest and length, the per-region length change, the
-   branch re-encodings, relocation reseats, addend repairs, path counts and
-   the derived donor's procedure range are all pinned by the declaration and
-   re-measured here, and the derived donor object is re-parsed and checked
-   before the same-slot delegate installs it.
+   branch re-encodings, relocation reseats, addend repairs, path counts, the
+   bijection's rewritten bytes and changes of mapping, and the derived
+   donor's procedure range are all pinned by the declaration and re-measured
+   here, and the derived donor object is re-parsed and checked before the
+   same-slot delegate installs it.
+
+10. Scope bijection (optional).  A record may declare a register
+    permutation sigma (fixing ESP; naming EBP only with the frame-pointer-free
+    proof of `register_reencoding`: an FPO record with FRAME_FPO and no SEH,
+    and no instruction deriving EBP from ESP) and scopes, disjoint ranges of
+    D's instruction boundaries.  A point p outside every region interior is
+    *mapped* when it lies in a scope.
+
+    a. Every instruction outside the regions at a mapped point is rewritten
+       field by field under sigma (a byte field stays within AL..BL/AH..BH),
+       and may touch a support register only through such a field: an
+       implicit operand (a call's arguments or clobbers, a return's live set,
+       a frozen sub-register or string operand) is refused.  The re-decoded
+       image instruction keeps length, opcode (the register bits of an
+       opcode-register form aside), flow and mapped target; its register
+       reads and writes are sigma's image of the donor's, its atoms on every
+       other register are the donor's, and it touches no support register
+       implicitly either.
+    b. On every CFG edge from an instruction outside the regions whose two
+       ends differ in mapping, and at every entry (the function's, an
+       external entry, a relocated in-body target) that is mapped, every
+       support register is dead in D and in I, at atom and at register
+       granularity.
+    c. Check 8 runs with the replacement started from the renamed entry
+       state (its sigma(r) holds D's entry r when the region's start is
+       mapped) and compares D's r with I's sigma(r) at the exit when the end
+       is mapped.
+
+    The invariant at a mapped point p is: memory, ESP and the live flags are
+    equal; every register sigma leaves alone agrees atom by atom on the
+    union of the two atom live sets; and I's sigma(r) equals D's r in all 32
+    bits for every support register r that D has live, or whose image I has
+    live, at *register* granularity (a write narrower than 32 bits counts as
+    a read, so a partial write never re-establishes a whole register).  A
+    rewritten instruction preserves it because it computes the same function
+    of sigma-renamed inputs into sigma-renamed outputs (10a); a region
+    preserves it by check 8 under the renaming (8f then asks that a support
+    register read at a mapped entry be live there at register granularity);
+    and at a change of mapping both correspondences agree because no support
+    register is live (10b).  Outside every scope the invariant is the
+    unmapped one above.
+
+Calls.  A direct call to a symbol whose MSVC C decoration is ``_name`` or
+``_name@N`` (or that thunk's ``__imp_`` slot) reads no general register: only
+``__fastcall`` and C++ member functions take register arguments.  Compiler
+and runtime helpers (an identifier that itself starts with an underscore) and
+every other callee keep the decoder's EAX/ECX/EDX reads.  This is the same
+callee model as above: a callee honours the convention its decoration names.
 
 Line rows inside a region interior are carried to the replacement's first
 byte: rows are debug metadata only, and the count is kept.
@@ -150,17 +204,23 @@ from .debug import (
 from .foundation import require_payload_free_declaration, sha256_bytes
 from .region_simulation import (
     FLAG_NAMES,
+    canonical_flag,
     contradictory,
     lin_atom,
     simulate_region,
     stores_equivalent,
     term_atoms,
 )
+from .register_reencoding import require_frame_pointer_free_frame
 from .register_semantics import (
     _IA32_ATOMS_OF,
+    _IA32_REGISTER_NUMBERS,
     IA32_GENERAL_REGISTER_NAMES,
+    _bijection_form_for,
+    _ia32_backward_liveness,
     _register_bijection_live_sets,
     decode_ia32_bijection_body,
+    ia32_register_atoms,
 )
 from .relational import (
     ia32_relational_flag_liveness,
@@ -198,6 +258,311 @@ def _region_refusals(ordinal: int) -> Iterator[None]:
         raise
     except ByteIdentityError as exc:
         raise RegionRefusal(str(exc), ordinal) from exc
+
+
+_BYTE_REGISTERS = frozenset({"eax", "ecx", "edx", "ebx"})
+_CALL_CLOBBERED = frozenset({"eax", "ecx", "edx"})
+_C_IDENTIFIER = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
+
+
+class ScopeBoundRefusal(ByteIdentityError):
+    """A refusal of check 10b: ``offset`` is a scope bound where a support register is live."""
+
+    def __init__(self, message: str, offset: int) -> None:
+        super().__init__(message)
+        self.offset = offset
+
+
+def register_free_callee(symbol: object) -> bool:
+    """Whether a callee's MSVC C decoration says it takes no argument in a register.
+
+    MSVC decorates a C ``__cdecl`` function ``_name`` and a ``__stdcall`` one
+    ``_name@N``; only ``__fastcall`` (``@name@N``) and C++ member functions
+    (``?...``) receive arguments in registers, and the import thunk of either C
+    form is ``__imp_`` before it.  A name whose identifier itself starts with
+    an underscore (``__chkstk``, ``__aullshr``, ``__ftol``) is a compiler or
+    runtime helper with its own register convention and is not admitted.
+    """
+    if not isinstance(symbol, str):
+        return False
+    name = symbol[len("__imp_") :] if symbol.startswith("__imp_") else symbol
+    if not name.startswith("_") or name.startswith("__"):
+        return False
+    core = name[1:]
+    if "@" in core:
+        core, _at, size = core.rpartition("@")
+        if not size.isdigit() or "@" in core:
+            return False
+    return bool(core) and not core.startswith("_") and set(core) <= _C_IDENTIFIER
+
+
+def refine_call_reads(
+    instructions: list[dict[str, Any]], relocations: dict[int, Any]
+) -> list[dict[str, Any]]:
+    """The decoded body with a register-free direct call reading no caller-saved register.
+
+    The decoder lets every call to an undecorated or C callee read EAX, ECX
+    and EDX, since it cannot tell a register argument from none.  A direct
+    ``call rel32`` or ``call [abs32]`` whose relocated callee
+    :func:`register_free_callee` admits reads only the stack; it still
+    clobbers the three registers.
+    """
+    refined = []
+    for item in instructions:
+        if item["flow"] == "call" and not (item["reads"] & {"ebx", "esi", "edi", "ebp"}):
+            field = item["offset"] + item["length"] - 4
+            row = relocations.get(field)
+            memory = item["memory"]
+            direct = memory is None or (
+                memory["absolute"] and memory["base"] is None and memory["index"] is None
+            )
+            if (
+                direct
+                and row is not None
+                and row.get("width") == 4
+                and register_free_callee(row.get("target"))
+            ):
+                item = {
+                    **item,
+                    "reads": frozenset(item["reads"] - _CALL_CLOBBERED),
+                    "read_atoms": frozenset(
+                        item["read_atoms"] - ia32_register_atoms(_CALL_CLOBBERED)
+                    ),
+                }
+        refined.append(item)
+    return refined
+
+
+def _validate_bijection(
+    value: object,
+    boundaries: set[int],
+    limit: int,
+    frame_pointer_free: bool,
+    context: str,
+) -> tuple[dict[str, str], list[tuple[int, int]]]:
+    """The declared scope bijection: a register permutation and the ranges it rules."""
+    require_payload_free_declaration(value, f"{context} bijection declaration")
+    require(
+        isinstance(value, dict) and set(value) == {"mapping", "scopes"},
+        f"{context}: the bijection names an unknown or missing field",
+    )
+    item = cast(dict[str, Any], value)
+    mapping = item["mapping"]
+    require(
+        isinstance(mapping, dict)
+        and bool(mapping)
+        and all(
+            isinstance(key, str) and isinstance(target, str) for key, target in mapping.items()
+        ),
+        f"{context}: the bijection mapping is not a register map",
+    )
+    mapping = cast(dict[str, str], mapping)
+    require(
+        set(mapping) <= set(_IA32_REGISTER_NUMBERS)
+        and set(mapping.values()) == set(mapping)
+        and len(set(mapping.values())) == len(mapping)
+        and all(source != target for source, target in mapping.items()),
+        f"{context}: the bijection mapping is not a fixed-point-free permutation of one "
+        "register set",
+    )
+    require(
+        "esp" not in mapping,
+        f"{context}: the bijection names ESP, whose encodings carry ModRM/SIB structure",
+    )
+    require(
+        frame_pointer_free or "ebp" not in mapping,
+        f"{context}: the bijection names EBP without a frame-pointer-free proof for this body",
+    )
+    scopes = item["scopes"]
+    require(
+        isinstance(scopes, list)
+        and bool(scopes)
+        and all(
+            isinstance(pair, list) and len(pair) == 2 and all(type(bound) is int for bound in pair)
+            for pair in scopes
+        ),
+        f"{context}: the bijection scopes are not a list of ranges",
+    )
+    ranges = [(int(pair[0]), int(pair[1])) for pair in cast(list[list[int]], scopes)]
+    for start, end in ranges:
+        require(
+            0 <= start < end <= limit
+            and start in boundaries
+            and (end in boundaries or end == limit),
+            f"{context}: the bijection scope [{start}, {end}) is not on instruction boundaries "
+            "of the code",
+        )
+    for (_left_start, left_end), (right_start, _right_end) in itertools.pairwise(ranges):
+        require(
+            left_end < right_start,
+            f"{context}: the bijection scopes are unsorted, overlapping or adjacent",
+        )
+    return dict(mapping), ranges
+
+
+def _field_registers(code: bytes, item: dict[str, Any]) -> set[str]:
+    """The general registers an instruction names through a rewritable field."""
+    names = IA32_GENERAL_REGISTER_NAMES
+    found = {names[code[at] >> shift & 7] for at, shift in item["fields"]}
+    found |= {names[code[at] >> shift & 3] for at, shift in item.get("byte_fields", ())}
+    return found
+
+
+def _touched_registers(item: dict[str, Any]) -> set[str]:
+    """Every general register an instruction reads or writes, at any width."""
+    atoms = set(item["read_atoms"]) | set(item["write_atoms"])
+    return set(item["reads"]) | set(item["writes"]) | {atom.split(".")[0] for atom in atoms}
+
+
+def _implicit_support(code: bytes, item: dict[str, Any], support: set[str]) -> list[str]:
+    """Support registers the instruction touches other than through a rewritable field."""
+    frozen = set(item.get("frozen", frozenset())) - set(item.get("byte_frozen", frozenset()))
+    implicit = (_touched_registers(item) - _field_registers(code, item)) | frozen
+    return sorted(implicit & support)
+
+
+def _sigma_rewrite(
+    image: bytearray,
+    item: dict[str, Any],
+    mapping: dict[str, str],
+    relocated_fields: set[int],
+    context: str,
+) -> list[int]:
+    """Rewrite one instruction's register fields under ``mapping``; the changed offsets.
+
+    The instruction must name every support register it touches through a
+    rewritable field: an implicit operand (a call's clobbers or arguments, a
+    return's live set, a frozen sub-register or string operand) would keep
+    its register while the value moved, so it is refused.  A byte field may
+    only move within AL..BL / AH..BH.
+    """
+    support = set(mapping)
+    numbers = {
+        _IA32_REGISTER_NUMBERS[key]: _IA32_REGISTER_NUMBERS[value] for key, value in mapping.items()
+    }
+    at = item["offset"]
+    implicit = _implicit_support(bytes(image), item, support)
+    require(
+        not implicit,
+        f"{context}: the instruction at {at} touches {implicit} other than through a field the "
+        "bijection can rewrite",
+    )
+    stranded = sorted(
+        name
+        for name in support
+        if any(
+            IA32_GENERAL_REGISTER_NAMES[image[byte] >> shift & 3] == name
+            for byte, shift in item.get("byte_fields", ())
+        )
+        and (name not in _BYTE_REGISTERS or mapping[name] not in _BYTE_REGISTERS)
+    )
+    require(
+        not stranded,
+        f"{context}: {stranded} is named by a byte field at {at} that the bijection would move off "
+        "a byte register",
+    )
+    changed = []
+    for byte, shift in item["fields"]:
+        value = image[byte] >> shift & 7
+        if value not in numbers:
+            continue
+        require(
+            byte not in relocated_fields,
+            f"{context}: a rewritten register field at {byte} overlaps a relocation",
+        )
+        image[byte] = (image[byte] & ~(7 << shift) | numbers[value] << shift) & 0xFF
+        changed.append(byte)
+    for byte, shift in item.get("byte_fields", ()):
+        value = image[byte] >> shift & 7
+        if value & 3 not in numbers:
+            continue
+        require(
+            byte not in relocated_fields,
+            f"{context}: a rewritten register field at {byte} overlaps a relocation",
+        )
+        image[byte] = (
+            image[byte] & ~(7 << shift) | (numbers[value & 3] | value & 4) << shift
+        ) & 0xFF
+        changed.append(byte)
+    return sorted(set(changed))
+
+
+def _require_sigma_image(
+    item: dict[str, Any],
+    image_bytes: bytes,
+    other: dict[str, Any],
+    mapping: dict[str, str],
+    context: str,
+) -> None:
+    """The re-decoded image instruction is exactly the bijection's image of the donor's."""
+    support = set(mapping)
+
+    def image_of(names: Any) -> frozenset[str]:
+        return frozenset(mapping.get(name, name) for name in names)
+
+    def split(atoms: Any) -> tuple[frozenset[str], frozenset[str]]:
+        plain = frozenset(atom for atom in atoms if atom.split(".")[0] not in support)
+        mapped = frozenset(atom.split(".")[0] for atom in atoms if atom.split(".")[0] in support)
+        return plain, mapped
+
+    at = item["offset"]
+    require(
+        other["reads"] == image_of(item["reads"]) and other["writes"] == image_of(item["writes"]),
+        f"{context}: the image's operand set at donor {at} is not the bijection's image",
+    )
+    for key in ("read_atoms", "write_atoms"):
+        plain, mapped = split(item[key])
+        other_plain, other_mapped = split(other[key])
+        require(
+            other_plain == plain and other_mapped == image_of(mapped),
+            f"{context}: the image's {key.replace('_', ' ')} at donor {at} are not the "
+            "bijection's image",
+        )
+    implicit = _implicit_support(image_bytes, other, support)
+    require(
+        not implicit,
+        f"{context}: the image instruction for donor {at} touches {implicit} implicitly",
+    )
+
+
+def _register_level_live(
+    instructions: list[dict[str, Any]], successors: list[list[int]], context: str
+) -> list[frozenset[str]]:
+    """Whole-register liveness: a write narrower than 32 bits is a read and never a kill.
+
+    The decoder's ``reads``/``writes`` sets are exactly this view for every
+    register an instruction names through a field, which is every support
+    register an in-scope instruction may touch.
+    """
+    view = [
+        {"read_atoms": frozenset(item["reads"]), "write_atoms": frozenset(item["writes"])}
+        for item in instructions
+    ]
+    return _ia32_backward_liveness(view, successors, context)
+
+
+def _cover(
+    name: str,
+    sigma: dict[str, str],
+    live: tuple[frozenset[str], frozenset[str], frozenset[str], frozenset[str]],
+) -> frozenset[str]:
+    """The atoms of donor register ``name`` the two states agree on at one point.
+
+    ``live`` is (donor atoms, image atoms, donor registers, image registers)
+    live at the point.  Outside a scope, or for a register the bijection does
+    not move, the states agree atom by atom on the union of the two atom live
+    sets.  Inside a scope a moved register is compared whole: the image's
+    ``sigma(name)`` equals the donor's ``name`` in all 32 bits whenever the
+    donor has ``name`` or the image has ``sigma(name)`` live at register
+    granularity, and nothing is known otherwise.
+    """
+    donor_atoms, image_atoms, donor_registers, image_registers = live
+    atoms = _IA32_ATOMS_OF[name]
+    if name in sigma:
+        if name in donor_registers or sigma[name] in image_registers:
+            return atoms
+        return frozenset()
+    return atoms & (donor_atoms | image_atoms)
 
 
 def _hex_instruction(text: object, context: str) -> bytes:
@@ -298,6 +663,8 @@ def apply_region_resize(
     external_entries: frozenset[int] = frozenset(),
     protected_offsets: frozenset[int] = frozenset(),
     prologue_length: int = 0,
+    bijection: object = None,
+    frame_pointer_free: bool = False,
 ) -> tuple[bytes, dict[str, Any]]:
     """Install each declared replacement, relay the body out, and prove it (checks 1-8).
 
@@ -306,8 +673,10 @@ def apply_region_resize(
     procedure (before MSVC 5.0's alignment fill; the body's length when
     None).  ``protected_offsets`` are offsets other records name (section
     symbols, the CodeView procedure range, closure-child references), none of
-    which may lie in a region interior.  Returns the unpadded image (code and
-    tail) and the proof; the caller pads it.
+    which may lie in a region interior.  ``bijection``, when given, is the
+    declared scope bijection of check 10; ``frame_pointer_free`` states that
+    the caller proved EBP is not this body's frame pointer.  Returns the
+    unpadded image (code and tail) and the proof; the caller pads it.
     """
     body = bytes(body)
     require(bool(body), f"{context}: body is empty")
@@ -330,8 +699,9 @@ def apply_region_resize(
     relocation_view = relocation_symbol_map(rows)
     decode_view = None if limit == len(body) else limit
     donor_body = body[:proc]
-    instructions = decode_ia32_bijection_body(
-        body, f"{context} donor", relocation_view, decode_view
+    instructions = refine_call_reads(
+        decode_ia32_bijection_body(body, f"{context} donor", relocation_view, decode_view),
+        relocation_view,
     )
     index_of = {item["offset"]: index for index, item in enumerate(instructions)}
     for item in instructions:
@@ -408,11 +778,13 @@ def apply_region_resize(
                     f"{region_context}: the relocation at {row['offset']} is not an external "
                     "DIR32 field",
                 )
-            # Check 5: the order-preserving bijection of relocated fields.
+            # Check 5: a bijection of relocated fields, each keeping its record.
             pairs = region["relocations"]
             require(
-                [donor for _local, donor in pairs] == [row["offset"] for row in region_rows],
-                f"{region_context}: the replacement's relocations are not the region's, in order",
+                sorted(donor for _local, donor in pairs)
+                == sorted(row["offset"] for row in region_rows)
+                and len({donor for _local, donor in pairs}) == len(pairs),
+                f"{region_context}: the replacement's relocations are not the region's, each once",
             )
             locals_ = [local for local, _donor in pairs]
             require(
@@ -422,6 +794,27 @@ def apply_region_resize(
                 "range",
             )
             region["rows"] = region_rows
+    # Check 10a: the scope bijection's declaration and its rewrite.
+    sigma: dict[str, str] = {}
+    scopes: list[tuple[int, int]] = []
+    if bijection is not None:
+        sigma, scopes = _validate_bijection(
+            bijection, set(index_of), limit, frame_pointer_free, f"{context} bijection"
+        )
+
+    def scoped(offset: int) -> bool:
+        return any(left <= offset < right for left, right in scopes)
+
+    def outside_regions(offset: int) -> bool:
+        return not any(region["start"] <= offset < region["end"] for region in declared)
+
+    base = bytearray(donor_body)
+    sigma_bytes: set[int] = set()
+    for item in instructions:
+        if outside_regions(item["offset"]) and scoped(item["offset"]):
+            sigma_bytes |= set(
+                _sigma_rewrite(base, item, sigma, relocated_fields, f"{context} bijection")
+            )
     # Check 6: the layout.
     shifts: list[tuple[int, int, int]] = []
     delta = 0
@@ -445,10 +838,10 @@ def apply_region_resize(
     pieces: list[bytes] = []
     cursor = 0
     for region in declared:
-        pieces.append(donor_body[cursor : region["start"]])
+        pieces.append(bytes(base[cursor : region["start"]]))
         pieces.append(region["replacement"])
         cursor = region["end"]
-    pieces.append(donor_body[cursor:])
+    pieces.append(bytes(base[cursor:]))
     image = bytearray(b"".join(pieces))
     image_limit = mapped(limit)
     image_proc = mapped(proc)
@@ -525,11 +918,14 @@ def apply_region_resize(
             addend_repairs.append([at, addend, new_addend])
     image_bytes = bytes(image)
     # Check 4: the image re-decodes on the layout's boundaries.
-    image_instructions = decode_ia32_bijection_body(
-        image_bytes,
-        f"{context} image",
+    image_instructions = refine_call_reads(
+        decode_ia32_bijection_body(
+            image_bytes,
+            f"{context} image",
+            image_view,
+            None if image_limit == len(image_bytes) else image_limit,
+        ),
         image_view,
-        None if image_limit == len(image_bytes) else image_limit,
     )
     image_index = {item["offset"]: index for index, item in enumerate(image_instructions)}
     for region in declared:
@@ -554,9 +950,15 @@ def apply_region_resize(
             f"{context}: the instruction at {item['offset']} did not land where M says",
         )
         other = image_instructions[image_index[new_at]]
+        form = _bijection_form_for(item["opcode"])
+        opcode_mask = (
+            0xF8
+            if scoped(item["offset"]) and form is not None and form["opreg"] is not None
+            else 0xFFFF
+        )
         require(
             other["length"] == item["length"]
-            and other["opcode"] == item["opcode"]
+            and other["opcode"] & opcode_mask == item["opcode"] & opcode_mask
             and other["flow"] == item["flow"]
             and other["indirect"] == item["indirect"]
             and other["target"] == (None if item["target"] is None else mapped(item["target"])),
@@ -564,8 +966,14 @@ def apply_region_resize(
         )
         raw = body[item["offset"] : item["offset"] + item["length"]]
         new_raw = image_bytes[new_at : new_at + item["length"]]
+        if scoped(item["offset"]):
+            _require_sigma_image(item, image_bytes, other, sigma, f"{context} bijection")
         if raw != new_raw:
-            allowed = set()
+            allowed = {
+                at - item["offset"]
+                for at in sigma_bytes
+                if item["offset"] <= at < item["offset"] + item["length"]
+            }
             if new_at in branch_repairs:
                 width = _branch_width(body, item, context)
                 allowed |= set(range(item["length"] - width, item["length"]))
@@ -589,8 +997,69 @@ def apply_region_resize(
         f"{context}: the image changed the data tail outside an addend repair",
     )
     # Check 7: liveness on both bodies.
-    donor_live, _ = _register_bijection_live_sets(instructions, f"{context} donor liveness")
-    image_live, _ = _register_bijection_live_sets(image_instructions, f"{context} image liveness")
+    donor_live, donor_successors = _register_bijection_live_sets(
+        instructions, f"{context} donor liveness"
+    )
+    image_live, image_register_successors = _register_bijection_live_sets(
+        image_instructions, f"{context} image liveness"
+    )
+    donor_registers_live = _register_level_live(
+        instructions, donor_successors, f"{context} donor register liveness"
+    )
+    image_registers_live = _register_level_live(
+        image_instructions, image_register_successors, f"{context} image register liveness"
+    )
+
+    def live_at(
+        offset: int,
+    ) -> tuple[frozenset[str], frozenset[str], frozenset[str], frozenset[str]]:
+        """Donor and image liveness at a donor point outside every region interior."""
+        donor_index, image_at = index_of[offset], image_index[mapped(offset)]
+        return (
+            donor_live[donor_index],
+            image_live[image_at],
+            donor_registers_live[donor_index],
+            image_registers_live[image_at],
+        )
+
+    # Check 10b: the correspondence changes only where every support register
+    # is dead in both versions, at atom and at register granularity.
+    mode_changes: set[int] = set()
+    if sigma:
+        support = set(sigma)
+        support_atoms = ia32_register_atoms(support)
+
+        def require_dead(offset: int, why: str) -> None:
+            donor_atoms, image_atoms, donor_registers, image_registers = live_at(offset)
+            live_support = sorted(
+                (support & (donor_registers | image_registers))
+                | {atom.split(".")[0] for atom in support_atoms & (donor_atoms | image_atoms)}
+            )
+            if live_support:
+                raise ScopeBoundRefusal(
+                    f"{context} bijection: {live_support} is live at {offset}, where {why}", offset
+                )
+
+        for index, item in enumerate(instructions):
+            if not outside_regions(item["offset"]):
+                continue
+            for edge in donor_successors[index]:
+                target = instructions[edge]["offset"]
+                if scoped(item["offset"]) != scoped(target):
+                    require_dead(target, f"the edge from {item['offset']} crosses a scope bound")
+                    mode_changes.add(target)
+        for offset in sorted({0} | entry_offsets | set(internal_targets)):
+            if offset < limit and scoped(offset):
+                require(
+                    offset in index_of,
+                    f"{context} bijection: the entry {offset} is not an instruction boundary",
+                )
+                require_dead(offset, "control may enter the scope from outside the body's flow")
+        require(
+            bool(sigma_bytes)
+            or any(scoped(region["start"]) or scoped(region["end"]) for region in declared),
+            f"{context} bijection: the bijection rewrites nothing and rules no region bound",
+        )
     donor_flag_live = ia32_relational_flag_liveness(items, successors, f"{context} donor flags")
     donor_item_index = {item["offset"]: index for index, item in enumerate(items)}
     image_items, image_successors, _image_entries = ia32_relational_flow_walk(
@@ -620,6 +1089,8 @@ def apply_region_resize(
                 "donor",
                 f"{region_context} donor",
             )
+            entry_sigma = sigma if scoped(start) else {}
+            exit_sigma = sigma if scoped(end) else {}
             image_paths = simulate_region(
                 region["replacement"],
                 0,
@@ -627,9 +1098,23 @@ def apply_region_resize(
                 region_maps[ordinal],
                 "replacement",
                 f"{region_context} replacement",
+                entry_names={
+                    entry_sigma.get(name, name): name for name in IA32_GENERAL_REGISTER_NAMES
+                },
             )
-            exit_atoms = donor_live[index_of[end]] | image_live[image_index[image_end]]
-            entry_atoms = donor_live[index_of[start]] | image_live[image_index[image_start]]
+            entry_live = live_at(start)
+            exit_live = live_at(end)
+
+            def entry_cover(
+                name: str, sigma_in: dict[str, str] = entry_sigma, live: Any = entry_live
+            ) -> frozenset[str]:
+                return _cover(name, sigma_in, live)
+
+            def exit_cover(
+                name: str, sigma_out: dict[str, str] = exit_sigma, live: Any = exit_live
+            ) -> frozenset[str]:
+                return _cover(name, sigma_out, live)
+
             exit_flags = (
                 donor_flag_live[donor_item_index[end]]
                 | image_flag_live[image_item_index[image_end]]
@@ -639,9 +1124,7 @@ def apply_region_resize(
                 | image_flag_live[image_item_index[image_start]]
             )
             compared_registers = sorted(
-                name
-                for name in IA32_GENERAL_REGISTER_NAMES
-                if name != "esp" and _IA32_ATOMS_OF[name] & exit_atoms
+                name for name in IA32_GENERAL_REGISTER_NAMES if name != "esp" and exit_cover(name)
             )
             compared_flags = sorted(name for name in FLAG_NAMES if name in exit_flags)
             pairs = 0
@@ -658,13 +1141,19 @@ def apply_region_resize(
                     )
                     for name in compared_registers:
                         require(
-                            left.regs[name] == right.regs[name],
+                            left.regs[name] == right.regs[exit_sigma.get(name, name)],
                             f"{region_context}: {name} is live at the exit and the two versions "
-                            "leave it different",
+                            "leave it different"
+                            + (
+                                f" (the replacement's {exit_sigma[name]})"
+                                if name in exit_sigma
+                                else ""
+                            ),
                         )
                     for name in compared_flags:
                         require(
-                            left.flags[name] == right.flags[name],
+                            canonical_flag(name, left.flags[name])
+                            == canonical_flag(name, right.flags[name]),
                             f"{region_context}: the flag {name} is live at the exit and the two "
                             "versions leave it different",
                         )
@@ -677,14 +1166,15 @@ def apply_region_resize(
                         left.footprint == right.footprint,
                         f"{region_context}: the two versions access different memory",
                     )
-                    for path in (left, right):
+                    for path, names in ((left, {}), (right, exit_sigma)):
                         for name in ["esp", *compared_registers]:
-                            if name != "esp" and path.regs[name] == lin_atom(("reg0", name)):
+                            value = path.regs[names.get(name, name)]
+                            if name != "esp" and value == lin_atom(("reg0", name)):
                                 # A register both versions leave at its entry
                                 # value needs only its exit-live atoms shared.
                                 passed_through.add(name)
                                 continue
-                            term_atoms(path.regs[name], mentioned)
+                            term_atoms(value, mentioned)
                         for name in compared_flags:
                             term_atoms(path.flags[name], mentioned)
                         term_atoms(path.stores, mentioned)
@@ -692,7 +1182,7 @@ def apply_region_resize(
                         term_atoms(path.conditions, mentioned)
             require(pairs > 0, f"{region_context}: no pair of paths is consistent")
             for name in sorted(passed_through):
-                missing = (_IA32_ATOMS_OF[name] & exit_atoms) - entry_atoms
+                missing = exit_cover(name) - entry_cover(name)
                 require(
                     not missing,
                     f"{region_context}: {name} passes through the region but {sorted(missing)} is "
@@ -702,7 +1192,7 @@ def apply_region_resize(
                 if kind == "reg0":
                     if name == "esp":
                         continue
-                    missing = _IA32_ATOMS_OF[name] - entry_atoms
+                    missing = _IA32_ATOMS_OF[name] - entry_cover(name)
                     require(
                         not missing,
                         f"{region_context}: the entry value of {name} is read but "
@@ -714,27 +1204,29 @@ def apply_region_resize(
                         f"{region_context}: the entry flag {name} is read but dead at the region "
                         "entry",
                     )
-            proved.append(
-                {
-                    "region_start": start,
-                    "region_end": end,
-                    "image_start": image_start,
-                    "image_end": image_end,
-                    "growth": region["growth"],
-                    "donor_paths": len(donor_paths),
-                    "replacement_paths": len(image_paths),
-                    "path_pairs": pairs,
-                    "compared_registers": compared_registers,
-                    "compared_flags": compared_flags,
-                }
-            )
+            record = {
+                "region_start": start,
+                "region_end": end,
+                "image_start": image_start,
+                "image_end": image_end,
+                "growth": region["growth"],
+                "donor_paths": len(donor_paths),
+                "replacement_paths": len(image_paths),
+                "path_pairs": pairs,
+                "compared_registers": compared_registers,
+                "compared_flags": compared_flags,
+            }
+            if sigma:
+                record["entry_mapped"] = bool(entry_sigma)
+                record["exit_mapped"] = bool(exit_sigma)
+            proved.append(record)
     offset_map: dict[int, int] = {}
     for item in instructions:
         if not any(region["start"] < item["offset"] < region["end"] for region in declared):
             offset_map[item["offset"]] = mapped(item["offset"])
     for offset in range(limit, len(body) + 1):
         offset_map[offset] = offset + delta
-    return image_bytes, {
+    proof: dict[str, Any] = {
         "kind": REGION_RESIZE_KIND,
         "regions": proved,
         "growth": delta,
@@ -751,6 +1243,10 @@ def apply_region_resize(
             [region["start"], region["end"], region["image_start"]] for region in declared
         ],
     }
+    if sigma:
+        proof["bijection_rewrites"] = sorted(mapped(at) for at in sigma_bytes)
+        proof["bijection_mode_changes"] = sorted(mapped(at) for at in mode_changes)
+    return image_bytes, proof
 
 
 def _padded_length(proc_size: int, fill_alignment: int) -> int:
@@ -1059,8 +1555,18 @@ def produce_region_resize_rewriting_candidate(
             "expected_procedure_range",
             "expected_carried_code_symbols",
             "expected_collapsed_line_rows",
+            "bijection",
+            "expected_bijection_rewrites",
+            "expected_bijection_mode_changes",
         },
         "region-resize declaration names an unknown field",
+    )
+    bijection = spec.get("bijection")
+    require(
+        (bijection is None)
+        == ("expected_bijection_rewrites" not in spec)
+        == ("expected_bijection_mode_changes" not in spec),
+        "region-resize bijection and its pins are declared together or not at all",
     )
     donor_rows = detailed_relocations(donor, dp)
     internal_targets = internal_relocation_targets(donor_rows, dp["number"])
@@ -1088,6 +1594,21 @@ def produce_region_resize_rewriting_candidate(
         )
         require(fpo["cbProcSize"] == proc_size, "region-resize FPO procedure size differs")
         prologue = fpo["cbProlog"]
+    frame_pointer_free = False
+    if isinstance(bijection, dict) and "ebp" in (bijection.get("mapping") or {}):
+        require_frame_pointer_free_frame(
+            donor,
+            dp,
+            donor_body,
+            decode_ia32_bijection_body(
+                donor_body,
+                "region-resize frame proof",
+                relocation_symbol_map(donor_rows),
+                spec.get("expected_code_length"),
+            ),
+            "region-resize frame proof",
+        )
+        frame_pointer_free = True
     image, proof = apply_region_resize(
         donor_body,
         spec["regions"],
@@ -1099,7 +1620,15 @@ def produce_region_resize_rewriting_candidate(
         external_entries=frozenset(external_entries),
         protected_offsets=protected_code_offsets(donor, dp, "region-resize"),
         prologue_length=prologue,
+        bijection=bijection,
+        frame_pointer_free=frame_pointer_free,
     )
+    if bijection is not None:
+        require(
+            proof["bijection_rewrites"] == spec["expected_bijection_rewrites"]
+            and proof["bijection_mode_changes"] == spec["expected_bijection_mode_changes"],
+            "region-resize bijection differs from its declaration",
+        )
     padded = _padded_length(proof["image_proc_size"], fill_alignment)
     image = image + bytes([MSVC50_FUNCTION_FILL_BYTE]) * (padded - len(image))
     require(
@@ -1161,6 +1690,18 @@ def produce_region_resize_rewriting_candidate(
         REGION_RESIZE_CLASS,
         {
             "region_resize": proof["regions"],
+            **(
+                {}
+                if bijection is None
+                else {
+                    "bijection": {
+                        "mapping": bijection["mapping"],
+                        "scopes": bijection["scopes"],
+                        "rewrites": proof["bijection_rewrites"],
+                        "mode_changes": proof["bijection_mode_changes"],
+                    }
+                }
+            ),
             "growth": proof["growth"],
             "branch_repairs": proof["branch_repairs"],
             "relocation_reseat": proof["relocation_reseat"],
@@ -1177,8 +1718,11 @@ def produce_region_resize_rewriting_candidate(
 __all__ = [
     "REGION_RESIZE_CLASS",
     "REGION_RESIZE_KIND",
+    "ScopeBoundRefusal",
     "apply_region_resize",
     "produce_region_resize_rewriting_candidate",
     "protected_code_offsets",
+    "refine_call_reads",
+    "register_free_callee",
     "resized_donor_object",
 ]

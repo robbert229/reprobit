@@ -147,6 +147,16 @@ assumes two different pointers are disjoint, so a reload past a store through
 another pointer is refused: that difference is a source difference (one
 version caches a member in a local) that no binary proof can settle.
 
+When no plain replacement proves, the search is repeated under a register
+permutation: the donor's and reference's instructions are aligned with their
+register fields masked, the permutations of up to six differing registers
+are scored by how many aligned instructions they reconcile, and for each of
+the best six the scopes are the groups of instructions joined by edges into
+points where a moved register is live, taken when the permutation explains
+more of a group's instructions than it breaks. A scope bound the image's own
+liveness refuses is marked live and the scopes chosen again. Relocated
+fields pair with the reference's by target symbol, not by order.
+
 Each candidate is compiled through the project's locked compiler graph. A
 candidate can be saved as local progress only after a separate build from
 scratch proves the function and required logic checks. It is exact only when

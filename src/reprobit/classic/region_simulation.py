@@ -55,6 +55,10 @@ values on every execution that reaches them from the same entry state):
   ``cmp r, 0; je`` both read ``eqz(r)``.  Every other condition is a raw atom
   over the exact flag terms it reads.  An atom decided by constants does not
   fork the path.
+- A region proved under a register bijection starts the replacement from a
+  renamed entry state (:func:`entry_state`): its register ``x`` holds the
+  donor's entry atom ``("reg0", sigma^-1(x))``, so the two versions' terms
+  are written over one set of entry atoms.
 
 Every instruction outside the closed set below is refused, as is any
 relocated field the simulator does not consume as a displacement or
@@ -339,6 +343,25 @@ def condition(code: int, flags: Mapping[str, Term]) -> tuple[Term, bool] | bool:
     return (atom, value != inverted)
 
 
+def canonical_flag(name: str, term: Term) -> Term:
+    """A flag's value as a canonical term, for comparing two versions' exit flags.
+
+    ZF is the only flag given a semantic normal form: after ``sub``/``cmp``
+    of ``a`` and ``b`` it is ``a == b`` (an equality, symmetric in its
+    operands), after a logical operation it is ``result == 0``, and the two
+    meet (``cmp r, 0`` and ``test r, r``).  Both forms are exact functions of
+    the operands, so equal canonical terms denote equal flags.  Every other
+    flag, and ZF of any other producer, is its exact producer term.
+    """
+    if name == "zf" and term[0] == "flag" and term[1] == "zf":
+        kind, width = term[2], term[3]
+        if kind == "sub":
+            return ("zf=", _eq(width, term[4], term[5]))
+        if kind == "logic":
+            return ("zf=", _eqz(width, term[5]))
+    return term
+
+
 # --- execution state ------------------------------------------------------------
 
 
@@ -376,9 +399,24 @@ class PathResult:
     relocations_read: frozenset[int]
 
 
-def entry_state() -> PathState:
+def entry_state(entry_names: Mapping[str, str] | None = None) -> PathState:
+    """The symbolic entry state; ``entry_names`` renames which entry value a register holds.
+
+    By default register ``r`` holds the atom ``("reg0", r)``.  Under a
+    register bijection the replacement's register ``x`` holds the value the
+    donor keeps in ``entry_names[x]``, so both versions start from one set of
+    entry atoms named in the donor's registers.
+    """
+    names = dict(entry_names or {})
+    require(
+        set(names) <= set(_REGS)
+        and set(names.values()) <= set(_REGS)
+        and sorted(names) == sorted(names.values())
+        and names.get("esp", "esp") == "esp",
+        "a region entry renaming is not a permutation of the general registers fixing ESP",
+    )
     return PathState(
-        {name: lin_atom(("reg0", name)) for name in _REGS},
+        {name: lin_atom(("reg0", names.get(name, name))) for name in _REGS},
         {name: ("flag0", name) for name in FLAG_NAMES},
     )
 
@@ -964,20 +1002,22 @@ def simulate_region(
     relocations: Mapping[int, str],
     tag: str,
     context: str,
+    entry_names: Mapping[str, str] | None = None,
 ) -> list[PathResult]:
     """Every path of [start, end) from the symbolic entry state.
 
     ``relocations`` maps the offset of each relocated 32-bit field (in
     ``code``'s own coordinates) to its target symbol.  A path ends when it
     reaches ``end``; every branch must go strictly forward to an instruction
-    start of the region or to ``end``.
+    start of the region or to ``end``.  ``entry_names`` is passed to
+    :func:`entry_state`.
     """
     starts = region_boundaries(code, start, end, context)
     boundaries = set(starts) | {end}
     instructions = {offset: _Instruction(code, offset, relocations, context) for offset in starts}
     undefined = _Undefined(tag)
     results: list[PathResult] = []
-    pending: list[tuple[int, PathState]] = [(start, entry_state())]
+    pending: list[tuple[int, PathState]] = [(start, entry_state(entry_names))]
     steps = 0
     while pending:
         offset, state = pending.pop()
@@ -1107,8 +1147,10 @@ __all__ = [
     "MAX_PATHS",
     "PathResult",
     "address_relation",
+    "canonical_flag",
     "condition",
     "contradictory",
+    "entry_state",
     "region_boundaries",
     "simulate_region",
     "stores_equivalent",
