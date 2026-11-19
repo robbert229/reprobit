@@ -81,18 +81,29 @@ _RELOCATION_FIELDS = (
 def _pair_relocations(
     donor_rows: list[dict[str, Any]], reference_rows: list[dict[str, Any]]
 ) -> list[list[int]]:
-    """Each reference field with the first unused donor record of the same symbol and type."""
+    """Each reference field with an unused donor record of the same symbol and type.
+
+    The first such record whose addend is the field's own is taken, else the
+    first such record.  The proof names a relocated value by its target alone
+    (the addend is in the bytes), but the installed table's records are the
+    donor's re-seated and must match the image's fields addend for addend: so
+    when two fields of one symbol move past each other (stores to two globals
+    reordered), each still takes the record of its own displacement.  Where
+    the first record already has the field's addend, the choice is the one
+    made before.
+    """
     unused = list(donor_rows)
     pairs = []
     for row in sorted(reference_rows, key=lambda item: item["offset"]):
+        candidates = [
+            candidate
+            for candidate in unused
+            if _symbol_identity(candidate) == _symbol_identity(row)
+            and candidate["type"] == row["type"]
+        ]
         match = next(
-            (
-                candidate
-                for candidate in unused
-                if _symbol_identity(candidate) == _symbol_identity(row)
-                and candidate["type"] == row["type"]
-            ),
-            None,
+            (candidate for candidate in candidates if candidate["addend"] == row["addend"]),
+            candidates[0] if candidates else None,
         )
         if match is None:
             raise DiscoveryAuthoringError(

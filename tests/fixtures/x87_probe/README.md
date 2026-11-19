@@ -28,6 +28,20 @@ host's x87 unit.
   distinct `result/flags/C1` values the six runs gave, so one value means
   the operation is symmetric there.  Its output is `commute.out`; recorded on
   2026-11-18 on a 13th Gen Intel Core i5-13400F.
+- `memory_operands.c` (GNU C, not MSVC: the x87 unit is the host's either
+  way) runs `fadd`/`fmul` with a 32-bit memory operand against the same
+  with the operand loaded into a register, and with two memory operands
+  commuted, over ten operands (SNaNs and QNaNs of several payloads and
+  signs, 1, a denormal, -0, infinity), every exception masked.  Each line
+  says whether the commuted memory operands, the memory operand against
+  the register, and the commuted registers give the same 80-bit result and
+  exception flags.  Its output is `memory_operands.out` (the same 13th Gen
+  Intel Core i5-13400F, 2026-11-19): only the registers always commute;
+  a memory operand differs from its loaded register when the other operand
+  is a NaN (the NaN payload chosen, or DE for a denormal), so the simulator
+  never equates `fmem` with `fld` and never commutes two memory operands.
+  Reproduce with `gcc -O0 -o memory_operands memory_operands.c &&
+  ./memory_operands > memory_operands.out`.
 - `encodings.txt` is `objdump -d` of the three objects, restricted to x87 lines:
   the bytes each probe executed.  `commute_encodings.txt` is the same for
   `commute.obj`.
