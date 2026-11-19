@@ -11,7 +11,7 @@ from reprobit.cli_output import CLIOutput, bounded_items, count_phrase, human_co
 from reprobit.cli_paths import (
     project_root,
 )
-from reprobit.model import AuthenticityPolicy
+from reprobit.model import Artifact, AuthenticityPolicy
 from reprobit.project_execution import (
     NULL_EXECUTION_PROGRESS as NULL_EXECUTION_PROGRESS,
 )
@@ -57,6 +57,7 @@ from reprobit.project_execution import (
 from reprobit.project_execution import (
     prepare_producer_graph_run as prepare_producer_graph_run,
 )
+from reprobit.report import reprobit_written_objects
 from reprobit.state import KeepWorkspace
 
 
@@ -162,6 +163,17 @@ def command_build(args: argparse.Namespace, output: CLIOutput) -> int:
     return 0
 
 
+def _reprobit_object_lines(written: tuple[Artifact, ...]) -> list[str]:
+    """Disclose linker inputs ReproBit wrote itself rather than a toolchain program."""
+
+    if not written:
+        return []
+    return [
+        f"ReproBit-written objects: {count_phrase(len(written), 'COFF weak-alias object')} "
+        "(not toolchain output; bytes re-derived from the producer graph's declaration)"
+    ]
+
+
 def _emit_verify_result(output: CLIOutput, verified: VerifyResult) -> None:
     result = verified.engine
     requested_policy = verified.policy
@@ -182,6 +194,7 @@ def _emit_verify_result(output: CLIOutput, verified: VerifyResult) -> None:
             diagnostic=True,
             **ledger_fields,
         )
+    written = reprobit_written_objects(result.report)
     exact_targets = sum(item.comparison.byte_exact for item in result.targets)
     target_results = {item.target_id: item.comparison.byte_exact for item in result.targets}
     different_targets = tuple(target for target, exact in target_results.items() if not exact)
@@ -199,6 +212,7 @@ def _emit_verify_result(output: CLIOutput, verified: VerifyResult) -> None:
                 f"{count_phrase(quarantine_actions, 'disclosed exception')} covering "
                 f"{quarantine_bytes} bytes"
             )
+        message_lines.extend(_reprobit_object_lines(written))
         message_lines.extend(
             (
                 f"Intervention cost: {result.report.costs.project_total:,} relative points",
@@ -216,6 +230,7 @@ def _emit_verify_result(output: CLIOutput, verified: VerifyResult) -> None:
             if hidden:
                 summary += f", ... and {hidden} more"
             message_lines.append(f"Different: {summary}")
+        message_lines.extend(_reprobit_object_lines(written))
         message_lines.append(f"Report: {report_html}")
     output.emit(
         "verification",
@@ -232,6 +247,7 @@ def _emit_verify_result(output: CLIOutput, verified: VerifyResult) -> None:
         target_results=target_results,
         quarantine_actions=quarantine_actions,
         quarantine_bytes=quarantine_bytes,
+        reprobit_objects=[item.logical_path for item in written],
     )
 
 

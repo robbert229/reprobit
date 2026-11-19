@@ -555,8 +555,13 @@ def add_producer_nodes(plan: ClassicIncrementalPlan) -> None:
             for path in (warm_context.sampled_reference_path(plan, reference),)
             if path is not None
         }
-        role_path = plan.census.known_path(
-            plan.toolchain_root.joinpath(*PurePosixPath(plan.role_relatives[node.role]).parts)
+        role_relative = plan.role_relatives.get(node.role)
+        role_path = (
+            plan.census.known_path(
+                plan.toolchain_root.joinpath(*PurePosixPath(role_relative).parts)
+            )
+            if role_relative is not None
+            else None
         )
         if role_path is not None:
             sampled_inputs.add(role_path)

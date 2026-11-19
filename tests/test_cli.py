@@ -5472,7 +5472,10 @@ def test_cold_producer_build_and_verify_never_construct_incremental_cache(
     class FakeVerificationResult:
         verdict = SimpleNamespace(clean=True, quarantined=False, quarantines=())
         evidence = SimpleNamespace(origin_integrity=True)
-        report = SimpleNamespace(costs=SimpleNamespace(project_total=0))
+        report = SimpleNamespace(
+            costs=SimpleNamespace(project_total=0),
+            proof=SimpleNamespace(artifacts=(), provenance=()),
+        )
         targets = (
             SimpleNamespace(
                 target_id="program",

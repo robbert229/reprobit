@@ -155,6 +155,8 @@ class _ClassicGraphPhases:
     generated: tuple[ProducerNode, ...]
     librarians: tuple[ProducerNode, ...]
     linkers: tuple[ProducerNode, ...]
+    # ReproBit-written weak-alias objects; they run before every archive/link.
+    weak_aliases: tuple[ProducerNode, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -551,7 +553,12 @@ class ClassicProducerGraphBuildExecutor:
         )
         librarians = tuple(node for node in self.graph.nodes if node.role is ProducerRole.LIBRARIAN)
         linkers = tuple(node for node in self.graph.nodes if node.role is ProducerRole.LINKER)
-        if len(ordinary) + len(generated) + len(librarians) + len(linkers) != len(self.graph.nodes):
+        weak_aliases = tuple(
+            node for node in self.graph.nodes if node.role is ProducerRole.COFF_WEAK_ALIAS
+        )
+        if len(ordinary) + len(generated) + len(librarians) + len(linkers) + len(
+            weak_aliases
+        ) != len(self.graph.nodes):
             raise ClassicProjectError("producer graph contains an unsupported role")
         return _ClassicGraphPhases(
             counterfactual_compilers,
@@ -559,6 +566,7 @@ class ClassicProducerGraphBuildExecutor:
             generated,
             librarians,
             linkers,
+            weak_aliases,
         )
 
     def _check_developer_recursive_inputs(
@@ -893,6 +901,25 @@ class ClassicProducerGraphBuildExecutor:
             root=self.build_root,
             allowed_outputs=rdata_outputs,
             phase="object-transform phase",
+        )
+
+        weak_alias_seal = _tree_file_seal(self.build_root)
+        steps.extend(
+            self.producer.run_graph_nodes(
+                supervisor,
+                phases.weak_aliases,
+                completed=completed,
+                output_steps=output_steps,
+                cancellation=cancellation,
+            )
+        )
+        _require_declared_tree_writes(
+            weak_alias_seal,
+            root=self.build_root,
+            allowed_outputs=(
+                path for node in phases.weak_aliases for path in self.producer.node_outputs(node)
+            ),
+            phase="weak-alias phase",
         )
 
         librarian_seal = _tree_file_seal(self.build_root)

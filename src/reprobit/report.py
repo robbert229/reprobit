@@ -1296,6 +1296,28 @@ class Report(StrictModel):
         )
 
 
+def reprobit_written_objects(report: Report) -> tuple[Artifact, ...]:
+    """Return the objects ReproBit wrote itself in this run, not a toolchain program.
+
+    Today these are only COFF weak-alias objects (:mod:`reprobit.coff_weak_alias`),
+    whose bytes follow from the alias declarations in the producer graph.
+    """
+
+    from reprobit.coff_weak_alias import COFF_WEAK_ALIAS_OPERATION
+
+    artifacts = {item.id: item for item in report.proof.artifacts}
+    return tuple(
+        sorted(
+            (
+                artifacts[node.artifact_id]
+                for node in report.proof.provenance
+                if node.operation == COFF_WEAK_ALIAS_OPERATION and node.artifact_id in artifacts
+            ),
+            key=lambda item: item.logical_path,
+        )
+    )
+
+
 __all__ = [
     "AuditIssueSummary",
     "BuildExecutionSummary",
@@ -1321,4 +1343,5 @@ __all__ = [
     "ToolSummary",
     "ToolchainSummary",
     "ToolchainTreeSummary",
+    "reprobit_written_objects",
 ]

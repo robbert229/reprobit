@@ -73,6 +73,20 @@ occurrence count, so an authorized archive cannot silently appear in another tar
 additional link site. Noncompiler argv uses a closed role grammar; unknown or unmodeled switches
 are rejected rather than guessed to be harmless.
 
+One graph role runs no program. A `coff-weak-alias` node has empty argv, no inputs and one
+`.obj` output, and carries a `coff_weak_alias` declaration: an ordered list of
+`{weak, default}` symbol pairs, the weak-external search characteristic (`nolibrary`,
+`library` or `alias`), and the `output_digest`/`output_size` of the object. ReproBit writes that
+object itself in each run (`reprobit.coff_weak_alias`): i386, no sections, timestamp 0, no
+optional header; one undefined external per distinct default, in first-appearance order; then,
+per pair, a weak external (storage class 105) whose one auxiliary record names its default's
+symbol index and the characteristic; then the string table of names longer than eight bytes, in
+symbol-table order. A graph whose pin differs from those bytes does not load. Duplicate weak
+names, a weak name equal to its own default, and a weak name that is also some pair's default
+are refused. A linker consumes the object like any other current-run object, with a direct
+dependency on the node. Nodes without a declaration serialize as before, so existing graph
+digests are unchanged.
+
 Bare `system-library/` identities normally resolve only through locked toolchain library roots.
 If an earlier project `LIBPATH` selects an external SDK archive, that path and SHA-256 must also
 appear in `project_sdk_libraries` and match the source manifest. A source-root

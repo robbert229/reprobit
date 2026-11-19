@@ -75,6 +75,7 @@ from reprobit.process import (
     ProcessSupervisor,
 )
 from reprobit.producer_graph import (
+    TOOL_PRODUCER_ROLES,
     ProducerGraphDocument,
     ProducerNode,
     ProducerRole,
@@ -253,7 +254,7 @@ class ClassicProducerExecution:
         link_timeout: float,
         progress: ClassicProgressReporter,
     ) -> None:
-        if set(role_commands) != set(ProducerRole) or set(role_tool_ids) != set(ProducerRole):
+        if set(role_commands) != TOOL_PRODUCER_ROLES or set(role_tool_ids) != TOOL_PRODUCER_ROLES:
             raise ClassicProjectError("producer graph does not bind every locked role")
         self.bundle = bundle
         self.session_root = session_root
@@ -1077,6 +1078,8 @@ class ClassicProducerExecution:
         include_trace_epoch: str | None = None,
         compiler_namespace_id: str | None = None,
     ) -> tuple[StepExecutionReceipt, ...]:
+        if node.role is ProducerRole.COFF_WEAK_ALIAS:
+            return (self._write_coff_weak_alias(node, receipt_step_id or node.id),)
         for value in (*node.inputs, *node.directive_inputs):
             path = self.reference(value)
             if path is not None:
@@ -1189,6 +1192,48 @@ class ClassicProducerExecution:
             auxiliary.append(resource_audit.step)
         return producer_receipt, *auxiliary
 
+    def _write_coff_weak_alias(self, node: ProducerNode, step_id: str) -> StepExecutionReceipt:
+        """Write one weak-alias object from its declaration; no program runs.
+
+        The bytes follow from the reviewed declaration alone, and must equal its
+        pinned digest; nothing else is read.
+        """
+
+        declaration = node.coff_weak_alias
+        if declaration is None:
+            raise ClassicProjectError(f"coff-weak-alias node {node.id!r} lacks its declaration")
+        started = time.monotonic()
+        payload = declaration.payload()
+        if (
+            Digest.from_bytes(payload) != declaration.output_digest
+            or len(payload) != declaration.output_size
+        ):
+            raise ClassicProjectError(f"coff-weak-alias node {node.id!r} differs from its pin")
+        (path,) = self.declared_outputs(node)
+        if os.path.lexists(path):
+            raise ClassicProjectError(f"producer {node.id!r} output already exists: {path}")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("xb") as stream:
+            stream.write(payload)
+        self.require_regular(path, label=f"producer {node.id!r} output")
+        actual = path.resolve(strict=True)
+        with self._output_lock:
+            if actual in self._physical_outputs.values():
+                raise ClassicProjectError(
+                    f"producer {node.id!r} reuses another node's physical output"
+                )
+            self._physical_outputs[path] = actual
+        return _internal_step(
+            step_id,
+            {
+                "producer": "reprobit.coff-weak-alias",
+                "node": node.id,
+                "declaration": declaration.model_dump(mode="json"),
+                "output": declaration.output_digest.value,
+            },
+            time.monotonic() - started,
+        )
+
     def run_graph_nodes(
         self,
         supervisor: ProcessSupervisor,
@@ -1254,6 +1299,7 @@ class ClassicProducerExecution:
                                 ProducerRole.RESOURCE: "resource",
                                 ProducerRole.LIBRARIAN: "librarian",
                                 ProducerRole.LINKER: "link",
+                                ProducerRole.COFF_WEAK_ALIAS: "weak-alias",
                             }[node.role],
                             producer_receipt.step_id,
                         )
