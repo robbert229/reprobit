@@ -476,6 +476,7 @@ from .region_simulation import (
 from .region_x87 import x87_return_cases, x87_stack_solution
 from .relational import ia32_relational_flow_walk, relational_form_external_entries
 from .rewriting_region_resize import (
+    _composed_identity,
     _hex_instruction,
     _padded_length,
     protected_code_offsets,
@@ -2305,6 +2306,57 @@ def measure_function_validation(
     )
 
 
+def _static_base(row: Mapping[str, Any]) -> str | None:
+    """The base name of a file static ``<base>$S<serial>`` (storage class 3), else None."""
+    base, separator, serial = str(row["target"]).rpartition("$S")
+    if row.get("target_storage") == 3 and separator and base and serial.isdigit():
+        return base
+    return None
+
+
+def require_composed_relocations(
+    composed: list[dict[str, Any]], installed: list[dict[str, Any]], context: str
+) -> None:
+    """The composed table is the proved reseat, up to the composer's renumbering.
+
+    The same-slot composer names a compiler local (``$T<n>``, ``$L<n>``) by
+    the seed's symbol of the same kind at the same place, after proving that
+    section byte-identical in both objects, and a file static
+    ``<base>$S<serial>`` by the seed's static of the same base name: any
+    declaration a grind donor adds renumbers both serials while the body's
+    bytes stay the same.  So a local is compared by kind and place
+    (`rewriting_region_resize._composed_identity`), a static by its base,
+    type and storage, every other target by name; and the renaming of
+    statics must be one bijection over the whole table, so two statics that
+    share a base are never taken for each other.
+    """
+
+    def identity(row: dict[str, Any]) -> tuple[Any, ...]:
+        base = _static_base(row)
+        if base is not None:
+            return (
+                row["offset"],
+                ("static", base, row["target_type"], row["target_storage"]),
+                row["type"],
+            )
+        return _composed_identity(row)
+
+    require(
+        [identity(row) for row in composed] == [identity(row) for row in installed],
+        f"{context} is not the proved reseat",
+    )
+    forward: dict[str, str] = {}
+    backward: dict[str, str] = {}
+    for left, right in zip(composed, installed, strict=True):
+        if _static_base(right) is None:
+            continue
+        require(
+            forward.setdefault(right["target"], left["target"]) == left["target"]
+            and backward.setdefault(left["target"], right["target"]) == right["target"],
+            f"{context} renames the file statics inconsistently",
+        )
+
+
 def produce_function_validation_candidate(
     seed_bytes: bytes,
     donor_bytes: bytes,
@@ -2356,10 +2408,8 @@ def produce_function_validation_candidate(
         label,
         declared_donor_extras=function.get("expected_donor_extra_functions") or None,
     )
-    require(
-        [(row["offset"], row["target"], row["type"]) for row in detailed_relocations(checked, cp)]
-        == [(row["offset"], row["target"], row["type"]) for row in measured.rows],
-        f"{label} composed relocation table is not the proved reseat",
+    require_composed_relocations(
+        detailed_relocations(checked, cp), measured.rows, f"{label} composed relocation table"
     )
     return composed, candidate_proof(
         detail,
@@ -2399,6 +2449,7 @@ __all__ = [
     "produce_function_validation_candidate",
     "proof_summary",
     "prove_function",
+    "require_composed_relocations",
     "validate_function",
     "validate_replacement",
 ]

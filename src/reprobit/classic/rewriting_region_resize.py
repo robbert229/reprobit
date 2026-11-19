@@ -268,7 +268,7 @@ from .debug import (
     parse_fpo_data,
     shifted_pointer,
 )
-from .foundation import require_payload_free_declaration, sha256_bytes
+from .foundation import local_symbol_kind, require_payload_free_declaration, sha256_bytes
 from .region_simulation import (
     FLAG_NAMES,
     X87_CONDITION_BITS,
@@ -1912,6 +1912,25 @@ def protected_code_offsets(
     return frozenset(offsets)
 
 
+def _composed_identity(row: dict[str, Any]) -> tuple[Any, ...]:
+    """A relocation as the composed object must carry it from the derived donor.
+
+    The same-slot composer names a compiler local (``$T<n>``, ``$L<n>``) by
+    the seed's symbol of the same kind at the same section and value, after
+    proving that section byte-identical in both objects; any declaration
+    added to the unit renumbers those serials, so only kind and place are
+    compared.  Every other target keeps its name.
+    """
+    kind = local_symbol_kind(str(row["target"]))
+    if kind is not None:
+        return (
+            row["offset"],
+            ("local", kind, row["target_section"], row["target_value"]),
+            row["type"],
+        )
+    return (row["offset"], row["target"], row["type"])
+
+
 def produce_region_resize_rewriting_candidate(
     seed_bytes: bytes,
     donor_bytes: bytes,
@@ -2083,8 +2102,8 @@ def produce_region_resize_rewriting_candidate(
         declared_donor_extras=function.get("expected_donor_extra_functions") or None,
     )
     require(
-        [(row["offset"], row["target"], row["type"]) for row in detailed_relocations(checked, cp)]
-        == [(row["offset"], row["target"], row["type"]) for row in installed_rows],
+        [_composed_identity(row) for row in detailed_relocations(checked, cp)]
+        == [_composed_identity(row) for row in installed_rows],
         "region-resize composed relocation table is not the proved reseat",
     )
     return composed, candidate_proof(
