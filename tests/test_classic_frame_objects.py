@@ -17,12 +17,17 @@ holds 0, the addend the closed set admits).
    stack access at a variable offset.
 3. The record: authored and dispatched with the donor's type server, pinning
    a14 and its escaping objects.
+4. Grind and the build: grind authors the record with the PDB its donor
+   compile wrote, and the build composes it from its own donor compile's PDB;
+   a missing PDB, or one another compile wrote, refuses.
 """
 
 from __future__ import annotations
 
+import re
 import struct
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 from test_classic_function_validation import _extern_donor
@@ -50,6 +55,7 @@ from reprobit.classic_project import (
 from reprobit.coff_format import CoffObject, coff_body
 from reprobit.discovery_authoring import DiscoveryAuthoringError
 from reprobit.discovery_function_validation import build_function_validation_rewriting
+from reprobit.model import Digest
 
 T_INT4 = 0x74
 T_RCHAR = 0x70
@@ -548,3 +554,171 @@ def test_without_the_type_server_the_frame_objects_pass_cannot_run() -> None:
         match=r"block string moves; the frame-objects pass \(a14\) cannot run: .* not supplied",
     ):
         _author(None)
+
+
+# --- 4. grind and the build: the type server the donor's own compile wrote ----------------
+
+
+def _grind_rewriting(monkeypatch: pytest.MonkeyPatch, type_server: bytes | None) -> Any:
+    """Grind's donor rewriting of the fixture, with the probe's type server."""
+    import reprobit.discovery_grind as grind
+    from reprobit.discovery_contracts import DeclarationFamily
+
+    def refuse(**_kwargs: object) -> object:
+        raise DiscoveryAuthoringError("block string moves")
+
+    monkeypatch.setattr(grind, "_extern_run", lambda _state: SimpleNamespace(**_RUN))
+    monkeypatch.setattr(grind, "_header_placement", lambda _context: "after-includes")
+    monkeypatch.setattr(grind, "build_extern_run_donor", lambda **_kwargs: _extern_donor())
+    monkeypatch.setattr(grind, "build_donor_schedule_rewriting", refuse)
+    monkeypatch.setattr(grind, "build_region_resize_rewriting", refuse)
+
+    def validation(**kwargs: Any) -> object:
+        # Grind reports the reorder's reason; keep the proof's own refusal.
+        try:
+            return build_function_validation_rewriting(**kwargs)
+        except DiscoveryAuthoringError as error:
+            _REFUSALS.append(str(error))
+            raise
+
+    _REFUSALS.clear()
+    monkeypatch.setattr(grind, "build_function_validation_rewriting", validation)
+    seed = _rep_coff(REP_D)
+    context = SimpleNamespace(
+        unit=SimpleNamespace(target_id="program", id="tu.fixture", build_target="program"),
+        symbol=TARGET_SYMBOL,
+    )
+    return seed, grind._state_rewriting(
+        cast(Any, SimpleNamespace(family=DeclarationFamily.EXTERN_RUN_PAIR)),
+        cast(Any, context),
+        seed_object=seed,
+        donor_object=seed,
+        reference_object=_rep_coff(REP_P),
+        donor_type_server=type_server,
+    )
+
+
+_REFUSALS: list[str] = []
+_RUN = {
+    "header_prefix": "ReproBitPad",
+    "header_count": 1,
+    "seat_prefix": "ReproBitPadSeat",
+    "seat_count": 0,
+    "width": 3,
+}
+
+
+def _donor_material(donor: Any, donor_object: bytes, type_server: bytes | None) -> Any:
+    """The build's fresh donor material: the object and the PDB its compile wrote."""
+    from reprobit.classic.semantic_contracts import (
+        _CLASSIC_SEMANTIC_ISSUER,
+        _ClassicDonorSemanticMaterial,
+    )
+
+    return _ClassicDonorSemanticMaterial(
+        intervention=donor.intervention,
+        donor_object=donor_object,
+        source_inputs={},
+        compiler_statement={"schema": 1},
+        _issuer=_CLASSIC_SEMANTIC_ISSUER,
+        donor_type_server=type_server,
+    )
+
+
+def _compose(seed: bytes, authored: Any, type_server: bytes | None) -> Any:
+    """Compose the unit as the build does, from the donor compile's own outputs."""
+    from reprobit.classic_orchestration import (
+        ClassicPreparedDonor,
+        ClassicPreparedUnit,
+        compose_classic_unit,
+    )
+    from reprobit.schema import ClassicTranslationUnitPlan
+
+    function = authored.function.intervention
+    unit = ClassicPreparedUnit(
+        ClassicTranslationUnitPlan(
+            id="tu.fixture",
+            target_id="program",
+            build_target="program",
+            source="src/unit.c",
+            source_digest=Digest.from_bytes(b"source"),
+        ),
+        (
+            ClassicPreparedDonor(
+                authored.donor.intervention,
+                cast(Any, SimpleNamespace(logical_outputs={}, carrier_identifiers=frozenset())),
+            ),
+        ),
+        (function,),
+        (),
+        (function,),
+        (authored.function.receipt,),
+    )
+    return compose_classic_unit(
+        unit,
+        seed_object=seed,
+        donor_materials={
+            authored.donor.intervention.id: _donor_material(authored.donor, seed, type_server)
+        },
+        seed_source=b"source",
+    )
+
+
+def test_grind_authors_an_a14_record_from_its_donor_compile_s_pdb_and_the_build_composes_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _pdb([_array(T_RCHAR, 16)])
+    seed, authored = _grind_rewriting(monkeypatch, server)
+    proof = authored.function.receipt.expected_values["function_validation.expected_proof"]
+    assert proof["assumptions"] == ["a14"] and proof["frame_objects"] == [[-16, 16]]
+
+    composed = _compose(seed, authored, server)
+    assert not composed.incomplete
+    assert composed.output == authored.candidate_object
+    output = CoffObject(composed.output)
+    assert bytes(coff_body(output, output.function_section(TARGET_SYMBOL))) == REP_P
+    # The consumer names the PDB the donor's compile wrote, by digest: the
+    # evidence binds it to that compile's produced type-server artifact.
+    (witness,) = composed.witnesses
+    inputs = {
+        item["name"]: item["digest"]
+        for item in witness.semantic_proof.input_statement["binary_inputs"]
+    }
+    assert inputs[f"dependency_types:{authored.donor.intervention.id}"] == (
+        Digest.from_bytes(server).model_dump(mode="json")
+    )
+
+
+def test_grind_without_its_donor_compile_s_pdb_cannot_run_a14(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(DiscoveryAuthoringError, match=r"block string moves"):
+        _grind_rewriting(monkeypatch, None)
+    assert len(_REFUSALS) == 1
+    assert re.search(r"the frame-objects pass \(a14\) cannot run: .* not supplied", _REFUSALS[0])
+
+
+def test_grind_refuses_a_pdb_another_compile_wrote(monkeypatch: pytest.MonkeyPatch) -> None:
+    other = _pdb([_array(T_RCHAR, 16)], signature=SIGNATURE + 1)
+    with pytest.raises(DiscoveryAuthoringError, match=r"block string moves"):
+        _grind_rewriting(monkeypatch, other)
+    assert len(_REFUSALS) == 1
+    assert (
+        "supplied type server has signature 0x6afe5731 and age 42, but the object "
+        "names 0x6afe5730 and age 42" in _REFUSALS[0]
+    )
+
+
+def test_the_build_refuses_an_a14_record_without_its_pdb_or_with_another_compile_s(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _pdb([_array(T_RCHAR, 16)])
+    seed, authored = _grind_rewriting(monkeypatch, server)
+    with pytest.raises((ByteIdentityError, ClassicProjectError), match=r"not supplied"):
+        _compose(seed, authored, None)
+    older = _pdb([_array(T_RCHAR, 16)], age=AGE - 1)
+    with pytest.raises(
+        (ByteIdentityError, ClassicProjectError),
+        match=r"supplied type server has signature 0x6afe5730 and age 41",
+    ):
+        _compose(seed, authored, older)

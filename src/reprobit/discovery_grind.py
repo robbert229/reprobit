@@ -86,9 +86,26 @@ class ColdTrialEvidence:
     report: Report
 
 
+@dataclass(frozen=True, slots=True)
+class DonorCompileProduct:
+    """The two outputs one donor compile writes: its object and its type-server PDB.
+
+    MSVC 5.0 ``/Zi`` writes a donor's types to the PDB its ``/Fd`` names, and
+    the object's ``.debug$T`` holds only an ``LF_TYPESERVER`` record naming
+    that PDB's signature and age.  The frame-objects pass (a14 of
+    `classic.function_validation`) reads local sizes from it, so the PDB is
+    taken from the same compile as the object, never from another build.
+    """
+
+    object_payload: bytes
+    type_server: bytes
+
+
 SeedProbe = Callable[[Path, str], bytes]
 DonorProgress = Callable[[int, int, str], None]
-DonorProbe = Callable[[Path, tuple[str, ...], DonorProgress | None], Mapping[str, bytes]]
+DonorProbe = Callable[
+    [Path, tuple[str, ...], DonorProgress | None], Mapping[str, DonorCompileProduct]
+]
 ColdVerifier = Callable[[Path], ColdTrialEvidence]
 GrindProgress = Callable[
     [int, int, str, str, ProgressKind, str | None],
@@ -380,12 +397,16 @@ def _state_rewriting(
     seed_object: bytes,
     donor_object: bytes,
     reference_object: bytes,
+    donor_type_server: bytes | None = None,
 ) -> DeclarationShapeEqualBodyAuthoring:
     """Author the state's extern-run donor and a donor rewriting reaching the reference.
 
     A reordering is tried first; when none reaches the reference, a
     region-resize rewriting (whose replacements may change the length); when
     no region replacement proves, a whole-function translation validation.
+    ``donor_type_server`` is the PDB the donor's own compile wrote
+    (`DonorCompileProduct`), read only by the function validation's
+    frame-objects pass (a14).
     """
 
     _require_grind_family(state)
@@ -445,6 +466,7 @@ def _state_rewriting(
                 seed_object=seed_object,
                 donor_object=donor_object,
                 reference_object=reference_object,
+                donor_type_server=donor_type_server,
             )
         except DiscoveryAuthoringError:
             raise rewriting_error from None
@@ -736,13 +758,21 @@ def run_project_grind(
             completed += 1
             _advance(progress, completed, total, "grind-donors", donor_id)
 
-        donor_objects = dict(callbacks.probe_donors(staged_root, donor_ids, donor_progress))
+        donor_products = dict(callbacks.probe_donors(staged_root, donor_ids, donor_progress))
         if donor_completed != len(donor_ids):
             raise GrindError("donor compiler probe omitted completion progress")
-        if set(donor_objects) != set(donor_ids) or any(
-            type(payload) is not bytes or not payload for payload in donor_objects.values()
+        if set(donor_products) != set(donor_ids) or any(
+            type(product) is not DonorCompileProduct
+            or type(product.object_payload) is not bytes
+            or not product.object_payload
+            or type(product.type_server) is not bytes
+            or not product.type_server
+            for product in donor_products.values()
         ):
             raise GrindError("donor probe returned an incomplete compiler result set")
+        donor_objects = {
+            donor_id: product.object_payload for donor_id, product in donor_products.items()
+        }
         reference_object = context.reference_path.read_bytes()
         qualified: list[_QualifiedCandidate] = []
         original_ids = {item.id for item in context.intervention_document.interventions}
@@ -773,6 +803,9 @@ def run_project_grind(
                             seed_object=seed_object,
                             donor_object=donor_object,
                             reference_object=reference_object,
+                            donor_type_server=donor_products[
+                                provisional_record.intervention.id
+                            ].type_server,
                         )
                     except DiscoveryAuthoringError:
                         raise splice_error from None
@@ -981,6 +1014,7 @@ def run_project_grind(
 
 __all__ = [
     "ColdTrialEvidence",
+    "DonorCompileProduct",
     "GrindError",
     "GrindRejection",
     "GrindSolution",

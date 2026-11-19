@@ -99,7 +99,12 @@ class ClassicCapturedProducerOutput:
 
 @dataclass(frozen=True, slots=True)
 class ClassicDonorOutputReceipt:
-    """Private compiler object consumed only by certified composition."""
+    """Private compiler object consumed only by certified composition.
+
+    ``type_server_digest`` and ``type_server_size`` pin the PDB the same
+    compile wrote beside the object (``/Fdo.pdb``), whose types a
+    frame-objects proof reads (a14 of `function_validation`).
+    """
 
     intervention_id: str
     node_id: str
@@ -107,6 +112,8 @@ class ClassicDonorOutputReceipt:
     logical_path: str
     digest: Digest
     size: int
+    type_server_digest: Digest | None = None
+    type_server_size: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

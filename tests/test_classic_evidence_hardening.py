@@ -586,3 +586,94 @@ def test_legacy_range_mapping_remembers_an_unmappable_target(
     assert outcomes == [((ByteRange(offset=0, length=1),), "function-body")] * 2
     assert parses == [b"not a PE image"]
     assert images == {"program": None}
+
+
+def _donor_output_assembler(
+    receipt: object,
+) -> tuple[classic_evidence._ClassicEvidenceAssembler, list[dict[str, object]], list[object]]:
+    """An assembler whose producer seams record the private donor artifacts."""
+    from reprobit.producer_graph import ProducerRole
+
+    assembler = object.__new__(classic_evidence._ClassicEvidenceAssembler)
+    assembler.record = cast(object, SimpleNamespace(donor_outputs=(receipt,)))  # type: ignore[assignment]
+    assembler.nodes = {"compiler.unit": SimpleNamespace(role=ProducerRole.COMPILER)}  # type: ignore[assignment]
+    assembler.reads_by_node = {  # type: ignore[assignment]
+        "compiler.unit": [SimpleNamespace(epoch="donor:donor.private", namespace_id="ns", reads=())]
+    }
+    assembler.witnesses = {"donor.private": cast(object, "witness")}  # type: ignore[assignment]
+    produced: list[dict[str, object]] = []
+    certified: list[object] = []
+
+    def produce(**kwargs: object) -> str:
+        produced.append(kwargs)
+        return f"artifact.{kwargs['reference']}"
+
+    def certify(witness: object, artifact_ids: tuple[str, ...]) -> str:
+        certified.append((witness, artifact_ids))
+        return "certificate.donor"
+
+    assembler._tool_artifact = lambda _role: "tool.compiler"  # type: ignore[method-assign]
+    assembler._compiler_namespace_artifact = lambda _ns: "namespace"  # type: ignore[method-assign]
+    assembler._source_read_artifact = lambda _read: "source"  # type: ignore[method-assign]
+    assembler._add_produced_artifact = produce  # type: ignore[method-assign,assignment]
+    assembler._add_certificate = certify  # type: ignore[method-assign,assignment]
+    assembler._attach_certificate = (  # type: ignore[method-assign]
+        lambda artifact_id, certificate_id: certified.append((artifact_id, certificate_id))
+    )
+    return assembler, produced, certified
+
+
+def test_a_private_donor_s_type_server_is_a_produced_artifact_of_its_compile() -> None:
+    from reprobit.classic_execution_records import ClassicDonorOutputReceipt
+
+    receipt = ClassicDonorOutputReceipt(
+        "donor.private",
+        "compiler.unit",
+        "donor.step",
+        "R:/build/donors/o.obj",
+        Digest.from_bytes(b"donor object"),
+        len(b"donor object"),
+        Digest.from_bytes(b"donor pdb"),
+        len(b"donor pdb"),
+    )
+    assembler, produced, certified = _donor_output_assembler(receipt)
+
+    assembler._add_donor_outputs()
+
+    assert [
+        (item["reference"], item["digest"], item["size"], item["step_id"], item["logical_path"])
+        for item in produced
+    ] == [
+        (
+            "build/private-donors/donor.private.obj",
+            Digest.from_bytes(b"donor object"),
+            len(b"donor object"),
+            "donor.step",
+            ".reprobit/private-donors/donor.private.obj",
+        ),
+        (
+            "build/private-donors/donor.private.pdb",
+            Digest.from_bytes(b"donor pdb"),
+            len(b"donor pdb"),
+            "donor.step",
+            ".reprobit/private-donors/donor.private.pdb",
+        ),
+    ]
+    # Both outputs of the one compile share its inputs and its certificate.
+    assert produced[0]["inputs"] == produced[1]["inputs"]
+    assert certified == [
+        (
+            "witness",
+            (
+                "artifact.build/private-donors/donor.private.obj",
+                "artifact.build/private-donors/donor.private.pdb",
+            ),
+        ),
+        ("artifact.build/private-donors/donor.private.obj", "certificate.donor"),
+        ("artifact.build/private-donors/donor.private.pdb", "certificate.donor"),
+    ]
+
+    incomplete = replace(receipt, type_server_size=None)
+    assembler, _produced, _certified = _donor_output_assembler(incomplete)
+    with pytest.raises(ClassicProjectError, match="type-server receipt is incomplete"):
+        assembler._add_donor_outputs()
