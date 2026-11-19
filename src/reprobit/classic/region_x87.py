@@ -156,7 +156,9 @@ def x87_stack_effect(code: bytes, item: Mapping[str, Any]) -> tuple[int, int] | 
     return _memory_effect(op, modrm >> 3 & 7)
 
 
-def _call_symbol(code: bytes, item: Mapping[str, Any], relocations: Mapping[int, Any]) -> str | None:
+def _call_symbol(
+    code: bytes, item: Mapping[str, Any], relocations: Mapping[int, Any]
+) -> str | None:
     at = item["opcode_at"]
     if code[at] == 0xE8:
         row = relocations.get(at + 1)
@@ -273,7 +275,7 @@ def x87_stack_depths(
                     after = _form(0, {variable(set(range(MAX_DEPTH + 1))): 1})
                 elif effect == (0, 0):
                     after = depth
-                else:
+                elif isinstance(effect, tuple):
                     need, delta = effect
                     constrain("ge", _add(depth, -need))
                     constrain("ge", _sub(_form(MAX_DEPTH - max(delta, 0)), depth))
@@ -309,13 +311,14 @@ def x87_stack_depths(
                         return None
                     domains[variable_index] = keep
                     changed = True
-            if not form[1]:
-                if (kind == "eq" and form[0] != 0) or (kind == "ge" and form[0] < 0):
-                    return None
+            if not form[1] and ((kind == "eq" and form[0] != 0) or (kind == "ge" and form[0] < 0)):
+                return None
     return [None if form is None else _bounds(form, domains) for form in forms]
 
 
-def _condition_effect(code: bytes, item: Mapping[str, Any]) -> tuple[frozenset[str], frozenset[str]]:
+def _condition_effect(
+    code: bytes, item: Mapping[str, Any]
+) -> tuple[frozenset[str], frozenset[str]]:
     """(read, defined) condition bits of one flow item.
 
     ``fnstsw`` (AX or m16), ``fnstenv`` and ``fnsave`` read C0-C3.  The
@@ -381,9 +384,7 @@ def x87_environment_exposures(items: list[dict[str, Any]], code: bytes) -> list[
     return found
 
 
-def require_x87_depth(
-    depth: tuple[int, int] | None, need: int, peak: int, context: str
-) -> None:
+def require_x87_depth(depth: tuple[int, int] | None, need: int, peak: int, context: str) -> None:
     """Refuse unless every entry depth in ``depth`` covers ``need`` and leaves room for ``peak``."""
     require(
         depth is not None,

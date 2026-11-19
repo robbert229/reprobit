@@ -320,7 +320,7 @@ _AH_BITS = ((0, "c0"), (1, "c1"), (2, "c2"), (6, "c3"))
 
 
 def _is_fswh(value: Term) -> bool:
-    return value[0] == "b" and value[2][0] == "fswh"
+    return bool(value[0] == "b" and value[2][0] == "fswh")
 
 
 def _fsw_mask(name: str, left: Term, right: Term) -> Term:
@@ -347,7 +347,8 @@ def _fsw_mask(name: str, left: Term, right: Term) -> Term:
         term = terms[bit_name]
         require(
             term[0] != "x87undef",
-            f"the x87 condition bit {bit_name.upper()} is read but the last x87 instruction left it "
+            f"the x87 condition bit {bit_name.upper()} is read but the last x87 instruction left "
+            "it "
             "undefined",
         )
         if term != ("fbit", 0):
@@ -588,7 +589,11 @@ class X87State:
     def view(self) -> X87View:
         live = tuple(
             sorted(
-                ((position, term) for position, term in self.slots.items() if position >= -self.push),
+                (
+                    (position, term)
+                    for position, term in self.slots.items()
+                    if position >= -self.push
+                ),
                 key=lambda item: item[0],
             )
         )
@@ -623,7 +628,9 @@ def x87_stacks_equivalent(left: X87View, right: X87View) -> str | None:
     are empty in both.
     """
     if left.push != right.push:
-        return f"they leave the x87 stack at depths {left.push:+d} and {right.push:+d} from its entry"
+        return (
+            f"they leave the x87 stack at depths {left.push:+d} and {right.push:+d} from its entry"
+        )
     if left.base != right.base:
         return "their x87 stacks descend from different calls"
     positions = {at for at, _term in left.slots} | {at for at, _term in right.slots}
@@ -1219,14 +1226,19 @@ class _X87:
         fpu = self.fpu
         exceptions = ("fexc", fpu.base, tuple(sorted(set(fpu.events), key=repr)))
         top = ("ftop", fpu.base, fpu.push)
-        return ("b", 16, ("fsw", fpu.cc["c0"], fpu.cc["c1"], fpu.cc["c2"], fpu.cc["c3"], top, exceptions))
+        return (
+            "b",
+            16,
+            ("fsw", fpu.cc["c0"], fpu.cc["c1"], fpu.cc["c2"], fpu.cc["c3"], top, exceptions),
+        )
 
 
 def _x87_step(state: PathState, item: _Instruction, undefined: _Undefined) -> None:
     """Execute one x87 instruction of the closed set (see the module docstring)."""
     context = item.context
     require(
-        not item.operand16, f"{context}: an operand-size-prefixed x87 instruction is outside the closed set"
+        not item.operand16,
+        f"{context}: an operand-size-prefixed x87 instruction is outside the closed set",
     )
     require(
         not state.fpu.after_call,
@@ -1237,7 +1249,9 @@ def _x87_step(state: PathState, item: _Instruction, undefined: _Undefined) -> No
     state.fpu.used = True
     op = item.opcode
     mod, digit, index = item.modrm()
-    refused = f"{context}: the x87 instruction {item.raw.hex()} is outside the simulator's closed set"
+    refused = (
+        f"{context}: the x87 instruction {item.raw.hex()} is outside the simulator's closed set"
+    )
     if mod != 3:
         if op in (0xD8, 0xDC):
             width = 4 if op == 0xD8 else 8
@@ -1273,7 +1287,13 @@ def _x87_step(state: PathState, item: _Instruction, undefined: _Undefined) -> No
         integer = {(0xDF, 0): 2, (0xDB, 0): 4, (0xDF, 5): 8}.get((op, digit))
         require(integer is not None, refused)
         # fild: every 16-, 32- and 64-bit integer converts exactly.
-        x87.push(("fild", cast(int, integer) * 8, _load(state, item.address(state.regs), cast(int, integer))))
+        x87.push(
+            (
+                "fild",
+                cast(int, integer) * 8,
+                _load(state, item.address(state.regs), cast(int, integer)),
+            )
+        )
         x87.undefine()
         return
     if op in (0xD8, 0xDC, 0xDE) and digit in _X87_ARITH:
@@ -1868,22 +1888,22 @@ __all__ = [
     "MAX_PATHS",
     "X87_CONDITION_BITS",
     "PathResult",
+    "RelocationTarget",
     "X87State",
     "X87View",
-    "fcc_atom",
-    "mentions_x87_undefined",
-    "x87_stacks_equivalent",
-    "RelocationTarget",
     "address_relation",
     "callee_stack_pop",
     "canonical_flag",
     "condition",
     "contradictory",
     "entry_state",
+    "fcc_atom",
+    "mentions_x87_undefined",
     "region_boundaries",
     "register_free_callee",
     "simulate_region",
     "store_normal_form",
     "stores_equivalent",
     "term_atoms",
+    "x87_stacks_equivalent",
 ]

@@ -1192,9 +1192,7 @@ def apply_region_resize(
 
     def x87_depth(offset: int) -> tuple[int, int] | None:
         if not depth_cache:
-            depth_cache.append(
-                x87_stack_depths(items, successors, entries, body, relocation_view)
-            )
+            depth_cache.append(x87_stack_depths(items, successors, entries, body, relocation_view))
         depths = depth_cache[0]
         return None if depths is None else depths[donor_item_index[offset]]
 
@@ -1386,7 +1384,8 @@ def _prove_region_entry(
         require(
             not x87_exposures,
             f"{context}: the region uses the x87 unit and the body stores the x87 environment at "
-            f"{sorted(set(x87_exposures or []))}, which would expose state the proof does not compare",
+            f"{sorted(set(x87_exposures or []))}, which would expose state the proof does not "
+            "compare",
         )
         depth_of = x87_facts(donor_entry)[1]
         need = max(path.x87.need for path in (*donor_paths, *image_paths))
@@ -1457,9 +1456,7 @@ def _prove_region_entry(
                     "different",
                 )
             why = x87_stacks_equivalent(left.x87, right.x87)
-            require(
-                why is None, f"{context}: the two versions leave different x87 stacks: {why}"
-            )
+            require(why is None, f"{context}: the two versions leave different x87 stacks: {why}")
             exit_cc: frozenset[str] = (
                 x87_facts(left.exit)[0] if x87_facts is not None else frozenset()
             )

@@ -82,7 +82,11 @@ def _drain(depth):
 
 
 def _probe_lines(prefix):
-    return [line.split() for line in (PROBE / "probe.out").read_text().splitlines() if line.startswith(prefix)]
+    return [
+        line.split()
+        for line in (PROBE / "probe.out").read_text().splitlines()
+        if line.startswith(prefix)
+    ]
 
 
 def _fields(parts):
@@ -143,15 +147,30 @@ def _outcome(a, b):
 
 def test_compare_condition_bits_match_the_probe() -> None:
     rows = _probe_lines("CMP")
-    pops = {"fcom_m32": 0, "fcomp_m32": 1, "fcom_m64": 0, "fcomp_m64": 1, "D8D1": 0,
-            "D8D9": 1, "DED9": 2, "DDE1": 0, "DDE9": 1, "DAE9": 2}
+    pops = {
+        "fcom_m32": 0,
+        "fcomp_m32": 1,
+        "fcom_m64": 0,
+        "fcomp_m64": 1,
+        "D8D1": 0,
+        "D8D9": 1,
+        "DED9": 2,
+        "DDE1": 0,
+        "DDE9": 1,
+        "DAE9": 2,
+    }
     seen = set()
     for row in rows:
         fields = _fields(row[2:])
         a = float("nan") if "NAN" in fields["A"] else float(fields["A"])
         b = float(fields["B"])
         after = int(fields["swafter"], 16)
-        bits = {"c0": after >> 8 & 1, "c1": after >> 9 & 1, "c2": after >> 10 & 1, "c3": after >> 14 & 1}
+        bits = {
+            "c0": after >> 8 & 1,
+            "c1": after >> 9 & 1,
+            "c2": after >> 10 & 1,
+            "c3": after >> 14 & 1,
+        }
         assert bits == FCMP_BITS[_outcome(a, b)], row
         assert (int(fields["top1"]) - int(fields["top0"])) % 8 == pops[row[1]]
         seen.add((row[1], fields["preset"]))
@@ -175,7 +194,9 @@ def test_no_precision_control_makes_a_spill_the_identity_on_the_probe() -> None:
         fields = _fields(row[1:])
         if fields["c3c2c0"] != "100":
             differs.add((row[0], fields["cw"]))
-    assert differs == {(width, cw) for width in ("SPILL32", "SPILL64") for cw in ("007f", "027f", "037f")}
+    assert differs == {
+        (width, cw) for width in ("SPILL32", "SPILL64") for cw in ("007f", "027f", "037f")
+    }
 
 
 def test_register_copies_and_sign_operations_raise_nothing_and_copy_exactly_on_the_probe() -> None:
@@ -189,7 +210,14 @@ def test_register_copies_and_sign_operations_raise_nothing_and_copy_exactly_on_t
         v0, v1, s0, s1 = fields["V0"], fields["V1"], fields["S0"], fields["S1"]
         flipped = f"{int(v0[:4], 16) ^ 0x8000:04x}" + v0[4:]
         cleared = f"{int(v0[:4], 16) & 0x7FFF:04x}" + v0[4:]
-        expected = {0: (v1, v0), 1: (v1, v0), 2: (v0, v0), 3: (flipped, v1), 4: (cleared, v1), 5: (v0, v0)}
+        expected = {
+            0: (v1, v0),
+            1: (v1, v0),
+            2: (v0, v0),
+            3: (flipped, v1),
+            4: (cleared, v1),
+            5: (v0, v0),
+        }
         if case in expected:
             assert (s0, s1) == expected[case], row
     encodings = (PROBE / "encodings.txt").read_text()
@@ -268,15 +296,35 @@ _FAMILIES = [
     *[(f"de{m}", -1, False) for m in ("c1", "c9", "e1", "e9", "f1", "f9")],
     *[(f"d8{m}0c", 0, False) for m in ("41", "49", "61", "69", "71", "79")],
     *[(f"dc{m}10", 0, False) for m in ("41", "49", "61", "69", "71", "79")],
-    ("d9e0", 0, False), ("d9e1", 0, False), ("d9fa", 0, False),
-    ("d9e8", 1, False), ("d9ee", 1, False), ("d9c1", 1, False),
-    ("d9410c", 1, False), ("dd4110", 1, False),
-    ("df410c", 1, False), ("db410c", 1, False), ("df6910", 1, False),
-    ("d9c9", 0, False), ("ddd1", 0, False), ("ddd9", -1, False), ("ddd8", -1, False),
-    ("d9510c", 0, False), ("d9590c", -1, False), ("dd5110", 0, False), ("dd5910", -1, False),
-    ("d8d1", 0, True), ("d8d9", -1, True), ("ded9", -2, True),
-    ("dde1", 0, True), ("dde9", -1, True), ("dae9", -2, True),
-    ("d8510c", 0, True), ("d8590c", -1, True), ("dc5110", 0, True), ("dc5910", -1, True),
+    ("d9e0", 0, False),
+    ("d9e1", 0, False),
+    ("d9fa", 0, False),
+    ("d9e8", 1, False),
+    ("d9ee", 1, False),
+    ("d9c1", 1, False),
+    ("d9410c", 1, False),
+    ("dd4110", 1, False),
+    ("df410c", 1, False),
+    ("db410c", 1, False),
+    ("df6910", 1, False),
+    ("d9c9", 0, False),
+    ("ddd1", 0, False),
+    ("ddd9", -1, False),
+    ("ddd8", -1, False),
+    ("d9510c", 0, False),
+    ("d9590c", -1, False),
+    ("dd5110", 0, False),
+    ("dd5910", -1, False),
+    ("d8d1", 0, True),
+    ("d8d9", -1, True),
+    ("ded9", -2, True),
+    ("dde1", 0, True),
+    ("dde9", -1, True),
+    ("dae9", -2, True),
+    ("d8510c", 0, True),
+    ("d8590c", -1, True),
+    ("dc5110", 0, True),
+    ("dc5910", -1, True),
 ]
 
 
@@ -298,7 +346,7 @@ def test_each_family_proves_under_an_fxch_schedule_and_refuses_swapped_operands(
     assert region["x87"]["entry_depths"] == [[0, 0]]
     assert region["x87"]["peak"] >= 2
     # Without the exchange the operands are swapped: a different term.
-    with pytest.raises(ByteIdentityError, match="different (memory|x87)"):
+    with pytest.raises(ByteIdentityError, match=r"different (memory|x87)"):
         _prove(donor, _family_region([X, Y], encoding, change, compare))
 
 
@@ -436,7 +484,11 @@ def _walk(hex_code, relocations=None):
 def _depths(hex_code, relocations=None):
     code, items, successors, entries = _walk(hex_code, relocations)
     depths = x87_stack_depths(items, successors, entries, code, relocations or {})
-    return None if depths is None else {item["offset"]: d for item, d in zip(items, depths, strict=True)}
+    return (
+        None
+        if depths is None
+        else {item["offset"]: d for item, d in zip(items, depths, strict=True)}
+    )
 
 
 def _call(at, symbol):
