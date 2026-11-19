@@ -137,8 +137,9 @@ m16 and ``fist``/``fistp``; the control word is then a term
 (``SHARED_CONTROL_WORD`` until a ``fldcw``), a ``fldcw`` must keep the
 shared word's exception masks (x4), and ``fist`` names the word it rounds
 under.  A whole-function proof may set an instruction's ``indirect_pop``:
-``call [reg+disp]`` through a vtable slot is then an event
-(:func:`_vtable_call`).
+``call r/m32`` through a pointer (a vtable slot, a structure field, a
+register) is then an event named by the pointer's term
+(:func:`_indirect_call`).
 
 A whole-function proof (an ``extended`` instruction, a path with a frame
 model) also gets three forms no region proof sees: ``rep stos``/``rep movs``
@@ -680,7 +681,9 @@ def condition(code: int, flags: Mapping[str, Term]) -> tuple[Term, bool] | bool:
     if atom is None:
         atom = ("raw", base, tuple(terms))
     if isinstance(atom, bool):
-        return atom != inverted
+        # The condition holds when the atom equals ``value`` (``be`` and
+        # ``le`` hold when ``right < left`` is false).
+        return (atom == value) != inverted
     return (atom, value != inverted)
 
 
@@ -1027,6 +1030,14 @@ class _Instruction:
         # return, when a whole-function proof has determined them
         # (:mod:`reprobit.classic.function_validation`); None refuses it.
         self.indirect_pop: int | None = None
+        # Whether that pop is the words pushed since the previous call (a11 of
+        # `function_validation`): the event then checks none of them is a
+        # saved register (:func:`_indirect_call`).
+        self.pushed_pop = False
+        # For a call to a compiler helper whose effect on ESP a whole-function
+        # proof's stack relation solved: that change, which every run of the
+        # body must make (:func:`_step`).
+        self.helper_stack_change: int | None = None
         cursor = 0
         self.operand16 = False
         self.repeat: int | None = None
@@ -2411,6 +2422,14 @@ class HelperCode:
     symbol: str
     code: bytes
     sha256: str
+    # The body's relocated fields, by offset in ``code``: a data symbol's
+    # address (DIR32) or a call's or jump's PC-relative target (REL32), each
+    # named as the linker resolves it (`toolchain_helpers`).  Only a
+    # whole-function proof runs a body that has any.
+    relocations: Mapping[int, RelocationTarget] = field(default_factory=dict)
+    # Each compiler helper a REL32 field names, resolved in the same library
+    # (shared by every body of one closure, so it may be cyclic).
+    linked: Mapping[str, HelperCode] = field(default_factory=dict, compare=False, repr=False)
 
 
 def run_helper(
@@ -2437,13 +2456,21 @@ def run_helper(
     The helper's instructions then run on the caller's state, on its own
     stack below the caller's ESP, through the same memory, frame and x87
     model as the caller's, with the helper forms of :class:`_Instruction`
-    admitted.  The run must not fork: every branch is decided by constants
-    (or by the path's conditions), so a helper whose control flow depends on
-    an unknown value, or that loops past ``HELPER_MAX_STEPS``, is refused.
-    A helper may not call out (a call or an indirect transfer is refused,
-    and its body has no relocation, so it names no global).  It must return
-    with ``ret`` to exactly the pushed address, with ESP a constant offset
-    from the caller's and the control word restored.  In a whole-function
+    admitted.  The run must not fork: every branch is decided by constants,
+    by the path's conditions or, in a whole-function proof, by the ranges
+    the compared terms fix (:func:`interval_truth`), so a helper whose
+    control flow depends on an unknown value, or that loops past
+    ``HELPER_MAX_STEPS``, is refused.  A body with relocated fields runs only
+    in a whole-function proof: a data symbol's field is that symbol's address
+    (its loads and stores are the shared memory's), and a call or jump
+    through a REL32 field enters another helper of the body's resolved
+    closure (``helper.linked``: a nested call with a fresh return address of
+    its own, at most ``HELPER_MAX_DEPTH`` deep, or a tail jump); a call
+    within the body (``call rel32`` without a field) enters the body at that
+    offset.  A call to anything else, or an indirect transfer, is refused:
+    it reaches the environment.  The run must return with ``ret`` to exactly
+    the pushed address, with ESP a constant offset from the caller's and the
+    control word restored.  In a whole-function
     proof's frame model a read below ESP inside the helper (a stack probe)
     is a fresh value of this version (``FrameModel.load``): the frame model
     owns no memory there.  Everything else is the exact
@@ -2451,6 +2478,11 @@ def run_helper(
     call is the helper's real effect on the caller's state.
     """
     where = f"{context}: the helper {helper.symbol}"
+    require(
+        not helper.relocations or state.frame is not None,
+        f"{where} has relocated fields (it names globals or other code), which only a "
+        "whole-function proof simulates",
+    )
     undefined.count += 1
     if _equivalences(state) and return_offset is not None:
         returned = lin(return_offset, ((CODE_ENTRY, 1),))
@@ -2465,30 +2497,61 @@ def run_helper(
     frame = state.frame
     if frame is not None:
         frame.helper_reads = undefined
-    decoded: dict[int, _Instruction] = {}
+    decoded: dict[tuple[str, int], _Instruction] = {}
+    # The calls into other bodies still to return: (body, return offset,
+    # pushed return address).
+    frames: list[tuple[HelperCode, int, Term]] = []
+    body = helper
     try:
         offset = 0
         steps = 0
         while True:
             steps += 1
             require(steps <= HELPER_MAX_STEPS, f"{where} runs past {HELPER_MAX_STEPS} steps")
-            require(0 <= offset < len(helper.code), f"{where} reaches {offset}, outside its body")
-            item = decoded.get(offset)
+            here = f"{where}" if body is helper else f"{where} (in {body.symbol})"
+            require(0 <= offset < len(body.code), f"{here} reaches {offset}, outside its body")
+            item = decoded.get((body.symbol, offset))
             if item is None:
-                item = _Instruction(helper.code, offset, {}, where, helper=True)
-                decoded[offset] = item
+                item = _Instruction(body.code, offset, body.relocations, here, helper=True)
+                decoded[(body.symbol, offset)] = item
             op = item.opcode
             if op in (0xC3, 0xC2) and not item.operand16:
+                expected = frames[-1][2] if frames else returned
                 address = _load(state, state.regs["esp"], 4)
-                require(address == returned, f"{where} returns to another address")
+                require(address == expected, f"{here} returns to another address")
                 pop = 4
                 if op == 0xC2:
                     pop += int.from_bytes(item.raw[item.cursor : item.cursor + 2], "little")
                 state.regs["esp"] = lin_add(state.regs["esp"], lin(pop))
-                break
+                if not frames:
+                    break
+                body, offset, _address = frames.pop()
+                continue
+            transfer = _helper_transfer(body, item)
+            if transfer is not None:
+                kind, target = transfer
+                if kind == "call":
+                    require(
+                        len(frames) < HELPER_MAX_DEPTH,
+                        f"{here} calls deeper than {HELPER_MAX_DEPTH} helpers",
+                    )
+                    undefined.count += 1
+                    inner = lin_atom(("retaddr", undefined.tag, undefined.count))
+                    _push(state, inner)
+                    frames.append((body, offset + item.length, inner))
+                elif kind == "jcc":
+                    decided = _helper_decide(state, item.raw[item.cursor - 1] & 15, here)
+                    if not decided:
+                        offset += item.length
+                        continue
+                if isinstance(target, int):
+                    offset = target
+                else:
+                    body, offset = cast(HelperCode, target), 0
+                continue
             require(
-                op not in (0xE8, 0x9A) and not (op == 0xFF and item.modrm()[1] in (2, 3, 4, 5)),
-                f"{where} calls out or transfers control indirectly",
+                not (op == 0xFF and item.modrm()[1] in (2, 3, 4, 5)) and op != 0x9A,
+                f"{here} calls out or transfers control indirectly",
             )
             action, detail = _step(state, item, undefined)
             following = offset + item.length
@@ -2499,16 +2562,7 @@ def run_helper(
                 offset = detail
                 continue
             code_value, target = detail
-            decided = condition(code_value, state.flags)
-            if not isinstance(decided, bool):
-                atom, polarity = decided
-                known = dict(state.conditions)
-                require(
-                    atom in known,
-                    f"{where} branches on a value that is not constant at the call",
-                )
-                decided = known[atom] == polarity
-            offset = target if decided else following
+            offset = target if _helper_decide(state, code_value, here) else following
     finally:
         if frame is not None:
             frame.helper_reads = None
@@ -2529,6 +2583,144 @@ def run_helper(
     ]
 
 
+HELPER_MAX_DEPTH = 4
+
+
+def _helper_transfer(body: HelperCode, item: _Instruction) -> tuple[str, Any] | None:
+    """A helper's call or jump into code: (``call``/``jmp``/``jcc``, offset or body), or None.
+
+    ``call rel32`` without a relocation calls an offset of the same body; one
+    whose field is relocated names another body, which must be a compiler
+    helper the library resolved (``body.linked``) -- a call to anything else
+    (a C function, an import) reaches the environment and is refused.  A
+    ``jmp rel32`` or ``jcc rel32`` whose field is relocated is a tail jump
+    into another body.  Every other instruction is None (``_step`` runs it).
+    """
+    op = item.opcode
+    if op == 0xE8:
+        kind = "call"
+    elif op == 0xE9:
+        kind = "jmp"
+    elif 0x0F80 <= op <= 0x0F8F:
+        kind = "jcc"
+    else:
+        return None
+    field_at = item.offset + item.cursor
+    target = body.relocations.get(field_at)
+    if target is None:
+        if kind != "call":
+            return None  # an ordinary branch of the body: ``_step`` takes it
+        displacement = int.from_bytes(
+            item.raw[item.cursor : item.cursor + 4], "little", signed=True
+        )
+        return (kind, item.offset + item.length + displacement)
+    require(
+        isinstance(target, tuple) and target[0] == "rel32",
+        f"{item.context}: a {kind} through an absolute field",
+    )
+    addend = int.from_bytes(item.raw[item.cursor : item.cursor + 4], "little", signed=True)
+    require(addend == 0, f"{item.context}: a {kind} into the middle of a symbol")
+    name = cast(tuple[str, str], target)[1]
+    callee = body.linked.get(name)
+    require(
+        callee is not None,
+        f"{item.context}: the helper {kind}s {name}, outside the toolchain's compiler helpers "
+        "the library resolves (it reaches the environment: a C function, an import, or a "
+        "helper beyond the closure's bounds)",
+    )
+    return (kind, callee)
+
+
+def _helper_decide(state: PathState, code_value: int, context: str) -> bool:
+    """Whether a helper's conditional branch is taken: a constant, a path fact, or a range.
+
+    The run does not fork.  In a whole-function proof a comparison of a
+    value whose range its term fixes (`interval_truth`) is decided too.
+    """
+    decided = condition(code_value, state.flags)
+    if isinstance(decided, bool):
+        return decided
+    atom, polarity = decided
+    known = dict(state.conditions)
+    if atom in known:
+        return known[atom] == polarity
+    truth = interval_truth(atom) if state.frame is not None else None
+    require(
+        truth is not None,
+        f"{context} branches on a value that is not constant at the call",
+    )
+    return truth == polarity
+
+
+def term_range(value: Term) -> tuple[int, int] | None:
+    """[lo, hi] holding a 32-bit term's unsigned value, when its form bounds it exactly.
+
+    An atom is bounded when its form says so: a zero-extended narrow value
+    ``("zx", part, w)`` lies in [0, 2**w - 1]; a constant with bits
+    [low, low + w) replaced (``("ins", k, low, w, part)``) between the
+    constant with those bits clear and with them set; ``x & m`` for a
+    constant m in [0, m].  A linear form ``c + sum(k_i a_i)`` of bounded
+    atoms is bounded by the integer sum's range when that range lies in
+    [0, 2**32) for some representative of c mod 2**32: the machine value is
+    then that integer, with no wrap.  Every other term is None.
+    """
+    if value[0] != "lin":
+        return None
+    low_sum = high_sum = 0
+    for atom, coefficient in value[2]:
+        bounds = _atom_range(atom)
+        if bounds is None:
+            return None
+        factor = _signed(coefficient, 32)
+        lo, hi = bounds
+        if factor >= 0:
+            low_sum += factor * lo
+            high_sum += factor * hi
+        else:
+            low_sum += factor * hi
+            high_sum += factor * lo
+    for constant in (value[1], value[1] - (1 << 32)):
+        if constant + low_sum >= 0 and constant + high_sum < 1 << 32:
+            return (constant + low_sum, constant + high_sum)
+    return None
+
+
+def _atom_range(atom: Term) -> tuple[int, int] | None:
+    if not isinstance(atom, tuple) or not atom:
+        return None
+    if atom[0] == "zx" and isinstance(atom[2], int):
+        return (0, (1 << atom[2]) - 1)
+    if atom[0] == "ins" and const_of(atom[1]) is not None:
+        mask = ((1 << atom[3]) - 1) << atom[2]
+        cleared = cast(int, const_of(atom[1])) & ~mask & _MASK
+        return (cleared, cleared | mask)
+    if atom[0] == "op" and atom[1] == "and" and atom[2] == 32:
+        masks = [const_of(operand) for operand in atom[3] if const_of(operand) is not None]
+        if masks:
+            return (0, min(cast(int, mask) for mask in masks))
+    return None
+
+
+def interval_truth(atom: Term) -> bool | None:
+    """The truth of an unsigned compare or zero test whose operands' ranges decide it, else None."""
+    if not isinstance(atom, tuple) or len(atom) < 3 or atom[1] != 32:
+        return None
+    if atom[0] == "ltu" and len(atom) == 4:
+        left, right = term_range(atom[2]), term_range(atom[3])
+        if left is None or right is None:
+            return None
+        if left[1] < right[0]:
+            return True
+        if left[0] >= right[1]:
+            return False
+        return None
+    if atom[0] == "eqz" and len(atom) == 3:
+        bounds = term_range(atom[2])
+        if bounds is not None and bounds[0] > 0:
+            return False
+    return None
+
+
 def _below(store: tuple[Term, int, Term], esp: Term) -> bool:
     """Whether a store lies wholly below ESP (a constant offset from it)."""
     offset = const_of(lin_sub(store[0], esp))
@@ -2537,32 +2729,94 @@ def _below(store: tuple[Term, int, Term], esp: Term) -> bool:
     return _signed(offset, 32) + store[1] <= 0
 
 
-def _vtable_call(state: PathState, item: _Instruction, undefined: _Undefined, context: str) -> None:
-    """``call [reg+disp]`` through a slot of a vtable loaded from memory: an event.
+def _indirect_call(
+    state: PathState, item: _Instruction, undefined: _Undefined, context: str
+) -> None:
+    """``call r/m32`` through a pointer (``FF /2``): an event named by the pointer's term.
 
-    The operand's address must be one 32-bit load (the vtable pointer, read
-    from an object) plus a constant (the slot).  The callee is the word in
-    that slot, a term: two versions name the same callee exactly when they
-    read the same slot of the same vtable from the same memory.  It is a
-    COM method (``__stdcall``: no register argument, the arguments popped
-    on return); the bytes it pops are ``item.indirect_pop``, determined by
-    the whole-function proof from each version's stack relation and part of
-    the event's name, so two versions that disagree make different calls.
+    The callee is the word the operand holds -- a register's term, or the
+    word loaded from the operand's address (a COM vtable's slot, a structure
+    field, a variable, an argument): two versions name the same callee
+    exactly when their terms are equal, which for a load means the same
+    address read from the same memory.  It takes no argument in a register
+    and keeps EBX, ESI, EDI and EBP (a5 for a COM method, a12 of
+    `function_validation` for any other pointer); the bytes it pops are
+    ``item.indirect_pop``, determined by the whole-function proof from each
+    version's stack relation and part of the event's name, so two versions
+    that disagree make different calls.  A pointer whose term is a code
+    address of this function (``CODE_ENTRY`` plus an offset) is refused:
+    both versions run from one entry address but hold different code there.
     """
-    address = item.address(state.regs)
-    terms: tuple[Any, ...] = address[2] if address[0] == "lin" else ()
+    mod = item.modrm()[0]
+    if mod == 3:
+        target = _get(state, item.modrm()[2], 32)
+    else:
+        target = _load(state, item.address(state.regs), 4)
     require(
-        len(terms) == 1
-        and terms[0][1] == 1
-        and isinstance(terms[0][0], tuple)
-        and terms[0][0][0] == "ld"
-        and terms[0][0][2] == 4,
-        f"{context}: an indirect call whose operand is not a slot of a vtable loaded from memory "
-        "is outside the simulator's closed set",
+        not mentions_atom(target, CODE_ENTRY),
+        f"{context}: an indirect call to a code address of this function",
     )
-    target = _load(state, address, 4)
     pop = cast(int, item.indirect_pop)
+    if item.pushed_pop:
+        _require_pushed_arguments(state, pop, context)
     _call(state, ("indirect", target, ("pop", pop)), None, undefined, context, pop=pop)
+
+
+# A word holding a callee-saved register's entry value: a register save.
+SAVED_ENTRY_VALUES = frozenset(lin_atom(("reg0", name)) for name in ("ebx", "ebp", "esi", "edi"))
+
+
+def _require_pushed_arguments(state: PathState, pop: int, context: str) -> None:
+    """An a11 pop's words are arguments: none of them holds a saved register's entry value.
+
+    A ``push esi`` that saves a callee-saved register lazily, between two
+    calls, is not an argument; counted as one it would make the pop too
+    large.  Each word [ESP, ESP + pop) is read as the frame model or the
+    store log holds it (without recording an access).
+    """
+    esp = state.regs["esp"]
+    for at in range(0, pop, 4):
+        address = lin_add(esp, lin(at))
+        word: Term = None
+        frame = state.frame
+        if frame is not None and frame.facts.private:
+            offset = _esp_word(address)
+            word = None if offset is None else frame.slots.get((offset, 4))
+        else:
+            for entry in reversed(state.stores):
+                if entry[0] == address and entry[1] == 4:
+                    word = entry[2]
+                    break
+                if address_relation(address, 4, entry[0], entry[1], None) != "disjoint":
+                    break
+        require(
+            word not in SAVED_ENTRY_VALUES,
+            f"{context}: a word the indirect call's pop counts as an argument (ESP+{at}) holds a "
+            "saved register's entry value, so it is not an argument (a11)",
+        )
+
+
+def _esp_word(address: Term) -> int | None:
+    """k when an address is ESP0 + k (the entry ESP's atom), else None."""
+    if address[0] != "lin" or address[2] != ((_ENTRY_ESP, 1),):
+        return None
+    return _signed(address[1], 32)
+
+
+def mentions_atom(value: Term, atom: Term) -> bool:
+    """Whether a term mentions ``atom`` (visiting each shared subterm once)."""
+    stack = [value]
+    seen: set[int] = set()
+    while stack:
+        current = stack.pop()
+        if current == atom:
+            return True
+        if isinstance(current, (tuple, list, frozenset)):
+            if id(current) in seen:
+                continue
+            seen.add(id(current))
+            stack.extend(item for item in current if not isinstance(item, (str, int)))
+    return False
 
 
 def _step(
@@ -2872,8 +3126,8 @@ def _step(
                 x87_returns if state.frame is not None else None,
             )
             return ("fall", None)
-        if op == 0xFF and digit == 2 and mod != 3 and item.indirect_pop is not None:
-            _vtable_call(state, item, undefined, context)
+        if op == 0xFF and digit == 2 and item.indirect_pop is not None:
+            _indirect_call(state, item, undefined, context)
             return ("fall", None)
         require(
             op == 0xFF and digit == 6,
@@ -2888,7 +3142,15 @@ def _step(
             addend == 0, f"{context}: a call into the middle of a symbol is outside the closed set"
         )
         if helpers is not None and symbol in helpers:
+            esp = state.regs["esp"]
             run_helper(state, helpers[symbol], undefined, context, item.offset + item.length)
+            if item.helper_stack_change is not None:
+                change = const_of(lin_sub(state.regs["esp"], esp))
+                require(
+                    change is not None and _signed(change, 32) == item.helper_stack_change,
+                    f"{context}: the helper {symbol} changes ESP otherwise than the stack relation "
+                    f"solved ({item.helper_stack_change:+d})",
+                )
             return ("fall", None)
         _call(state, ("direct", symbol), symbol, undefined, context, x87_returns)
         return ("fall", None)

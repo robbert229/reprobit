@@ -16,28 +16,43 @@ MSVC50_LIBRARY_AUTHORITIES`, whose digest is the library's in the profile's
 reviewed ``lib`` tree (`reprobit.toolchain_helper_library`).  :meth:`HelperLibrary.
 helper` resolves a symbol as the linker does, through the archive's first
 linker member (the symbol index), to the one member that defines it; that
-member's definition must be external, in a code section with no relocation
-(so the helper names no global and calls nothing), and the helper's body is
-that section's bytes from the symbol's value to the section's end.  The
-region simulator runs those bytes inline at every call
+member's definition must be external, in a code section, and the helper's
+body is that section's bytes from the symbol's value to the section's end.
+The region simulator runs those bytes inline at every call
 (`region_simulation.run_helper`), and the record pins the library's digest
 and the body's.
 
+A section may have relocations (``__isctype`` reads the ``__pctype``
+global; ``__CIacos`` calls and jumps into the helpers of ``common.obj``).
+Each DIR32 or REL32 field of the body is kept by its offset, its target
+named as the linker resolves it (:func:`linker_name`: an external by name, a
+static qualified by its member and section); any other relocation type is
+refused.  Every compiler helper a REL32 field names is resolved here too,
+breadth first, while the closure stays within MAX_HELPER_MEMBERS bodies and
+MAX_HELPER_DEPTH calls deep, and each body of the closure carries the whole
+closure (``HelperCode.linked``); a C function or an import a field names is
+never resolved, so a run that reaches it is refused as reaching the
+environment.  Only a whole-function proof runs a relocated body, and the
+record then pins the digest of its fields and of every body in its closure.
+
 The one assumption is the one every installed body already rests on: the
-linked image's helper is that library member's section, copied unchanged
-(it has no relocation to apply), so the bytes the proof ran are the bytes
+linked image's helper is that library member's section with its relocations
+applied to the symbols the linker resolves them to -- the same definition a
+name has wherever the program names it, and a static of the member placed
+with that member -- so the bytes and addresses the proof ran are the ones
 the program runs.  Nothing here carries a helper's bytes into a record.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from reprobit.binary import ByteIdentityError, require
-from reprobit.coff_format import CoffObject, coff_body
+from reprobit.coff_format import CoffObject, coff_body, detailed_relocations
 
 from .region_simulation import HelperCode, callee_stack_pop
 
@@ -86,7 +101,7 @@ class HelperBody:
 
     def pin(self) -> dict[str, Any]:
         """What a record pins: the library, its digest, the member and the body's digest."""
-        return {
+        pin: dict[str, Any] = {
             "symbol": self.code.symbol,
             "library": self.library,
             "library_sha256": self.library_sha256,
@@ -94,6 +109,21 @@ class HelperBody:
             "body_sha256": self.code.sha256,
             "body_length": len(self.code.code),
         }
+        if self.code.relocations:
+            # Only a relocated body pins its fields and its closure, so every
+            # self-contained helper's pin is the one records made before.
+            pin["relocations_sha256"] = relocations_digest(self.code.relocations)
+            pin["linked"] = [
+                {
+                    "symbol": code.symbol,
+                    "body_sha256": code.sha256,
+                    "body_length": len(code.code),
+                    "relocations_sha256": relocations_digest(code.relocations),
+                }
+                for code in sorted(self.code.linked.values(), key=lambda item: item.symbol)
+                if code.symbol != self.code.symbol
+            ]
+        return pin
 
 
 class HelperLibrary:
@@ -120,7 +150,21 @@ class HelperLibrary:
         self._resolved: dict[str, HelperBody] = {}
 
     def helper(self, symbol: str) -> HelperBody:
-        """The verified body of ``symbol``, or a refusal saying why it is not admitted."""
+        """The verified body of ``symbol``, or a refusal saying why it is not admitted.
+
+        A body whose section has relocations carries them (`HelperCode.
+        relocations`), and every compiler helper its REL32 fields name is
+        resolved here too, transitively, while the closure stays within
+        MAX_HELPER_MEMBERS bodies and MAX_HELPER_DEPTH calls deep; one beyond
+        those bounds, or one the library does not admit, stays unresolved and
+        a run that reaches it is refused.
+        """
+        resolved = self._resolve(symbol)
+        if resolved.code.relocations:
+            self._link(resolved)
+        return resolved
+
+    def _resolve(self, symbol: str) -> HelperBody:
         if symbol in self._resolved:
             return self._resolved[symbol]
         where = f"the compiler helper {symbol} in {self.path}"
@@ -145,29 +189,126 @@ class HelperLibrary:
         section = coff.sections[definition["section"] - 1]
         if not section["characteristics"] & _CODE:
             raise HelperLibraryError(f"{where}: it is not defined in a code section")
-        if section["relocation_count"]:
-            raise HelperLibraryError(
-                f"{where}: its section has {section['relocation_count']} relocations, so it calls "
-                "out or touches the environment (global state); only a self-contained helper is "
-                "simulated"
-            )
         body = bytes(coff_body(coff, section))
         start = definition["value"]
         if not 0 <= start < len(body):
             raise HelperLibraryError(f"{where}: its value lies outside its section")
         code = body[start:]
+        relocations = _body_relocations(coff, section, start, name, where)
         resolved = HelperBody(
             self.path,
             self.sha256,
             name,
-            HelperCode(symbol, code, hashlib.sha256(code).hexdigest()),
+            HelperCode(symbol, code, hashlib.sha256(code).hexdigest(), relocations, {}),
         )
         self._resolved[symbol] = resolved
         return resolved
 
+    def _link(self, root: HelperBody) -> None:
+        """Resolve the compiler helpers ``root``'s REL32 fields name, breadth first, bounded.
+
+        Every body of the closure gets the whole closure as its ``linked``
+        map, so a helper it reaches finds its own callees there too.
+        """
+        if root.code.linked:
+            return
+        members = {root.code.symbol: root}
+        frontier = [(root, 0)]
+        while frontier:
+            body, depth = frontier.pop(0)
+            for target in sorted(_called_helpers(body.code)):
+                if target in members or depth + 1 > MAX_HELPER_DEPTH:
+                    continue
+                if len(members) >= MAX_HELPER_MEMBERS:
+                    frontier.clear()
+                    break
+                try:
+                    callee = self._resolve(target)
+                except HelperLibraryError:
+                    continue
+                members[target] = callee
+                frontier.append((callee, depth + 1))
+        for body in members.values():
+            linked = cast(dict[str, HelperCode], body.code.linked)
+            if not linked:
+                linked.update({symbol: member.code for symbol, member in members.items()})
+
+    def closure(self, body: HelperBody) -> list[HelperBody]:
+        """Every body a run of ``body`` may reach: itself and its resolved helpers, sorted."""
+        seen = {body.code.symbol: body}
+        for symbol in body.code.linked:
+            seen[symbol] = self._resolved[symbol]
+        return [seen[symbol] for symbol in sorted(seen)]
+
     def helpers(self, symbols: list[str]) -> dict[str, HelperBody]:
         """Every symbol's verified body (sorted), refusing at the first that is not admitted."""
         return {symbol: self.helper(symbol) for symbol in sorted(set(symbols))}
+
+
+MAX_HELPER_MEMBERS = 8
+MAX_HELPER_DEPTH = 4
+_DIR32 = 0x0006
+_REL32 = 0x0014
+
+
+def relocations_digest(relocations: Mapping[int, Any]) -> str:
+    """The SHA-256 of a body's relocated fields, in a canonical text."""
+    text = json.dumps(
+        [
+            [offset, list(target) if isinstance(target, tuple) else target]
+            for offset, target in sorted(relocations.items())
+        ],
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def linker_name(row: Mapping[str, Any], member: str) -> str:
+    """The name a relocation's target has in the linked image.
+
+    An external symbol is one definition the linker resolves by name, the
+    same in every object that names it (the caller's own ``__pctype`` read
+    is the helper's); a static or section symbol is private to its member,
+    so it is qualified by the member and section, which no linker name can
+    be (``|`` is not a C identifier character).
+    """
+    if row["target_storage"] == _EXTERNAL:
+        return cast(str, row["target"])
+    return f"{member}|{row['target_section']}|{row['target']}"
+
+
+def _body_relocations(
+    coff: CoffObject, section: Any, start: int, member: str, where: str
+) -> dict[int, Any]:
+    """A helper body's relocated fields by offset in the body (from ``start``)."""
+    found: dict[int, Any] = {}
+    for row in detailed_relocations(coff, section):
+        offset = row["offset"] - start
+        if offset < 0:
+            continue  # a field of the code before the symbol, outside the body
+        if row["type"] == _REL32:
+            if row["target_section"] == section["number"]:
+                raise HelperLibraryError(
+                    f"{where}: a PC-relative field at {offset} names its own section"
+                )
+            found[offset] = ("rel32", linker_name(row, member))
+        elif row["type"] == _DIR32:
+            found[offset] = linker_name(row, member)
+        else:
+            raise HelperLibraryError(
+                f"{where}: a relocation of type 0x{row['type']:04x} at {offset} is neither a DIR32 "
+                "nor a REL32 field"
+            )
+    return found
+
+
+def _called_helpers(code: HelperCode) -> set[str]:
+    """The compiler helpers a body's REL32 fields name (its calls and tail jumps)."""
+    return {
+        target[1]
+        for target in code.relocations.values()
+        if isinstance(target, tuple) and compiler_helper(target[1])
+    }
 
 
 def authenticate_helper_library(
