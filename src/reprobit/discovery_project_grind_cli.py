@@ -109,6 +109,7 @@ def _campaign_callbacks(
         probe_seed=probe_seed,
         probe_donors=probe_donors,
         cold_verify=callbacks.cold_verify,
+        helper_library=callbacks.helper_library,
     )
 
 

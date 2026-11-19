@@ -19,6 +19,7 @@ from reprobit.authority_snapshot import (
     assert_json_authority_unchanged,
 )
 from reprobit.binary import ByteIdentityError
+from reprobit.classic.toolchain_helpers import HelperLibrary, HelperLibraryError
 from reprobit.classic_donors import (
     generate_declaration_shape,
     generate_extern_run,
@@ -92,19 +93,32 @@ SeedProbe = Callable[[Path, str], bytes]
 DonorProgress = Callable[[int, int, str], None]
 DonorProbe = Callable[[Path, tuple[str, ...], DonorProgress | None], Mapping[str, bytes]]
 ColdVerifier = Callable[[Path], ColdTrialEvidence]
+HelperLibraryLoader = Callable[[str], HelperLibrary | None]
 GrindProgress = Callable[
     [int, int, str, str, ProgressKind, str | None],
     None,
 ]
 
 
+def no_helper_library(profile: str) -> HelperLibrary | None:
+    """No toolchain library: a proof whose donor calls a compiler helper refuses."""
+    del profile
+    return None
+
+
 @dataclass(frozen=True, slots=True)
 class ProjectGrindCallbacks:
-    """Execution seams supplied by the CLI's authenticated runtime."""
+    """Execution seams supplied by the CLI's authenticated runtime.
+
+    ``helper_library`` maps the sealed project's toolchain profile to the
+    authenticated ``lib/libc.lib`` under the toolchain root the probes compile
+    with (`reprobit.toolchain_helper_library.load_helper_library`), or None.
+    """
 
     probe_seed: SeedProbe
     probe_donors: DonorProbe
     cold_verify: ColdVerifier
+    helper_library: HelperLibraryLoader = no_helper_library
 
 
 @dataclass(frozen=True, slots=True)
@@ -382,12 +396,15 @@ def _state_rewriting(
     seed_object: bytes,
     donor_object: bytes,
     reference_object: bytes,
+    helper_library: HelperLibrary | None = None,
 ) -> DeclarationShapeEqualBodyAuthoring:
     """Author the state's extern-run donor and a donor rewriting reaching the reference.
 
     A reordering is tried first; when none reaches the reference, a
     region-resize rewriting (whose replacements may change the length); when
     no region replacement proves, a whole-function translation validation.
+    ``helper_library`` is the authenticated toolchain library both proofs
+    simulate compiler helpers from; without it they refuse helper calls.
     """
 
     _require_grind_family(state)
@@ -432,6 +449,7 @@ def _state_rewriting(
                 seed_object=seed_object,
                 donor_object=donor_object,
                 reference_object=reference_object,
+                helper_library=helper_library,
             )
         except DiscoveryAuthoringError as error:
             resize_error = error
@@ -447,6 +465,7 @@ def _state_rewriting(
                 seed_object=seed_object,
                 donor_object=donor_object,
                 reference_object=reference_object,
+                helper_library=helper_library,
             )
         except DiscoveryAuthoringError as validation_error:
             raise DiscoveryAuthoringError(
@@ -514,6 +533,7 @@ def qualify_state(
     donor_object: bytes,
     reference_object: bytes,
     seed_body: bool = False,
+    helper_library: HelperLibrary | None = None,
 ) -> DeclarationShapeEqualBodyAuthoring:
     """Author one state's records and check the candidate against the reference object.
 
@@ -521,6 +541,8 @@ def qualify_state(
     (a reorder, then a region resize).  A donor that compiles the seed's own
     body (``seed_body``) can only be rewritten -- an equal-body family has
     nothing to splice -- so it goes straight to the rewriting.
+    ``helper_library`` is passed to the rewriting's proofs
+    (:func:`_state_rewriting`).
     """
 
     if seed_body:
@@ -531,6 +553,7 @@ def qualify_state(
                 seed_object=seed_object,
                 donor_object=donor_object,
                 reference_object=reference_object,
+                helper_library=helper_library,
             )
         except DiscoveryAuthoringError as rewriting_error:
             raise DiscoveryAuthoringError(
@@ -564,6 +587,7 @@ def qualify_state(
                 seed_object=seed_object,
                 donor_object=donor_object,
                 reference_object=reference_object,
+                helper_library=helper_library,
             )
         except DiscoveryAuthoringError as rewriting_error:
             raise DiscoveryAuthoringError(f"{splice_error}; rewriting: {rewriting_error}") from None
@@ -573,6 +597,20 @@ def qualify_state(
             symbol=context.symbol,
         )
     return authored
+
+
+def _grind_helper_library(
+    callbacks: ProjectGrindCallbacks, context: ProjectGrindContext
+) -> HelperLibrary | None:
+    """The authenticated toolchain library of the sealed project's profile, or None.
+
+    Loaded at most once per grind.  Library bytes that are not the reviewed ones
+    supply no library, so the proofs refuse helper calls as without one.
+    """
+    try:
+        return callbacks.helper_library(context.bundle.spec.toolchain.profile)
+    except HelperLibraryError:
+        return None
 
 
 def describe_state(state: DeclarationState) -> str:
@@ -802,6 +840,14 @@ def run_project_grind(
         original_shard_cost = calculate_cost(
             context.intervention_document.interventions
         ).project_total
+        # Read on the first donor rewriting, then reused for every state.
+        loaded_library: list[HelperLibrary | None] = []
+
+        def helper_library() -> HelperLibrary | None:
+            if not loaded_library:
+                loaded_library.append(_grind_helper_library(callbacks, context))
+            return loaded_library[0]
+
         try:
             states = enumerate_declaration_states(context.config.plan)
         except DiscoveryError as exc:
@@ -910,6 +956,7 @@ def run_project_grind(
                     donor_object=donor_object,
                     reference_object=reference_object,
                     seed_body=seed_body,
+                    helper_library=helper_library(),
                 )
                 if authored.donor.intervention.id != provisional_record.intervention.id:
                     raise GrindError("final donor identity differs from its compiler probe")
@@ -1114,8 +1161,10 @@ __all__ = [
     "GrindError",
     "GrindRejection",
     "GrindSolution",
+    "HelperLibraryLoader",
     "ProjectGrindCallbacks",
     "ProjectGrindResult",
+    "no_helper_library",
     "require_single_acceptance",
     "run_project_grind",
 ]

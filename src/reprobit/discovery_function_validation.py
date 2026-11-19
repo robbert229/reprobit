@@ -28,10 +28,12 @@ from reprobit.classic.coff import (
     function_multiset,
 )
 from reprobit.classic.composition_mosaic import instruction_mosaic_metadata_sha256
+from reprobit.classic.debug import MSVC50_FUNCTION_FILL_BYTE
 from reprobit.classic.foundation import sha256_bytes
 from reprobit.classic.function_validation import (
     FUNCTION_VALIDATION_KIND,
     measure_function_validation,
+    section_label_values,
 )
 from reprobit.classic.region_simulation import region_boundaries
 from reprobit.classic.toolchain_helpers import HelperLibrary
@@ -79,22 +81,50 @@ _RELOCATION_FIELDS = (
 
 
 def _pair_relocations(
-    donor_rows: list[dict[str, Any]], reference_rows: list[dict[str, Any]]
+    donor_rows: list[dict[str, Any]],
+    reference_rows: list[dict[str, Any]],
+    donor_section: int | None = None,
+    reference_section: int | None = None,
 ) -> list[list[int]]:
     """Each reference field with an unused donor record of the same symbol and type.
 
-    The first such record whose addend is the field's own is taken, else the
-    first such record.  The proof names a relocated value by its target alone
-    (the addend is in the bytes), but the installed table's records are the
-    donor's re-seated and must match the image's fields addend for addend: so
-    when two fields of one symbol move past each other (stores to two globals
-    reordered), each still takes the record of its own displacement.  Where
-    the first record already has the field's addend, the choice is the one
-    made before.
+    Of those, the first whose addend is the field's own is taken, else the
+    first.  The proof names a relocated value by its target alone (the
+    addend is in the bytes), but the installed table's records are the
+    donor's re-seated and must match the image's fields addend for addend:
+    so when two fields of one symbol move past each other, each still takes
+    the record of its own displacement.
+
+    A record naming the function's own section (a switch table's base or
+    entry, a recursive call) takes the donor record of the same symbol name
+    and type, occurrence by occurrence in offset order: the label's place
+    differs between the two bodies, and the producer proves whatever pairing
+    is declared.
     """
-    unused = list(donor_rows)
-    pairs = []
-    for row in sorted(reference_rows, key=lambda item: item["offset"]):
+    own_donor = [row for row in donor_rows if row["target_section"] == donor_section]
+    own_reference = [row for row in reference_rows if row["target_section"] == reference_section]
+    pairs: list[list[int]] = []
+    for name in sorted({row["target"] for row in own_donor + own_reference}):
+        for kind in sorted({row["type"] for row in own_donor + own_reference}):
+            mine = sorted(
+                row["offset"] for row in own_donor if (row["target"], row["type"]) == (name, kind)
+            )
+            theirs = sorted(
+                row["offset"]
+                for row in own_reference
+                if (row["target"], row["type"]) == (name, kind)
+            )
+            if len(mine) != len(theirs):
+                raise DiscoveryAuthoringError(
+                    f"the reference names its own {name} {len(theirs)} times, the donor "
+                    f"{len(mine)} times"
+                )
+            pairs.extend([local, donor] for local, donor in zip(theirs, mine, strict=True))
+    unused = [row for row in donor_rows if row["target_section"] != donor_section]
+    for row in sorted(
+        (row for row in reference_rows if row["target_section"] != reference_section),
+        key=lambda item: item["offset"],
+    ):
         candidates = [
             candidate
             for candidate in unused
@@ -116,7 +146,116 @@ def _pair_relocations(
         raise DiscoveryAuthoringError(
             f"the donor relocates {unused[0]['target']} more often than the reference"
         )
-    return pairs
+    return sorted(pairs)
+
+
+def _labels(
+    donor: CoffObject,
+    donor_section: dict[str, Any],
+    reference: CoffObject,
+    reference_section: dict[str, Any],
+    pairs: list[list[int]],
+    donor_rows: list[dict[str, Any]],
+    reference_rows: list[dict[str, Any]],
+) -> list[list[int]]:
+    """Where each label of the donor's section lies in the reference.
+
+    A label a paired field names lies where the reference's paired record
+    names its own label; every other label (a ``goto`` label) where the
+    reference's symbol of the same name lies.
+    """
+    places: dict[int, int] = {}
+    by_donor = {row["offset"]: row for row in donor_rows}
+    by_reference = {row["offset"]: row for row in reference_rows}
+    for local, donor_offset in pairs:
+        mine, theirs = by_donor[donor_offset], by_reference[local]
+        if mine["target_section"] != donor_section["number"] or mine["target_value"] == 0:
+            continue
+        place = places.setdefault(mine["target_value"], theirs["target_value"])
+        if place != theirs["target_value"]:
+            raise DiscoveryAuthoringError(
+                f"the donor's label at {mine['target_value']} is named at both "
+                f"{place} and {theirs['target_value']} of the reference"
+            )
+    named = {
+        item["name"]: item["value"]
+        for item in reference.symbols.values()
+        if item["section"] == reference_section["number"]
+    }
+    for value in sorted(section_label_values(donor, donor_section)):
+        if value in places:
+            continue
+        names = sorted(
+            item["name"]
+            for item in donor.symbols.values()
+            if item["section"] == donor_section["number"] and item["value"] == value
+        )
+        found = {named[name] for name in names if name in named}
+        if len(found) != 1:
+            raise DiscoveryAuthoringError(
+                f"the donor's label {names} at {value} has no one place in the reference"
+            )
+        places[value] = found.pop()
+    return [[donor_place, image_place] for donor_place, image_place in sorted(places.items())]
+
+
+def _reference_procedure(
+    reference: CoffObject,
+    section: dict[str, Any],
+    donor_body: bytes,
+    donor_proc: int,
+    donor_debug_end: int,
+    context: str,
+) -> tuple[int, int, int, int]:
+    """(procedure size, code end, fill alignment, debug end) of the reference.
+
+    A reference whose FPO or CodeView procedure size is stale (it is the
+    seed's, and the original's code is longer or shorter) is measured from
+    its body instead: its code is the body up to MSVC 5.0's fill, ending in
+    a ``ret`` or ``jmp``.  Its debug end is then the donor's, carried back
+    from the end by the donor's epilogue, which the reference must end with.
+    Only the code bytes, never these sizes, reach the record's proof.
+    """
+    body = bytes(coff_body(reference, section))
+    debug_raw = bytes(coff_body(reference, _comdat_child(reference, section, ".debug$S")))
+    try:
+        proc, code_end, fill = _procedure(reference, section, context)
+    except (ByteIdentityError, DiscoveryAuthoringError):
+        rows = detailed_relocations(reference, section)
+        if any(row["target_section"] == section["number"] for row in rows):
+            raise
+        code_end = len(body)
+        while code_end and body[code_end - 1] == MSVC50_FUNCTION_FILL_BYTE:
+            code_end -= 1
+        starts = region_boundaries(body, 0, code_end, f"{context} reference code")
+        straddling = sorted(
+            row["offset"]
+            for row in rows
+            if any(row["offset"] < start < row["offset"] + 4 for start in starts)
+        )
+        if straddling:
+            raise DiscoveryAuthoringError(
+                f"{context}: the reference is stale: its procedure size is the seed's and its "
+                f"relocated fields at {straddling[:5]} straddle its own instructions (a "
+                "synthetic reference that kept the seed's records for a longer or shorter "
+                "original)"
+            ) from None
+        last = body[starts[-1] : code_end]
+        if last[:1] not in (b"\xc3", b"\xc2", b"\xe9", b"\xeb"):
+            raise DiscoveryAuthoringError(
+                f"{context}: the reference's procedure size is stale and its code does not end "
+                "in a ret or jmp before its fill"
+            ) from None
+        epilogue = donor_body[donor_debug_end:donor_proc]
+        if not body[:code_end].endswith(epilogue):
+            raise DiscoveryAuthoringError(
+                f"{context}: the reference's procedure size is stale and it does not end with "
+                "the donor's epilogue, so its debug range cannot be carried"
+            ) from None
+        fill = 16 if len(body) != code_end else 1
+        return code_end, code_end, fill, code_end - len(epilogue)
+    _length, _start, debug_end = coff_unpack("<III", debug_raw, 16, f"{context} debug range")
+    return proc, code_end, fill, debug_end
 
 
 def build_function_validation_rewriting(
@@ -157,30 +296,48 @@ def build_function_validation_rewriting(
         if donor_body == reference_body:
             raise DiscoveryAuthoringError("the donor body already equals the reference body")
         proc, code_end, fill = _procedure(donor_coff, dp, f"{context} donor")
-        reference_proc, reference_code_end, reference_fill = _procedure(
-            reference, rp, f"{context} reference"
+        donor_debug = bytes(coff_body(donor_coff, _comdat_child(donor_coff, dp, ".debug$S")))
+        _length, _start, donor_debug_end = coff_unpack(
+            "<III", donor_debug, 16, f"{context} donor debug range"
         )
-        if code_end != proc or reference_code_end != reference_proc:
-            raise DiscoveryAuthoringError("a body has a data tail (a switch table)")
+        reference_proc, reference_code_end, reference_fill, debug_end = _reference_procedure(
+            reference, rp, donor_body, proc, donor_debug_end, f"{context} reference"
+        )
         fill_alignment = max(fill, reference_fill)
-        code = reference_body[:reference_proc]
+        code = reference_body[:reference_code_end]
+        tail = reference_body[reference_code_end:reference_proc]
         reference_rows = detailed_relocations(reference, rp)
         donor_rows = detailed_relocations(donor_coff, dp)
         starts = region_boundaries(code, 0, len(code), f"{context} reference")
+        straddling = sorted(
+            row["offset"]
+            for row in reference_rows
+            if any(row["offset"] < start < row["offset"] + 4 for start in starts)
+        )
+        if straddling:
+            raise DiscoveryAuthoringError(
+                f"{context} reference: the reference is stale: its relocated fields at "
+                f"{straddling[:5]} straddle its own instructions (a synthetic reference that "
+                "kept the seed's relocation offsets for a longer or shorter original)"
+            )
         instructions = [
             code[start:end].hex()
             for start, end in zip(starts, [*starts[1:], len(code)], strict=True)
         ]
-        debug_raw = bytes(coff_body(reference, _comdat_child(reference, rp, ".debug$S")))
-        _length, _start, debug_end = coff_unpack(
-            "<III", debug_raw, 16, f"{context} reference debug range"
-        )
+        pairs = _pair_relocations(donor_rows, reference_rows, dp["number"], rp["number"])
+        labels = _labels(donor_coff, dp, reference, rp, pairs, donor_rows, reference_rows)
         spec: dict[str, Any] = {
             "kind": FUNCTION_VALIDATION_KIND,
             "replacement_instructions": instructions,
-            "replacement_relocations": _pair_relocations(donor_rows, reference_rows),
+            "replacement_relocations": pairs,
             "replacement_debug_end": debug_end,
         }
+        if code_end != proc:
+            spec["donor_code_end"] = code_end
+        if tail:
+            spec["replacement_tail"] = tail.hex()
+        if labels:
+            spec["replacement_labels"] = labels
         image = reference_body
         seed_functions = function_multiset(seed)
         donor_functions = function_multiset(donor_coff)
