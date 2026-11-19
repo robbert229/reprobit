@@ -139,6 +139,17 @@ shared word's exception masks (x4), and ``fist`` names the word it rounds
 under.  A whole-function proof may set an instruction's ``indirect_pop``:
 ``call [reg+disp]`` through a vtable slot is then an event
 (:func:`_vtable_call`).
+
+A whole-function proof (an ``extended`` instruction, a path with a frame
+model) also gets three forms no region proof sees: ``rep stos``/``rep movs``
+of any count as one block event (:func:`_block_string`); the transcendental,
+constant and classifying D9 forms as uninterpreted terms of their operands
+(:func:`_x87_extended`); and, for a condition bit an instruction leaves
+undefined, the term ``("x87cc", bit, name)`` naming the instruction and the
+x87 state it ran from (:meth:`_X87.undefine`) in place of a fresh
+``x87undef`` term -- equal only to the bit the same instruction leaves from
+the same state (a8 of :mod:`reprobit.classic.function_validation`).  Region
+proofs still refuse all three.
 """
 
 from __future__ import annotations
@@ -604,6 +615,9 @@ class X87State:
     # The control word while an inlined compiler helper has changed it (a
     # 16-bit term); None is the control word both versions share (x4).
     cw: Term = None
+    # The absolute depth of the entry frame when a whole-function proof knows
+    # it (None in a region proof): with ``push`` it fixes TOP and the tags.
+    origin: Term = None
 
     def fork(self) -> X87State:
         return X87State(
@@ -619,6 +633,7 @@ class X87State:
             self.call_frame,
             list(self.call_pushes),
             self.cw,
+            self.origin,
         )
 
     def entry_term(self, position: int) -> Term:
@@ -1359,13 +1374,38 @@ def _x87_arith(kind: str, st0: Term, other: Term) -> Term:
 
 
 class _X87:
-    """The x87 operations of one instruction on one path's state."""
+    """The x87 operations of one instruction on one path's state.
 
-    def __init__(self, state: PathState, undefined: _Undefined, context: str) -> None:
+    In a whole-function proof (``state.frame`` set) the x87 state before the
+    instruction is recorded, so :meth:`undefine` can name the condition bits
+    the instruction leaves undefined by the instruction and that state (a8 of
+    :mod:`reprobit.classic.function_validation`).
+    """
+
+    def __init__(
+        self,
+        state: PathState,
+        undefined: _Undefined,
+        context: str,
+        item: _Instruction | None = None,
+    ) -> None:
         self.state = state
         self.fpu = state.fpu
         self.undefined = undefined
         self.context = context
+        self.item = item
+        self.before: Term = None
+        if state.frame is not None and item is not None:
+            fpu = state.fpu
+            self.before = (
+                fpu.origin,
+                fpu.base,
+                fpu.push,
+                fpu.view().slots,
+                tuple(fpu.cc[name] for name in X87_CONDITION_BITS),
+                tuple(sorted(set(fpu.events), key=repr)),
+                fpu.cw,
+            )
 
     def position(self, index: int) -> int:
         position = index - self.fpu.push
@@ -1406,10 +1446,49 @@ class _X87:
         self.state.footprint.add(("fpe", term))
 
     def undefine(self) -> None:
-        """Every condition bit after an instruction that is not a compare (Intel: undefined)."""
-        for name in X87_CONDITION_BITS:
-            self.undefined.count += 1
-            self.fpu.cc[name] = ("x87undef", name, self.undefined.tag, self.undefined.count)
+        """Every condition bit after an instruction that is not a compare (Intel: undefined).
+
+        In a region proof each bit is a fresh ``("x87undef", ...)`` term, which
+        no read may use.  In a whole-function proof each bit is
+        ``("x87cc", bit, name)``, where ``name`` digests the instruction's form
+        (opcode and ModR/M register or digit), its memory operand's address,
+        the whole x87 state before it (entry depth, TOP, every written
+        register, C0-C3, the exception set and the control word) and the
+        stack after it: under a8 the processor leaves in an undefined bit a
+        fixed function of exactly those, so the term equals only the bit the
+        same instruction leaves from the same state -- never a compare's
+        bit, a constant, or the bit of another instruction.
+        """
+        if self.before is None:
+            for name in X87_CONDITION_BITS:
+                self.undefined.count += 1
+                self.fpu.cc[name] = ("x87undef", name, self.undefined.tag, self.undefined.count)
+            return
+        item = cast(_Instruction, self.item)
+        mod, digit, index = item.modrm()
+        form = (item.opcode, digit, index) if mod == 3 else (item.opcode, digit, "m")
+        address = item.address(self.state.regs) if mod != 3 else None
+        frame = self.state.frame
+        name = frame.digest(
+            "x87cc", (form, address, self.before, self.fpu.push, self.fpu.view().slots)
+        )
+        sites = getattr(frame, "cc_sites", None)
+        if sites is not None:
+            sites.setdefault(name, item.context)
+        for bit in X87_CONDITION_BITS:
+            self.fpu.cc[bit] = ("x87cc", bit, name)
+
+    def define(self, operation: str, operands: tuple[Term, ...], bits: Iterable[str]) -> None:
+        """Condition bits an instruction defines as a function of its operands.
+
+        ``("fccfun", operation, bit, operands)``: Intel defines C1 after the
+        transcendentals as the rounding direction and C2 after ``fsin``/
+        ``fcos`` as "out of range", ``fprem``'s four bits as its quotient bits
+        and completeness, ``fxam``'s as the operand's class -- each a function
+        of the operands under the shared control word, never evaluated here.
+        """
+        for bit in bits:
+            self.fpu.cc[bit] = ("fccfun", operation, bit, operands)
 
     def compare(self, kind: str, other: Term) -> None:
         compare = ("fcmp", self.get(0), other)
@@ -1421,7 +1500,11 @@ class _X87:
     def status_word(self) -> Term:
         fpu = self.fpu
         exceptions = ("fexc", fpu.base, tuple(sorted(set(fpu.events), key=repr)))
-        top = ("ftop", fpu.base, fpu.push)
+        top = (
+            ("ftop", fpu.base, fpu.push)
+            if fpu.origin is None
+            else ("ftop", fpu.base, fpu.push, fpu.origin)
+        )
         return (
             "b",
             16,
@@ -1530,7 +1613,7 @@ def _x87_step(state: PathState, item: _Instruction, undefined: _Undefined) -> No
         "closed set (the callee's x87 return count is not determined, or it is not a direct "
         "call)",
     )
-    x87 = _X87(state, undefined, context)
+    x87 = _X87(state, undefined, context, item)
     state.fpu.used = True
     op = item.opcode
     mod, digit, index = item.modrm()
@@ -1653,7 +1736,125 @@ def _x87_step(state: PathState, item: _Instruction, undefined: _Undefined) -> No
         _set(state, 0, 16, x87.status_word())
         x87.undefine()
         return
+    if item.extended and op == 0xD9:
+        _x87_extended(x87, 0xC0 | digit << 3 | index, context)
+        return
     require(False, refused)
+
+
+# The D9 register forms a whole-function proof admits beyond the region set,
+# by ModR/M byte: name and shape.  Each result is an uninterpreted term of its
+# exact operands (``("fun", name, x)``, ``("fun2", name, a, b)``), never
+# evaluated: equal operands give equal results under the control word both
+# versions share (x4), whatever the rounding and precision control.
+_X87_EXTENDED: dict[int, tuple[str, str]] = {
+    0xD0: ("fnop", "nop"),
+    0xE4: ("ftst", "test"),
+    0xE5: ("fxam", "examine"),
+    0xE9: ("l2t", "constant"),
+    0xEA: ("l2e", "constant"),
+    0xEB: ("pi", "constant"),
+    0xEC: ("lg2", "constant"),
+    0xED: ("ln2", "constant"),
+    0xF0: ("f2xm1", "unary"),
+    0xF1: ("fyl2x", "binary-pop"),
+    0xF2: ("fptan", "conditional-push"),
+    0xF3: ("fpatan", "binary-pop"),
+    0xF4: ("fxtract", "extract"),
+    0xF5: ("fprem1", "remainder"),
+    0xF8: ("fprem", "remainder"),
+    0xF9: ("fyl2xp1", "binary-pop"),
+    0xFB: ("fsincos", "conditional-push"),
+    0xFC: ("frndint", "unary"),
+    0xFD: ("fscale", "scale"),
+    0xFE: ("fsin", "trigonometric"),
+    0xFF: ("fcos", "trigonometric"),
+}
+# The operand of ``ftst``: +0.0 as the instruction's own constant, a term no
+# register or memory value is, so ``ftst`` meets only ``ftst`` (no hardware
+# probe relates it to ``fcom`` of a loaded zero).
+FTST_ZERO: Term = ("ftst-zero",)
+
+
+def _x87_extended(x87: _X87, modrm: int, context: str) -> None:
+    """The transcendental, constant and classifying D9 forms (whole-function proofs only).
+
+    - ``fsin``/``fcos``: ST(0) := f(ST(0)).  An operand outside +-2**63
+      leaves ST(0) unchanged and sets C2: still one function of the operand,
+      so ``("fun", "fsin", x)`` is exact; C2 and C1 are ``fccfun`` terms of
+      x, C0 and C3 undefined.  Every form that can raise an exception is an
+      event in the footprint.
+    - ``f2xm1``, ``frndint``: ST(0) := f(ST(0)); C1 a function, the rest
+      undefined.
+    - ``fpatan``, ``fyl2x``, ``fyl2xp1``: ST(1) := f(ST(1), ST(0)), then a pop.
+    - ``fscale``: ST(0) := f(ST(0), ST(1)).  ``fprem``/``fprem1``: likewise,
+      with C0-C3 all functions of the two operands.
+    - ``fxtract``: ST(0) := the exponent, then the significand is pushed.
+    - ``ftst``: a compare of ST(0) with ``FTST_ZERO``; ``fxam``: C0-C3 a
+      function of ST(0), no exception.
+    - ``fldpi``, ``fldl2e``, ``fldl2t``, ``fldlg2``, ``fldln2``: a named
+      constant (rounded under the shared control word).  ``fnop``: nothing.
+    - ``fptan`` and ``fsincos`` are refused: they push a second value only
+      when the operand is in range, so the stack depth after them depends on
+      the operand, which the stack model (one depth at every point) cannot
+      express.
+    """
+    entry = _X87_EXTENDED.get(modrm)
+    require(
+        entry is not None,
+        f"{context}: the x87 instruction d9{modrm:02x} is outside the simulator's closed set",
+    )
+    name, shape = cast(tuple[str, str], entry)
+    require(
+        shape != "conditional-push",
+        f"{context}: {name} pushes a second value only when its operand is in range, so the "
+        "x87 stack depth after it depends on the operand; it is outside the closed set",
+    )
+    if shape == "nop":
+        x87.undefine()
+        return
+    if shape == "test":
+        x87.compare("ftst", FTST_ZERO)
+        return
+    if shape == "constant":
+        x87.push(("fconst", name))
+        x87.undefine()
+        return
+    st0 = x87.get(0)
+    if shape == "examine":
+        x87.define("fxam", (st0,), X87_CONDITION_BITS)
+        return
+    if shape in ("unary", "trigonometric"):
+        result: Term = ("fun", name, st0)
+        x87.event(result)
+        x87.put(0, result)
+        x87.undefine()
+        x87.define(name, (st0,), ("c1", "c2") if shape == "trigonometric" else ("c1",))
+        return
+    if shape == "extract":
+        x87.event(("fun", name, st0))
+        x87.put(0, ("fun", "fxtract-exponent", st0))
+        x87.push(("fun", "fxtract-significand", st0))
+        x87.undefine()
+        x87.define(name, (st0,), ("c1",))
+        return
+    st1 = x87.get(1)
+    if shape == "binary-pop":
+        result = ("fun2", name, st1, st0)
+        x87.event(result)
+        x87.put(1, result)
+        x87.pop()
+        x87.undefine()
+        x87.define(name, (st1, st0), ("c1",))
+        return
+    result = ("fun2", name, st0, st1)
+    x87.event(result)
+    x87.put(0, result)
+    if shape == "remainder":
+        x87.define(name, (st0, st1), X87_CONDITION_BITS)
+        return
+    x87.undefine()  # fscale
+    x87.define(name, (st0, st1), ("c1",))
 
 
 def _string_step(state: PathState, item: _Instruction, undefined: _Undefined) -> None:
@@ -1687,12 +1888,16 @@ def _string_step(state: PathState, item: _Instruction, undefined: _Undefined) ->
             store_normal_form(state.stores),
             state.epoch,
         )
+        start = state.regs["edi"]
         if state.frame is not None:
+            state.frame.block_start(state, start, f"{context}: the repne scasb's start")
             scan = state.frame.digest("scan", scan)
         state.footprint.add(("scan", scan))
         remaining = lin_atom(("scanleft", scan))
-        state.regs["edi"] = lin_add(state.regs["edi"], lin_sub(state.regs["ecx"], remaining))
+        state.regs["edi"] = lin_add(start, lin_sub(state.regs["ecx"], remaining))
         state.regs["ecx"] = remaining
+        if state.frame is not None:
+            state.frame.block_end(start, state.regs["edi"])
         for name in FLAG_NAMES:
             state.flags[name] = ("flag", name, "scan", 8, scan, "")
         return
@@ -1703,12 +1908,15 @@ def _string_step(state: PathState, item: _Instruction, undefined: _Undefined) ->
             f"{context}: a repne stos or movs is outside the closed set",
         )
         known = const_of(state.regs["ecx"])
-        require(
-            known is not None and known <= MAX_STRING_COUNT,
-            f"{context}: a rep {'movs' if op in (0xA4, 0xA5) else 'stos'} whose count is not a "
-            f"constant of at most {MAX_STRING_COUNT} is outside the closed set",
-        )
-        count = cast(int, known)
+        if known is None or known > MAX_STRING_COUNT:
+            require(
+                state.frame is not None,
+                f"{context}: a rep {'movs' if op in (0xA4, 0xA5) else 'stos'} whose count is not "
+                f"a constant of at most {MAX_STRING_COUNT} is outside the closed set",
+            )
+            _block_string(state, item, width)
+            return
+        count = known
     for _index in range(count):
         if op in (0xAA, 0xAB):
             value = _get(state, 0, width * 8)
@@ -1719,6 +1927,67 @@ def _string_step(state: PathState, item: _Instruction, undefined: _Undefined) ->
         state.regs["edi"] = lin_add(state.regs["edi"], lin(width))
     if item.repeat is not None:
         state.regs["ecx"] = lin(0)
+
+
+def _block_string(state: PathState, item: _Instruction, width: int) -> None:
+    """``rep movs``/``rep stos`` of a count that is not a small constant: one event.
+
+    Whole-function proofs only (``state.frame`` set).  With the direction flag
+    clear (the calling convention's state at every entry and after every
+    call; no admitted instruction sets it), ``rep stos`` writes its value to
+    the ECX elements from EDI up and ``rep movs`` copies the ECX elements from
+    ESI up to EDI up, element by element, whether or not the ranges overlap.
+    Memory after it is therefore a function of exactly the count, EDI, ESI
+    (movs), the value (stos) and memory before it -- the store log since the
+    last event and that event.  The term naming all of these is an event, as
+    a call is: it joins the path's event list (so two versions are compared
+    on making the same block moves, in the same order relative to their
+    calls, from the same memory), it enters the footprint (its accesses and
+    faults are the same function), the store log restarts and every later
+    load names it.  Afterwards ECX is 0, EDI (and ESI) have advanced by
+    ECX * width -- exact on the 2**32 ring -- and the flags are unchanged.
+
+    The frame model checks each pointer (``FrameModel.block_start``): a
+    private frame admits none that is a stack address (none exists outside
+    ESP there, so the block cannot reach a private slot, check 7b), and a
+    shared frame admits a stack address only at a constant offset at or
+    above ESP, so (a9) the whole block lies at or above ESP.
+    """
+    op = item.opcode
+    movs = op in (0xA4, 0xA5)
+    kind = "movs" if movs else "stos"
+    context = item.context
+    frame = state.frame
+    count = state.regs["ecx"]
+    edi = state.regs["edi"]
+    esi = state.regs["esi"] if movs else None
+    frame.block_start(state, edi, f"{context}: the rep {kind}'s destination")
+    if movs:
+        frame.block_start(state, esi, f"{context}: the rep {kind}'s source")
+    value = None if movs else _get(state, 0, width * 8)
+    term = (
+        "rep",
+        kind,
+        width,
+        count,
+        edi,
+        esi,
+        value,
+        store_normal_form(state.stores),
+        state.epoch,
+    )
+    state.events.append(term)
+    name = frame.digest("rep", term)
+    state.footprint.add(("rep", name))
+    state.stores = []
+    state.epoch = name
+    advance = lin_scale(count, width)
+    state.regs["edi"] = lin_add(edi, advance)
+    frame.block_end(edi, state.regs["edi"])
+    if movs:
+        state.regs["esi"] = lin_add(cast(Term, esi), advance)
+        frame.block_end(esi, state.regs["esi"])
+    state.regs["ecx"] = lin(0)
 
 
 HELPER_MAX_STEPS = 8192
