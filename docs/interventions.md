@@ -170,7 +170,12 @@ object's one `.debug$T`, so a `/Z7` compile) type the function as returning
 exactly `void`. A caller of a void function cannot read EAX, so EAX is dead
 at its returns. The type index and the record's digest are pinned. A missing
 type stream, a PDB type server (`/Zi`) or any other return type keeps EAX
-live, and the reference object is never consulted. The module docstring of
+live, and the reference object is never consulted. x87 code may follow such a
+call when the donor's stack discipline fixes how many values (0 or 1) the
+callee returns: the call then leaves exactly that stack, its result a term
+named by the call. Add and multiply terms are commutative (a hardware probe
+shows them symmetric in result, NaN payload, flags and signed zero); no other
+algebraic identity is made. The module docstring of
 `reprobit.classic.rewriting_region_resize` states the theorem and its ten
 checks.
 

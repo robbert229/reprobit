@@ -72,11 +72,14 @@ uninterpreted terms over their exact operands with no algebraic identity:
 ``("fld", w, m)`` a load of a w-bit float, ``("fild", w, m)`` of an
 integer, ``("fmem", w, m)`` a memory operand of an arithmetic instruction
 (not the same term as a loaded register), ``("fop", op, a, b)`` for add and
-mul with (destination, source) order and for sub and div with (minuend,
+mul with the two operands sorted (commutative: the hardware probe finds
+the result, NaN payload, exception flags and C1 symmetric under every
+rounding mode and precision control) and for sub and div with (minuend,
 subtrahend) and (dividend, divisor) order -- so ``fsub``, ``fsubr`` and the
 popping forms that compute one difference meet, as the hardware probe
 shows they are one function -- and ``("fun", op, a)`` for chs, abs and
-sqrt.  A store to memory writes ``("fstm", w, x)``, the rounding of ``x`` to
+sqrt.  No other algebraic identity holds: no association or
+distribution.  A store to memory writes ``("fstm", w, x)``, the rounding of ``x`` to
 the slot, so a spill and reload is ``("fld", w, ("fstm", w, x))`` and never
 ``x``: no precision-control setting makes it the identity, because a
 register keeps a 15-bit exponent.  The terms are therefore exact under
@@ -93,8 +96,12 @@ the masked bits and refuses an undefined one, and a zero test over one
 compare's bits is the canonical atom "the outcome lies in this set" with
 the operand pair in a fixed order.  Any other use of the status word, and
 any path whose conditions, stores or footprint mention an undefined bit, is
-refused.  A call names the x87 stack and the event set in its event; no
-x87 instruction may follow a call inside the region.
+refused.  A call names the x87 stack and the event set in its event.  A
+direct call to a callee whose x87 return count r the donor's stack
+discipline determines (``x87_returns``) leaves a stack of exactly r values,
+the callee's result ``("fret", event)`` on top when r is 1, and the region
+may go on using the x87 unit from that absolute frame (:func:`_call`); after
+any other call no x87 instruction may follow inside the region.
 
 Every instruction outside the closed set below is refused, as is any
 relocated field the simulator does not consume as a displacement or
@@ -556,6 +563,18 @@ class X87State:
     undefined bit is a fresh ``("x87undef", ...)`` term.  ``events`` lists
     every operation that can raise a floating-point exception, so two paths
     with equal event sets leave equal sticky exception flags.
+
+    After a direct call whose callee's x87 return count is known
+    (``call_frame``), ``base`` is the call's event and the frame is
+    absolute: the stack the call leaves is empty but for the callee's
+    results, so ``push`` is the depth itself, a position ``k >= 0`` is an
+    empty register (any access is underflow and refused) and ``push`` may
+    not exceed eight.  ``need`` and ``peak`` keep bounding the entry frame
+    only.  ``call_pushes`` records ``push`` at every such call made from the
+    entry frame: x1 puts the stack at depth 0 there, so the entry depth is
+    ``-push``, which the caller checks against the donor's depths.  After a
+    call whose count is not known (``after_call``) the frame is relative to
+    the call's unknown depth and no x87 instruction may run.
     """
 
     push: int = 0
@@ -569,6 +588,8 @@ class X87State:
     events: list[Term] = field(default_factory=list)
     used: bool = False
     after_call: bool = False
+    call_frame: bool = False
+    call_pushes: list[int] = field(default_factory=list)
 
     def fork(self) -> X87State:
         return X87State(
@@ -581,6 +602,8 @@ class X87State:
             list(self.events),
             self.used,
             self.after_call,
+            self.call_frame,
+            list(self.call_pushes),
         )
 
     def entry_term(self, position: int) -> Term:
@@ -597,7 +620,15 @@ class X87State:
                 key=lambda item: item[0],
             )
         )
-        return X87View(self.base, self.push, live, self.need, self.peak, self.used)
+        return X87View(
+            self.base,
+            self.push,
+            live,
+            self.need,
+            self.peak,
+            self.used,
+            tuple(self.call_pushes),
+        )
 
 
 @dataclass(frozen=True)
@@ -610,6 +641,7 @@ class X87View:
     need: int = 0
     peak: int = 0
     used: bool = False
+    call_pushes: tuple[int, ...] = ()
 
     def term(self, position: int) -> Term:
         for at, term in self.slots:
@@ -1080,7 +1112,12 @@ def store_normal_form(stores: Iterable[tuple[Term, int, Term]]) -> tuple[Any, ..
 
 
 def _call(
-    state: PathState, callee: Term, symbol: object, undefined: _Undefined, context: str
+    state: PathState,
+    callee: Term,
+    symbol: object,
+    undefined: _Undefined,
+    context: str,
+    x87_returns: Mapping[str, int] | None = None,
 ) -> None:
     """A call to a register-free callee: one event named by everything it can read.
 
@@ -1095,6 +1132,20 @@ def _call(
     unknown: the store log restarts and every later load names the event.
     The pushed return address is part of the call, as for every call the
     layout moves.
+
+    x87.  A direct call (``callee`` is ``("direct", symbol)``) whose symbol
+    ``x87_returns`` maps to a count r (0 or 1: the donor's stack-depth
+    solver, :func:`reprobit.classic.region_x87.x87_stack_solution`) leaves
+    exactly r values: under x1 the stack is empty at a call to a C function
+    and the callee leaves its fixed count, so after the call the depth is r
+    and ST(0), when r is 1, is the callee's result ``("fret", event)`` --
+    like EAX, a function of everything the event names.  The stack before
+    the call must be empty: in a frame of known depth (after an earlier such
+    call) the simulator refuses a non-empty one; in the entry frame it
+    records ``push`` for the caller, which checks that the entry depth
+    ``-push`` is one the donor's depths allow.  Any other call (an unknown
+    count, an import slot) leaves the x87 stack the call's unknown function
+    and no x87 instruction may follow it inside the region.
     """
     pop = callee_stack_pop(symbol)
     require(
@@ -1103,6 +1154,27 @@ def _call(
         "convention, is outside the simulator's closed set",
     )
     fpu = state.fpu
+    returned: int | None = None
+    if (
+        callee[0] == "direct"
+        and isinstance(symbol, str)
+        and not symbol.startswith("__imp_")
+        and x87_returns is not None
+    ):
+        returned = x87_returns.get(symbol)
+    if returned is not None:
+        require(
+            returned in (0, 1),
+            f"{context}: the callee {symbol!r} returns {returned} x87 values, outside 0 and 1",
+        )
+        if fpu.call_frame:
+            require(
+                fpu.push == 0,
+                f"{context}: the call to {symbol!r} is made with {fpu.push} x87 values on the "
+                "stack (MSVC's discipline empties it before a call)",
+            )
+        elif not fpu.after_call:
+            fpu.call_pushes.append(fpu.push)
     identity: Term = (
         "call",
         callee,
@@ -1124,13 +1196,21 @@ def _call(
     state.stores = []
     state.epoch = identity
     # The x87 state after the call is the callee's function of the state
-    # before it (named by the event); how many values it leaves on the stack
-    # is not modelled, so no x87 instruction may follow inside the region.
+    # before it (named by the event).  With a known return count the frame
+    # is absolute (depth ``push``); otherwise how many values the callee
+    # leaves is not modelled and no x87 instruction may follow.
     fpu.base = identity
-    fpu.push = 0
-    fpu.slots = {}
     fpu.cc = {name: ("fcccall", identity, fpu.cc[name]) for name in X87_CONDITION_BITS}
-    fpu.after_call = True
+    if returned is None:
+        fpu.push = 0
+        fpu.slots = {}
+        fpu.after_call = True
+        fpu.call_frame = False
+    else:
+        fpu.push = returned
+        fpu.slots = {-1: ("fret", identity)} if returned else {}
+        fpu.after_call = False
+        fpu.call_frame = True
     for name in ("eax", "ecx", "edx"):
         state.regs[name] = lin_atom(("callret", name, identity))
     state.regs["esp"] = lin_add(state.regs["esp"], lin(cast(int, pop)))
@@ -1155,11 +1235,19 @@ def _push(state: PathState, value: Term) -> None:
 # difference meet: the role probe found the result and the exception flags of
 # every subtract (divide) encoding to be one function of (minuend,
 # subtrahend) whichever register held which.  Addition and multiplication
-# keep the order (destination, source); no commutativity is assumed.
+# are commutative: their operands are sorted.  The commutativity probe
+# (tests/fixtures/x87_probe/commute.c) ran every add and multiply register
+# encoding with each operand in each register, over 19 x 19 operands (the
+# role probe's NaNs, infinities, zeros, denormal and maximum, the encodings
+# no admitted instruction produces, and an exact zero sum) under all twelve
+# rounding-mode and precision-control settings, and found the 80-bit result,
+# the exception flags and C1 one function of the unordered pair.  No other
+# identity (association, distribution) is made.
 _X87_ARITH = {0: "add", 1: "mul", 4: "sub", 5: "subr", 6: "div", 7: "divr"}
+_X87_DEPTH = 8
 
 
-def _x87_arith(kind: str, st0: Term, other: Term, destination_is_st0: bool) -> Term:
+def _x87_arith(kind: str, st0: Term, other: Term) -> Term:
     if kind == "sub":
         return ("fop", "sub", st0, other)
     if kind == "subr":
@@ -1168,8 +1256,7 @@ def _x87_arith(kind: str, st0: Term, other: Term, destination_is_st0: bool) -> T
         return ("fop", "div", st0, other)
     if kind == "divr":
         return ("fop", "div", other, st0)
-    pair = (st0, other) if destination_is_st0 else (other, st0)
-    return ("fop", kind, *pair)
+    return ("fop", kind, *sorted((st0, other), key=repr))
 
 
 class _X87:
@@ -1184,6 +1271,10 @@ class _X87:
     def position(self, index: int) -> int:
         position = index - self.fpu.push
         if position >= 0:
+            require(
+                not self.fpu.call_frame,
+                f"{self.context}: ST({index}) is empty after the call (stack underflow)",
+            )
             # The entry's ST(position) must be a full register.
             self.fpu.need = max(self.fpu.need, position + 1)
         return position
@@ -1197,7 +1288,13 @@ class _X87:
 
     def push(self, value: Term) -> None:
         self.fpu.push += 1
-        self.fpu.peak = max(self.fpu.peak, self.fpu.push)
+        if self.fpu.call_frame:
+            require(
+                self.fpu.push <= _X87_DEPTH,
+                f"{self.context}: the x87 stack overflows after the call",
+            )
+        else:
+            self.fpu.peak = max(self.fpu.peak, self.fpu.push)
         self.fpu.slots[-self.fpu.push] = value
 
     def pop(self) -> None:
@@ -1243,7 +1340,8 @@ def _x87_step(state: PathState, item: _Instruction, undefined: _Undefined) -> No
     require(
         not state.fpu.after_call,
         f"{context}: an x87 instruction after a call inside the region is outside the simulator's "
-        "closed set (the callee's effect on the x87 stack is not modelled)",
+        "closed set (the callee's x87 return count is not determined, or it is not a direct "
+        "call)",
     )
     x87 = _X87(state, undefined, context)
     state.fpu.used = True
@@ -1262,7 +1360,7 @@ def _x87_step(state: PathState, item: _Instruction, undefined: _Undefined) -> No
                     x87.pop()
                 return
             st0 = x87.get(0)
-            result = _x87_arith(_X87_ARITH[digit], st0, operand, True)
+            result = _x87_arith(_X87_ARITH[digit], st0, operand)
             x87.event(result)
             x87.put(0, result)
             x87.undefine()
@@ -1298,7 +1396,7 @@ def _x87_step(state: PathState, item: _Instruction, undefined: _Undefined) -> No
         return
     if op in (0xD8, 0xDC, 0xDE) and digit in _X87_ARITH:
         st0, other = x87.get(0), x87.get(index)
-        result = _x87_arith(_X87_ARITH[digit], st0, other, op == 0xD8)
+        result = _x87_arith(_X87_ARITH[digit], st0, other)
         x87.event(result)
         if op == 0xD8:
             x87.put(0, result)
@@ -1363,7 +1461,12 @@ def _x87_step(state: PathState, item: _Instruction, undefined: _Undefined) -> No
     require(False, refused)
 
 
-def _step(state: PathState, item: _Instruction, undefined: _Undefined) -> tuple[str, Any]:
+def _step(
+    state: PathState,
+    item: _Instruction,
+    undefined: _Undefined,
+    x87_returns: Mapping[str, int] | None = None,
+) -> tuple[str, Any]:
     """Execute one instruction; return ("fall", None), ("jump", target) or ("branch", ...)."""
     op = item.opcode
     end = item.offset + item.length
@@ -1575,7 +1678,7 @@ def _step(state: PathState, item: _Instruction, undefined: _Undefined) -> tuple[
         require(
             addend == 0, f"{context}: a call into the middle of a symbol is outside the closed set"
         )
-        _call(state, ("direct", symbol), symbol, undefined, context)
+        _call(state, ("direct", symbol), symbol, undefined, context, x87_returns)
         return ("fall", None)
     if op in (0xC1, 0xD1):
         mod, digit, _rm = item.modrm()
@@ -1687,6 +1790,7 @@ def simulate_region(
     *,
     begin: int | None = None,
     leave: bool = False,
+    x87_returns: Mapping[str, int] | None = None,
 ) -> list[PathResult]:
     """Every path of [start, end) from the symbolic entry state.
 
@@ -1700,7 +1804,9 @@ def simulate_region(
     where it ended.  ``entry_names`` is passed to :func:`entry_state`.  Every
     relocated field of the region must be read on some path of the main
     entry; a run from a later ``begin`` is not asked to read the fields
-    before it.
+    before it.  ``x87_returns`` maps a direct callee to the number of x87
+    values it returns (see :func:`_call`); without it no x87 instruction may
+    follow a call.
     """
     starts = region_boundaries(code, start, end, context)
     boundaries = set(starts) | {end}
@@ -1729,7 +1835,7 @@ def simulate_region(
             steps += 1
             require(steps <= MAX_STEPS, f"{context}: the region's paths exceed the step bound")
             item = instructions[offset]
-            action, detail = _step(state, item, undefined)
+            action, detail = _step(state, item, undefined, x87_returns)
             following = offset + item.length
             if action == "fall":
                 offset = following

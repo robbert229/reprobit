@@ -137,13 +137,24 @@ Checks (each is a refusal):
       are covered by 8e: every operation that can raise one is in the
       footprint.  The x87 state is compared even when neither version
       touches it (it then passes through, or is the same call's result).
+      A direct call inside the region to a C function whose x87 return
+      count r the donor's discipline determines
+      (`region_x87.x87_stack_solution`) leaves a stack of exactly r values,
+      the callee's result term named by the call's event on top, and x87
+      code may follow it (`region_simulation._call`); the stack must be
+      empty at the call: from the region's entry frame the entry depth on
+      that path is then -push, which must lie in the donor's depth interval
+      at the region entry, and after an earlier such call the simulator
+      requires push 0.
 9. Pins.  The void-return evidence when declared, the image digest and
    length, the per-region length change, the branch re-encodings, relocation
    reseats, addend repairs, path counts, the bijection's rewritten bytes and
-   changes of mapping, an x87 region's entry depths, need, peak and compared
-   condition bits, and the derived donor's procedure range are all pinned by
-   the declaration and re-measured here, and the derived donor object is
-   re-parsed and checked before the same-slot delegate installs it.
+   changes of mapping, an x87 region's entry depths, need, peak, compared
+   condition bits and the x87 return counts of the callees it calls
+   (`call_returns`, present when it calls one), and the derived donor's
+   procedure range are all pinned by the declaration and re-measured here,
+   and the derived donor object is re-parsed and checked before the
+   same-slot delegate installs it.
 
 10. Scope bijection (optional).  A record may declare a register
     permutation sigma (fixing ESP; naming EBP only with the frame-pointer-free
@@ -194,7 +205,9 @@ inputs; check 8g re-establishes it at a region exit.  Assumptions: (x1)
 MSVC 5.0's x87 discipline in D, as `region_x87` states it -- one depth per
 program point, an empty stack at every call to a C function and at the
 function's entries, 0 or 1 values at a return, and each callee leaving the
-fixed number of values its prototype names; (x2) the contents of empty
+fixed number of values its prototype names, so a callee whose count the
+donor's own uses determine leaves that many values at a call inside a
+region too; (x2) the contents of empty
 registers and the x87 instruction and data pointers are not inputs of any
 callee (the bodies themselves are checked not to store them); (x3) C0-C3
 are not inputs of a callee; and (x4) the shared control word masks every
@@ -282,7 +295,7 @@ from .region_x87 import (
     require_x87_depth,
     x87_condition_liveness,
     x87_environment_exposures,
-    x87_stack_depths,
+    x87_stack_solution,
 )
 from .register_reencoding import require_frame_pointer_free_frame
 from .register_semantics import (
@@ -1248,13 +1261,13 @@ def apply_region_resize(
     x87_exposures = x87_environment_exposures(items, body) + x87_environment_exposures(
         image_items, image_bytes
     )
-    depth_cache: list[Any] = []
+    # The donor's stack discipline: the depth at every point and the x87
+    # return count of every C callee it determines (for calls inside a region).
+    x87_solution = x87_stack_solution(items, successors, entries, body, relocation_view)
+    x87_returns = {} if x87_solution is None else x87_solution[1]
 
     def x87_depth(offset: int) -> tuple[int, int] | None:
-        if not depth_cache:
-            depth_cache.append(x87_stack_depths(items, successors, entries, body, relocation_view))
-        depths = depth_cache[0]
-        return None if depths is None else depths[donor_item_index[offset]]
+        return None if x87_solution is None else x87_solution[0][donor_item_index[offset]]
 
     def x87_facts(offset: int) -> tuple[frozenset[str], Any]:
         """C0-C3 live at a donor point in D or at its image in I, and the x87 depth oracle."""
@@ -1311,6 +1324,7 @@ def apply_region_resize(
                     x87_facts=x87_facts,
                     x87_exposures=x87_exposures,
                     x87_record=x87_record,
+                    x87_returns=x87_returns,
                 )
                 pairs += pairs_here
                 donor_count += counts[0]
@@ -1338,6 +1352,8 @@ def apply_region_resize(
                     "peak": x87_record["peak"],
                     "compared_condition_bits": sorted(x87_record["compared_condition_bits"]),
                 }
+                if x87_record.get("call_returns"):
+                    record["x87"]["call_returns"] = dict(sorted(x87_record["call_returns"].items()))
             if sigma:
                 record["entry_mapped"] = bool(entry_sigma)
                 record["exit_mapped"] = bool(exit_sigma)
@@ -1395,6 +1411,7 @@ def _prove_region_entry(
     x87_facts: Any = None,
     x87_exposures: list[int] | None = None,
     x87_record: dict[str, Any] | None = None,
+    x87_returns: dict[str, int] | None = None,
 ) -> tuple[int, set[str], set[str], tuple[int, int]]:
     """Check 8 for the run of one region from one of its entries.
 
@@ -1418,6 +1435,7 @@ def _prove_region_entry(
         f"{context} donor",
         begin=donor_entry,
         leave=True,
+        x87_returns=x87_returns,
     )
     image_paths = simulate_region(
         replacement,
@@ -1429,6 +1447,7 @@ def _prove_region_entry(
         entry_names={entry_sigma.get(name, name): name for name in IA32_GENERAL_REGISTER_NAMES},
         begin=image_local,
         leave=True,
+        x87_returns=x87_returns,
     )
     entry_live = live_at(donor_entry)
     entry_flags = flags_live(donor_entry)
@@ -1452,11 +1471,32 @@ def _prove_region_entry(
         peak = max(path.x87.peak for path in (*donor_paths, *image_paths))
         entry_depth = depth_of(donor_entry)
         require_x87_depth(entry_depth, need, peak, context)
+        low, high = entry_depth
+        # A call of known return count made from the entry frame finds the
+        # stack empty (x1), so the entry depth on that path is -push: it must
+        # be one the donor's discipline allows.
+        for path in (*donor_paths, *image_paths):
+            for push in path.x87.call_pushes:
+                require(
+                    low <= -push <= high,
+                    f"{context}: a call inside the region is made {push:+d} x87 values from the "
+                    f"region entry, so the stack is empty there only at entry depth {-push}, "
+                    f"which the donor's depths [{low}, {high}] do not allow",
+                )
+        called = {
+            event[1][1]
+            for path in (*donor_paths, *image_paths)
+            for event in path.events
+            if event[1][0] == "direct" and event[1][1] in (x87_returns or {})
+        }
         if x87_record is not None:
             x87_record.setdefault("entry_depths", set()).add(tuple(entry_depth))
             x87_record["need"] = max(x87_record.get("need", 0), need)
             x87_record["peak"] = max(x87_record.get("peak", 0), peak)
             x87_record.setdefault("compared_condition_bits", set())
+            x87_record.setdefault("call_returns", {}).update(
+                {symbol: (x87_returns or {})[symbol] for symbol in called}
+            )
 
     def entry_cover(name: str) -> frozenset[str]:
         return _cover(name, entry_sigma, entry_live)

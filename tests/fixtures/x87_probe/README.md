@@ -19,8 +19,18 @@ host's x87 unit.
   `fld st(1)`, `fxch st(1)`, `fst st(1)`, `fchs`, `fabs`, `fld1`, `fldz`)
   over SNaN, QNaN, denormal, 1 and -0 operands and prints the exception
   flags and both registers bit for bit.  Its output is `moves.out`.
+- `commute.c` runs every add and multiply register encoding (D8 C1/C9,
+  DC C1/C9, DE C1/C9) with each operand in each register, over 19 x 19
+  operand pairs (the role probe's fourteen, the pseudo-NaN, pseudo-infinity,
+  unnormal and pseudo-denormal encodings, and -1 for an exact zero sum),
+  under all four rounding modes and the three precision controls (control
+  words 0x007F-0x0F7F, every exception masked).  Each line prints the
+  distinct `result/flags/C1` values the six runs gave, so one value means
+  the operation is symmetric there.  Its output is `commute.out`; recorded on
+  2026-11-18 on a 13th Gen Intel Core i5-13400F.
 - `encodings.txt` is `objdump -d` of the three objects, restricted to x87 lines:
-  the bytes each probe executed.
+  the bytes each probe executed.  `commute_encodings.txt` is the same for
+  `commute.obj`.
 
 Reproduce (inside the `developer` distrobox, toolchain at `$T`):
 
@@ -31,6 +41,8 @@ Reproduce (inside the `developer` distrobox, toolchain at `$T`):
     wine roles.exe > roles.out
     WINEDEBUG=-all INCLUDE="Z:$T/include" LIB="Z:$T/lib" wine $T/bin/cl.exe /nologo /Od moves.c
     wine moves.exe > moves.out
+    WINEDEBUG=-all INCLUDE="Z:$T/include" LIB="Z:$T/lib" wine $T/bin/cl.exe /nologo /Od commute.c
+    wine commute.exe > commute.out
 
 `tests/test_classic_region_x87.py` parses these files and checks the
 simulator against them.
