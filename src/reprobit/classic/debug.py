@@ -797,3 +797,95 @@ SOURCE_FPO_EXTRA_RELOCATION_KEYS = {
 
 
 CODEVIEW_PROCEDURE_RECORD_TYPES = (517, 516, 0x100B, 0x100A)
+
+
+# CodeView type records an MSVC 5.0 object compiled with /Z7 carries in its one
+# `.debug$T` section, numbered from 0x1000.  An object compiled with /Zi carries
+# only an LF_TYPESERVER record naming the PDB that holds its types.
+CODEVIEW_FIRST_TYPE_INDEX = 0x1000
+CODEVIEW_TYPE_SIGNATURES = frozenset({1, 2})
+CODEVIEW_LF_PROCEDURE_ST = 0x1008
+CODEVIEW_LF_TYPESERVER = (0x0016, 0x1501)
+CODEVIEW_T_VOID = 0x0003
+_CODEVIEW_PROCEDURE_ST_TYPES = (0x100B, 0x100A)
+
+
+def codeview_type_records(stream: bytes, context: str) -> list[bytes]:
+    """The records of one `.debug$T` type stream, each whole, in type-index order.
+
+    The record at position ``n`` has type index ``0x1000 + n``.  A stream that
+    does not open with a known signature or does not parse to exhaustion is
+    refused.
+    """
+    require(len(stream) >= 4, f"{context}: the type stream has no signature")
+    require(
+        int.from_bytes(stream[:4], "little") in CODEVIEW_TYPE_SIGNATURES,
+        f"{context}: the type stream signature is not CodeView's",
+    )
+    records = []
+    offset = 4
+    while offset < len(stream):
+        require(offset + 4 <= len(stream), f"{context}: a type record header is truncated")
+        length = int.from_bytes(stream[offset : offset + 2], "little")
+        require(
+            length >= 2 and offset + 2 + length <= len(stream),
+            f"{context}: a type record length is out of range",
+        )
+        records.append(stream[offset : offset + 2 + length])
+        offset += 2 + length
+    return records
+
+
+def codeview_void_return(
+    procedure_stream: bytes, type_streams: list[bytes], context: str
+) -> dict[str, Any]:
+    """The pin of a procedure whose own debug records type it as returning ``void``.
+
+    ``procedure_stream`` is the function's `.debug$S`, which opens with its
+    MSVC 5.0 procedure record (S_GPROC32_ST or S_LPROC32_ST); ``type_streams``
+    are the bodies of every `.debug$T` section of the same object.  The
+    procedure's type index must name, in the object's one type stream, an
+    LF_PROCEDURE record whose return type is exactly T_VOID.  Anything else
+    -- no type stream or several, a PDB type server, a primitive or
+    out-of-range index, another leaf, another return type (a typedef of void
+    included) or the 16-bit CodeView 4 forms -- is refused.  Returns the type
+    index and the SHA-256 of the whole LF_PROCEDURE record.
+    """
+    records = parse_codeview_symbol_stream(procedure_stream, f"{context} debug$S")
+    require(
+        bool(records) and records[0]["offset"] == 0,
+        f"{context}: the debug$S does not open with a procedure record",
+    )
+    record_type = records[0]["type"]
+    require(
+        record_type in _CODEVIEW_PROCEDURE_ST_TYPES,
+        f"{context}: the procedure record of type {record_type:#x} is not an MSVC 5.0 form "
+        "with a 32-bit type index",
+    )
+    type_index = int.from_bytes(procedure_stream[4 + 24 : 4 + 28], "little")
+    require(
+        len(type_streams) == 1,
+        f"{context}: the object has {len(type_streams)} type streams, not one",
+    )
+    types = codeview_type_records(type_streams[0], f"{context} debug$T")
+    require(
+        not any(int.from_bytes(item[2:4], "little") in CODEVIEW_LF_TYPESERVER for item in types),
+        f"{context}: the object's types are in a PDB type server, not in the object",
+    )
+    position = type_index - CODEVIEW_FIRST_TYPE_INDEX
+    require(
+        0 <= position < len(types),
+        f"{context}: the procedure type index {type_index:#x} names no record of the object",
+    )
+    record = types[position]
+    leaf = int.from_bytes(record[2:4], "little")
+    require(
+        leaf == CODEVIEW_LF_PROCEDURE_ST and len(record) >= 16,
+        f"{context}: the procedure type {type_index:#x} is leaf {leaf:#x}, not LF_PROCEDURE",
+    )
+    return_type = int.from_bytes(record[4:8], "little")
+    require(
+        return_type == CODEVIEW_T_VOID,
+        f"{context}: the procedure type {type_index:#x} returns type {return_type:#x}, not void",
+    )
+    return {"type_index": type_index, "procedure_type_sha256": sha256_bytes(record)}

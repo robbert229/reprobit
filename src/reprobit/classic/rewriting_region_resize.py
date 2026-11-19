@@ -39,6 +39,24 @@ the invariant holds again wherever control leaves the region, and at every
 return it covers EAX, the callee-saved registers and ESP, which the liveness
 treats as read by ``ret``.
 
+A void return.  When the record declares ``expected_void_return``, the
+liveness treats ``ret`` as reading the callee-saved registers and ESP but not
+EAX, and the theorem's conclusion drops "the same EAX".  That is sound under
+the model above, which already takes callers to honour the convention their
+callee declares: a caller of a function whose type returns ``void`` has no
+value to read in EAX (in C, calling a function through an incompatible type is
+undefined, and a void expression's value cannot be used), so EAX at the
+function's return is not observable.  The evidence is the donor's own
+debug records, never the reference's: its MSVC 5.0 procedure record
+(S_GPROC32_ST or S_LPROC32_ST) names a type index, and that index must name,
+in the donor object's one `.debug$T` stream, an LF_PROCEDURE record whose
+return type is exactly T_VOID (`debug.codeview_void_return`).  A missing
+type stream, a PDB type server (/Zi), an index naming another leaf, any other
+return type or the 16-bit CodeView 4 forms refuse the relaxation.  The type
+index and the SHA-256 of the LF_PROCEDURE record are pinned, so a donor
+object whose type changes refuses.  Only ``ret`` changes: an indirect jump
+leaving the body keeps every register it reads.
+
 Checks (each is a refusal):
 
 1. Shape.  Every region lies on instruction boundaries of D's code, inside
@@ -108,12 +126,12 @@ Checks (each is a refusal):
       (all of its atoms), so the symbolic entry state stands for values the
       two programs really share; a register both versions leave exactly at
       its entry value needs only its exit-live atoms live at the entry.
-9. Pins.  The image digest and length, the per-region length change, the
-   branch re-encodings, relocation reseats, addend repairs, path counts, the
-   bijection's rewritten bytes and changes of mapping, and the derived
-   donor's procedure range are all pinned by the declaration and re-measured
-   here, and the derived donor object is re-parsed and checked before the
-   same-slot delegate installs it.
+9. Pins.  The void-return evidence when declared, the image digest and
+   length, the per-region length change, the branch re-encodings, relocation
+   reseats, addend repairs, path counts, the bijection's rewritten bytes and
+   changes of mapping, and the derived donor's procedure range are all pinned
+   by the declaration and re-measured here, and the derived donor object is
+   re-parsed and checked before the same-slot delegate installs it.
 
 10. Scope bijection (optional).  A record may declare a register
     permutation sigma (fixing ESP; naming EBP only with the frame-pointer-free
@@ -211,6 +229,7 @@ from .debug import (
     CODEVIEW_PROCEDURE_RECORD_TYPES,
     MSVC50_FUNCTION_FILL_BYTE,
     _apply_replacements,
+    codeview_void_return,
     parse_codeview_symbol_stream,
     parse_fpo_data,
     shifted_pointer,
@@ -324,6 +343,40 @@ def refine_call_reads(
                 }
         refined.append(item)
     return refined
+
+
+def release_void_return(instructions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The decoded body with each ``ret`` no longer reading EAX (a proved void return).
+
+    The caller must have proved the function returns ``void`` from the donor's
+    own type records (:func:`donor_void_return`); see the module's theorem.
+    """
+    eax_atoms = ia32_register_atoms(frozenset({"eax"}))
+    return [
+        {
+            **item,
+            "reads": frozenset(item["reads"] - {"eax"}),
+            "read_atoms": frozenset(item["read_atoms"] - eax_atoms),
+        }
+        if item["flow"] == "ret"
+        else item
+        for item in instructions
+    ]
+
+
+def donor_void_return(donor: CoffObject, primary: dict[str, Any], context: str) -> dict[str, Any]:
+    """The donor's own evidence that its function returns ``void``, or a refusal.
+
+    It reads the function's `.debug$S` child and every `.debug$T` section of
+    the donor object; see :func:`debug.codeview_void_return`.
+    """
+    procedure_stream = bytes(coff_body(donor, _comdat_child(donor, primary, ".debug$S")))
+    type_streams = [
+        bytes(coff_body(donor, section))
+        for section in donor.sections
+        if section["name"] == ".debug$T"
+    ]
+    return codeview_void_return(procedure_stream, type_streams, context)
 
 
 def _validate_bijection(
@@ -683,6 +736,7 @@ def apply_region_resize(
     prologue_length: int = 0,
     bijection: object = None,
     frame_pointer_free: bool = False,
+    void_return: bool = False,
 ) -> tuple[bytes, dict[str, Any]]:
     """Install each declared replacement, relay the body out, and prove it (checks 1-8).
 
@@ -693,7 +747,9 @@ def apply_region_resize(
     symbols, the CodeView procedure range, closure-child references), none of
     which may lie in a region interior.  ``bijection``, when given, is the
     declared scope bijection of check 10; ``frame_pointer_free`` states that
-    the caller proved EBP is not this body's frame pointer.  Returns the
+    the caller proved EBP is not this body's frame pointer; ``void_return``
+    that the caller proved, from the donor's own type records, that the
+    function returns ``void``, so EAX is dead at its returns.  Returns the
     unpadded image (code and tail) and the proof; the caller pads it.
     """
     body = bytes(body)
@@ -721,6 +777,8 @@ def apply_region_resize(
         decode_ia32_bijection_body(body, f"{context} donor", relocation_view, decode_view),
         relocation_view,
     )
+    if void_return:
+        instructions = release_void_return(instructions)
     index_of = {item["offset"]: index for index, item in enumerate(instructions)}
     for item in instructions:
         # A relative call without a relocation names an offset of this body
@@ -995,6 +1053,8 @@ def apply_region_resize(
         ),
         image_view,
     )
+    if void_return:
+        image_instructions = release_void_return(image_instructions)
     image_index = {item["offset"]: index for index, item in enumerate(image_instructions)}
     for region in declared:
         starts = [region["image_start"] + local for local in region["boundaries"]]
@@ -1706,9 +1766,16 @@ def produce_region_resize_rewriting_candidate(
             "bijection",
             "expected_bijection_rewrites",
             "expected_bijection_mode_changes",
+            "expected_void_return",
         },
         "region-resize declaration names an unknown field",
     )
+    void_return = spec.get("expected_void_return")
+    if void_return is not None:
+        require(
+            donor_void_return(donor, dp, "region-resize void return") == void_return,
+            "region-resize void-return evidence differs from its declaration",
+        )
     bijection = spec.get("bijection")
     require(
         (bijection is None)
@@ -1770,6 +1837,7 @@ def produce_region_resize_rewriting_candidate(
         prologue_length=prologue,
         bijection=bijection,
         frame_pointer_free=frame_pointer_free,
+        void_return=void_return is not None,
     )
     if bijection is not None:
         require(
@@ -1850,6 +1918,7 @@ def produce_region_resize_rewriting_candidate(
                     }
                 }
             ),
+            **({} if void_return is None else {"void_return": void_return}),
             "growth": proof["growth"],
             "branch_repairs": proof["branch_repairs"],
             "relocation_reseat": proof["relocation_reseat"],
@@ -1868,8 +1937,10 @@ __all__ = [
     "REGION_RESIZE_KIND",
     "ScopeBoundRefusal",
     "apply_region_resize",
+    "donor_void_return",
     "produce_region_resize_rewriting_candidate",
     "protected_code_offsets",
     "refine_call_reads",
+    "release_void_return",
     "resized_donor_object",
 ]

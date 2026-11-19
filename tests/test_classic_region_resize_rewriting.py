@@ -39,6 +39,7 @@ from test_classic_register_bijection_reencoding_full import (
 )
 
 from reprobit.binary import ByteIdentityError
+from reprobit.classic.debug import codeview_void_return
 from reprobit.classic.region_simulation import (
     address_relation,
     condition,
@@ -531,3 +532,174 @@ def test_a_run_past_the_last_donor_instruction_is_labelled_by_the_code_end() -> 
     reference = _reference_coff(body=REFERENCE + bytes.fromhex("90"))
     with pytest.raises(DiscoveryAuthoringError):
         _author(reference=reference)
+
+
+# --- a void return: EAX dead at ret, from the donor's own type records ------------
+
+# What MSVC 5.0 emits for this unit with /c /Z7 /O2 (measured with the
+# toolchain's cl.exe):
+#     static int counter;
+#     void bump(int by) { counter += by; }          -- type 0x1001
+#     int read_counter(void) { return counter; }    -- type 0x1003
+#     void __stdcall stdbump(void) { counter++; }   -- type 0x1004
+MSVC50_Z7_TYPES = bytes.fromhex(
+    "02000000"
+    "0a00011201000000"
+    "74000000"
+    "0e000810"
+    "030000000000010000100000"
+    "06000112"
+    "00000000"
+    "0e000810"
+    "740000000000000002100000"
+    "0e000810"
+    "030000000700000002100000"
+)
+
+
+def _msvc50_procedure(type_index: int, name: bytes) -> bytes:
+    payload = bytes(12) + struct.pack("<IIII", 0x13, 0, 0x12, type_index) + bytes(7)
+    payload += bytes([len(name)]) + name
+    return struct.pack("<HH", len(payload) + 2, 0x100B) + payload
+
+
+def _st_codeview(body_length: int, debug_start: int, debug_end: int, type_index: int) -> bytes:
+    """S_GPROC32_ST naming ``type_index``, then S_END."""
+    payload = struct.pack("<III", 0, 0, 0) + struct.pack(
+        "<IIII", body_length, debug_start, debug_end, type_index
+    )
+    payload += bytes(7) + bytes([len(TARGET_SYMBOL)]) + TARGET_SYMBOL.encode()
+    return struct.pack("<HH", len(payload) + 2, 0x100B) + payload + struct.pack("<HH", 2, 6)
+
+
+def _type_server() -> bytes:
+    """What /Zi leaves in the object: one LF_TYPESERVER naming the PDB."""
+    record = struct.pack("<HII", 0x0016, 0x3A3B3C3D, 1) + bytes([8]) + b"vc50.pdb"
+    return struct.pack("<IH", 2, len(record)) + record
+
+
+def _procedure_types(return_type: int) -> bytes:
+    """LF_ARGLIST () as 0x1000 and LF_PROCEDURE returning ``return_type`` as 0x1001."""
+    return (
+        struct.pack("<I", 2)
+        + struct.pack("<HHI", 6, 0x1201, 0)
+        + struct.pack("<HHIBBHI", 14, 0x1008, return_type, 0, 0, 0, 0x1000)
+    )
+
+
+def test_the_void_return_reader_reads_msvc50_z7_types() -> None:
+    bump = codeview_void_return(_msvc50_procedure(0x1001, b"bump"), [MSVC50_Z7_TYPES], "t")
+    assert bump["type_index"] == 0x1001
+    assert len(bump["procedure_type_sha256"]) == 64
+    stdbump = codeview_void_return(_msvc50_procedure(0x1004, b"stdbump"), [MSVC50_Z7_TYPES], "t")
+    assert stdbump["type_index"] == 0x1004
+    assert stdbump["procedure_type_sha256"] != bump["procedure_type_sha256"]
+    with pytest.raises(ByteIdentityError, match="returns type 0x74, not void"):
+        codeview_void_return(_msvc50_procedure(0x1003, b"read_counter"), [MSVC50_Z7_TYPES], "t")
+
+
+@pytest.mark.parametrize(
+    ("procedure", "streams", "why"),
+    [
+        (_msvc50_procedure(0x1001, b"f"), [], "0 type streams"),
+        (_msvc50_procedure(0x1001, b"f"), [MSVC50_Z7_TYPES] * 2, "2 type streams"),
+        (
+            _msvc50_procedure(0x1001, b"f"),
+            [_type_server()],
+            "PDB type server",
+        ),
+        (_msvc50_procedure(0x1000, b"f"), [MSVC50_Z7_TYPES], "leaf 0x1201, not LF_PROCEDURE"),
+        (_msvc50_procedure(0x1005, b"f"), [MSVC50_Z7_TYPES], "names no record"),
+        (_msvc50_procedure(0x0003, b"f"), [MSVC50_Z7_TYPES], "names no record"),
+        (codeview_stream(37, 4, 32), [MSVC50_Z7_TYPES], "not an MSVC 5.0 form"),
+    ],
+)
+def test_the_void_return_reader_refuses_missing_or_unplain_types(procedure, streams, why) -> None:
+    with pytest.raises(ByteIdentityError, match=why):
+        codeview_void_return(procedure, streams, "t")
+
+
+# The replacement keeps the value in ECX and leaves the caller's EAX alone.
+EAX_REGION = ["8b4b04", "894b08", "890b"]
+EAX_REFERENCE = bytes.fromhex(PROLOGUE + "7408" + "".join(EAX_REGION) + EPILOGUE)
+
+
+def _typed_donor(return_type: int | None):
+    return make_coff(
+        body=DONOR,
+        relocations=DONOR_RELOCATIONS,
+        lines=DONOR_LINES,
+        debug_stream=_st_codeview(len(DONOR), 4, 32, 0x1001),
+        types=None if return_type is None else _procedure_types(return_type),
+    )
+
+
+def _author_eax(donor):
+    return build_region_resize_rewriting(
+        donor=_extern_donor(),
+        target_id="program",
+        translation_unit_id=UNIT,
+        build_target="program",
+        symbol=TARGET_SYMBOL,
+        seed_object=donor,
+        donor_object=donor,
+        reference_object=make_coff(
+            body=EAX_REFERENCE,
+            relocations=(6, 24),
+            lines=((4, 11), (14, 12), (14, 13), (22, 14)),
+            debug_stream=_st_codeview(len(EAX_REFERENCE), 4, 28, 0x1001),
+        ),
+    )
+
+
+def test_a_region_differing_only_in_eax_at_a_void_return_is_proved() -> None:
+    region = _region(replacement_instructions=EAX_REGION)
+    with pytest.raises(ByteIdentityError, match="eax is live at the exit"):
+        _apply(regions=[region])
+    image, proof = apply_region_resize(
+        DONOR, [region], _rows(), 1, "fixture", prologue_length=4, void_return=True
+    )
+    assert image == EAX_REFERENCE
+    assert proof["growth"] == -4
+
+
+def test_a_void_donor_authors_a_record_pinning_its_type() -> None:
+    donor = _typed_donor(0x0003)
+    authored = _author_eax(donor)
+    values = authored.function.receipt.expected_values
+    pin = values["region_resize.expected_void_return"]
+    assert pin["type_index"] == 0x1001
+    composed = CoffObject(authored.candidate_object)
+    assert bytes(coff_body(composed, composed.function_section(TARGET_SYMBOL))) == EAX_REFERENCE
+    constraints = merge_candidate_constraints(
+        authored.function.intervention, authored.function.receipt
+    ).materialize()
+    candidate = ClassicFamilyDispatcher().dispatch(
+        authored.function.intervention,
+        ClassicDispatchMaterials(
+            seed_object=donor, donor_object=donor, candidate_constraints=constraints
+        ),
+    )
+    assert candidate.output == authored.candidate_object
+    assert candidate.proof["void_return"] == pin
+    # A donor whose procedure type changes refuses the declared relaxation.
+    changed = _typed_donor(0x0074)
+    with pytest.raises(ByteIdentityError, match="returns type 0x74, not void"):
+        ClassicFamilyDispatcher().dispatch(
+            authored.function.intervention,
+            ClassicDispatchMaterials(
+                seed_object=changed, donor_object=changed, candidate_constraints=constraints
+            ),
+        )
+
+
+def test_a_non_void_donor_keeps_eax_live_and_refuses() -> None:
+    with pytest.raises(
+        DiscoveryAuthoringError, match=r"eax is live at the exit.*EAX stays live at ret.*0x74"
+    ):
+        _author_eax(_typed_donor(0x0074))
+
+
+def test_a_donor_without_types_keeps_eax_live_and_refuses() -> None:
+    with pytest.raises(DiscoveryAuthoringError, match=r"EAX stays live at ret.*0 type streams"):
+        _author_eax(_typed_donor(None))
