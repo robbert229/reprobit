@@ -344,7 +344,7 @@ def test_msvc50_code_end_stops_before_a_switch_table() -> None:
     from reprobit.discovery_rewriting import msvc50_code_end
 
     # ... ret, nop, mov edi,edi, then two table entries into this section.
-    code = bytes.fromhex("33c0" "c3" "90" "8bff")
+    code = bytes.fromhex("33c0 c3 90 8bff")
     body = code + bytes(8) + b"\x90" * 4
     rows = [
         {"offset": len(code), "width": 4, "target_section": 3},
@@ -355,7 +355,7 @@ def test_msvc50_code_end_stops_before_a_switch_table() -> None:
     other = [dict(row, target_section=7) for row in rows]
     assert msvc50_code_end(body, other, 3, len(code) + 8) == len(code) + 8
     # Without a terminal instruction before the fill the extent stands.
-    falls = bytes.fromhex("33c0" "40" "90" "8bff") + bytes(8)
+    falls = bytes.fromhex("33c0 40 90 8bff") + bytes(8)
     assert msvc50_code_end(falls, rows, 3, len(code) + 8) == len(code) + 8
     # No table: the procedure length stands.
     assert msvc50_code_end(body, [], 3, len(code) + 8) == len(code) + 8
@@ -366,14 +366,14 @@ def test_a_bijection_rewrites_byte_fields_within_eax_to_ebx() -> None:
     from reprobit.classic.register_semantics import decode_ia32_bijection_body
 
     # mov edx, [0] ; or dh, 2 ; mov [0], edx ; ret
-    body = bytes.fromhex("8b1500000000" "80ce02" "891500000000" "c3")
+    body = bytes.fromhex("8b1500000000 80ce02 891500000000 c3")
     decoded = decode_ia32_bijection_body(body, "t")
     assert decoded[1]["byte_fields"] == [(7, 0)]
     assert decoded[1]["byte_frozen"] == frozenset({"edx"})
     image, proof = apply_register_bijection(
         body, {"ecx": "edx", "edx": "ecx"}, (0, 15), frozenset(), "t", {}
     )
-    assert image == bytes.fromhex("8b0d00000000" "80cd02" "890d00000000" "c3")
+    assert image == bytes.fromhex("8b0d00000000 80cd02 890d00000000 c3")
     assert proof["rewritten_offsets"] == [1, 7, 10]
 
 
@@ -383,7 +383,7 @@ def test_a_bijection_refuses_to_move_a_byte_field_off_eax_to_ebx() -> None:
     from reprobit.binary import ByteIdentityError
     from reprobit.classic.register_bijection import apply_register_bijection
 
-    body = bytes.fromhex("8b1500000000" "80ce02" "891500000000" "c3")
+    body = bytes.fromhex("8b1500000000 80ce02 891500000000 c3")
     with pytest.raises(ByteIdentityError, match="off a byte register"):
         apply_register_bijection(body, {"esi": "edx", "edx": "esi"}, (0, 15), frozenset(), "t", {})
 
@@ -391,17 +391,16 @@ def test_a_bijection_refuses_to_move_a_byte_field_off_eax_to_ebx() -> None:
 def test_the_regional_deriver_reads_byte_fields() -> None:
     from reprobit.discovery_rewriting import derive_regional_bijections
 
-    donor = bytes.fromhex("8b1500000000" "80ce02" "891500000000" "c3")
-    target = bytes.fromhex("8b0d00000000" "80cd02" "890d00000000" "c3")
+    donor = bytes.fromhex("8b1500000000 80ce02 891500000000 c3")
+    target = bytes.fromhex("8b0d00000000 80cd02 890d00000000 c3")
     found = derive_regional_bijections(donor, target, {}, None, frozenset(), frozenset())
     assert found and found[0]["mapping"] == {"ecx": "edx", "edx": "ecx"}
-
 
 
 def test_msvc50_code_end_stops_before_a_jump_table_and_its_index_table() -> None:
     from reprobit.discovery_rewriting import msvc50_code_end
 
-    code = bytes.fromhex("33c0" "c3" "90")
+    code = bytes.fromhex("33c0 c3 90")
     body = code + bytes(8) + bytes.fromhex("00010100") + b"\x90" * 4
     rows = [
         {"offset": len(code), "width": 4, "target_section": 3},
@@ -413,10 +412,12 @@ def test_msvc50_code_end_stops_before_a_jump_table_and_its_index_table() -> None
 def test_msvc50_code_end_stops_before_two_switch_tables() -> None:
     from reprobit.discovery_rewriting import msvc50_code_end
 
-    code = bytes.fromhex("33c0" "c3" "90")
+    code = bytes.fromhex("33c0 c3 90")
     first = len(code)
     second = first + 8 + 4
-    body = code + bytes(8) + bytes.fromhex("00010000") + bytes(4) + bytes.fromhex("0001") + b"\x90" * 2
+    body = (
+        code + bytes(8) + bytes.fromhex("00010000") + bytes(4) + bytes.fromhex("0001") + b"\x90" * 2
+    )
     rows = [
         {"offset": first, "width": 4, "target_section": 3},
         {"offset": first + 4, "width": 4, "target_section": 3},
@@ -424,7 +425,7 @@ def test_msvc50_code_end_stops_before_two_switch_tables() -> None:
     ]
     assert msvc50_code_end(body, rows, 3, second + 6) == 3
     # A foreign relocation after the first table means it is not a table tail.
-    foreign = rows + [{"offset": second + 4, "width": 2, "target_section": 9}]
+    foreign = [*rows, {"offset": second + 4, "width": 2, "target_section": 9}]
     assert msvc50_code_end(body, foreign, 3, second + 6) == second + 6
 # A struct local's field store that the reference makes after the call's
 # argument pushes, its ESP displacement rebased by the pushes it crosses.
