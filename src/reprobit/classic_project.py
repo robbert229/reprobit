@@ -61,6 +61,7 @@ from reprobit.strict_json import canonical_json
 
 if TYPE_CHECKING:
     from reprobit.classic.overlay_tokens import ClassicOverlayRenderSession
+    from reprobit.classic.toolchain_helpers import HelperLibrary
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +100,9 @@ class ClassicDispatchMaterials:
     shape_identifiers: frozenset[str] = frozenset()
     candidate_constraints: Mapping[str, object] | None = None
     compiler_identity: Msvc420CompilerIdentity | None = None
+    # The authenticated toolchain library compiler-helper bodies are read
+    # from (reprobit.classic.toolchain_helpers); None when not supplied.
+    helper_library: HelperLibrary | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -236,11 +240,11 @@ class ClassicFamilyDispatcher:
             )
         elif family is ClassicRecipeFamily.RETAIL_EXACT_REGION_RESIZE_REWRITING:
             output, proof = region_resize.produce_region_resize_rewriting_candidate(
-                seed, donor, function
+                seed, donor, function, materials.helper_library
             )
         elif family is ClassicRecipeFamily.RETAIL_EXACT_FUNCTION_TRANSLATION_VALIDATION:
             output, proof = function_validation.produce_function_validation_candidate(
-                seed, donor, function
+                seed, donor, function, materials.helper_library
             )
         elif family is ClassicRecipeFamily.RETAIL_EXACT_SAME_TU_INSTRUCTION_HYBRID_RESIZE:
             output, proof = hybrid_resize.produce_same_tu_instruction_hybrid_resize_candidate(

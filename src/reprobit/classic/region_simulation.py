@@ -128,6 +128,17 @@ fdivr`` with m32, m64, ``st, st(i)``, ``st(i), st`` and popping operands,
 no return, string instruction, other x87 instruction (``fist``/``fistp``,
 ``fldcw``, the transcendentals, the environment instructions, ``fwait``)
 or indirect transfer is admitted.
+
+Two extensions are opt-in and leave every proof that does not ask for them
+unchanged.  A caller may pass ``helpers``, compiler helpers' verified
+bodies: a direct call to one runs the body inline (:func:`run_helper`),
+whose instructions also admit ``fwait``, ``leave``, ``fnstcw``/``fldcw``
+m16 and ``fist``/``fistp``; the control word is then a term
+(``SHARED_CONTROL_WORD`` until a ``fldcw``), a ``fldcw`` must keep the
+shared word's exception masks (x4), and ``fist`` names the word it rounds
+under.  A whole-function proof may set an instruction's ``indirect_pop``:
+``call [reg+disp]`` through a vtable slot is then an event
+(:func:`_vtable_call`).
 """
 
 from __future__ import annotations
@@ -590,6 +601,9 @@ class X87State:
     after_call: bool = False
     call_frame: bool = False
     call_pushes: list[int] = field(default_factory=list)
+    # The control word while an inlined compiler helper has changed it (a
+    # 16-bit term); None is the control word both versions share (x4).
+    cw: Term = None
 
     def fork(self) -> X87State:
         return X87State(
@@ -604,6 +618,7 @@ class X87State:
             self.after_call,
             self.call_frame,
             list(self.call_pushes),
+            self.cw,
         )
 
     def entry_term(self, position: int) -> Term:
@@ -795,6 +810,7 @@ class _Instruction:
         context: str,
         *,
         extended: bool = False,
+        helper: bool = False,
     ) -> None:
         self.offset = offset
         self.context = f"{context} at {offset}"
@@ -809,6 +825,14 @@ class _Instruction:
         # :func:`_string_step`.
         self.extended = extended
         self.scaled_lea_constants = extended
+        # An instruction of an inlined compiler helper's body (``helper``)
+        # also admits ``fwait``, ``leave``, ``fnstcw``/``fldcw`` m16 and
+        # ``fist``/``fistp`` m32 and ``fistp`` m64 (:func:`run_helper`).
+        self.helper = helper
+        # The bytes the callee of an indirect ``call [reg+disp]`` pops on
+        # return, when a whole-function proof has determined them
+        # (:mod:`reprobit.classic.function_validation`); None refuses it.
+        self.indirect_pop: int | None = None
         cursor = 0
         self.operand16 = False
         self.repeat: int | None = None
@@ -1171,6 +1195,7 @@ def _call(
     undefined: _Undefined,
     context: str,
     x87_returns: Mapping[str, int] | None = None,
+    pop: int | None = None,
 ) -> None:
     """A call to a register-free callee: one event named by everything it can read.
 
@@ -1199,12 +1224,21 @@ def _call(
     ``-push`` is one the donor's depths allow.  Any other call (an unknown
     count, an import slot) leaves the x87 stack the call's unknown function
     and no x87 instruction may follow it inside the region.
+
+    ``pop`` is given for an indirect call through a vtable slot (``callee``
+    is ``("indirect", target, ("pop", n))``): the bytes its callee pops, as a
+    whole-function proof determined them; ``symbol`` is then None.
     """
-    pop = callee_stack_pop(symbol)
+    if pop is None:
+        pop = callee_stack_pop(symbol)
     require(
         pop is not None,
         f"{context}: a call to {symbol!r}, whose decoration does not fix a register-free "
         "convention, is outside the simulator's closed set",
+    )
+    require(
+        state.fpu.cw is None,
+        f"{context}: a call is made while the x87 control word is changed",
     )
     fpu = state.fpu
     returned: int | None = None
@@ -1395,6 +1429,94 @@ class _X87:
         )
 
 
+# The x87 control-word forms an inlined compiler helper may run: fnstcw and
+# fldcw m16, fist and fistp m32, fistp m64 (by (opcode, digit)).
+_CONTROL_WORD_FORMS = {
+    (0xD9, 7): "fnstcw",
+    (0xD9, 5): "fldcw",
+    (0xDB, 2): "fist32",
+    (0xDB, 3): "fistp32",
+    (0xDF, 7): "fistp64",
+}
+# The control word both versions share (x4 of `rewriting_region_resize`): a
+# 16-bit atom, the same at every point because no instruction outside an
+# inlined helper changes it and a callee restores it.
+SHARED_CONTROL_WORD: Term = ("b", 16, ("fcw0",))
+
+
+def _low_byte(value: Term) -> Term:
+    """A canonical name for bits 0-7 of a 16-bit term, or None.
+
+    Follows exactly the sub-register terms a ``mov`` of AX, a byte operation
+    on AH and a ``mov`` back produce: the low byte of ``("ext", v, 0)`` is
+    the low byte of the 32-bit v; an insertion that leaves bits 0-7 alone
+    passes them through, and one of 16 or 8 bits at bit 0 supplies them.
+    """
+    if value == SHARED_CONTROL_WORD:
+        return ("fcw0-low",)
+    if not (value[0] == "b" and value[1] == 16 and value[2][0] == "ext" and value[2][2] == 0):
+        return None
+    word = value[2][1]
+    while True:
+        atom = _single_atom(word)
+        if atom is None or atom[0] != "ins":
+            return None
+        _tag, old, low, width, part = atom
+        if low >= 8:
+            word = old
+            continue
+        if low != 0:
+            return None
+        if width == 8:
+            return ("low", part)
+        if width == 16:
+            return _low_byte(part)
+        return None
+
+
+def _control_word_step(
+    state: PathState, item: _Instruction, x87: _X87, form: tuple[int, int]
+) -> None:
+    """``fnstcw``, ``fldcw`` and ``fist``/``fistp`` inside an inlined helper.
+
+    The control word is a term: the shared one (``SHARED_CONTROL_WORD``)
+    until a ``fldcw`` loads another, which ``fpu.cw`` then holds.  ``fnstcw``
+    stores the current word.  ``fldcw`` loads a 16-bit word and must leave
+    bits 0-7 -- the exception masks (and the reserved bits) -- exactly the
+    shared word's, so every exception stays masked (x4) and no instruction
+    traps; precision and rounding control may change.  ``fist``/``fistp``
+    store ``("fist", w, x, cw)``: the integer that rounding x under the
+    control word cw gives, an exact function of x and every bit of cw, and
+    an operation that can raise an exception (an event in the footprint).
+    """
+    fpu = state.fpu
+    current = SHARED_CONTROL_WORD if fpu.cw is None else fpu.cw
+    address = item.address(state.regs)
+    name = _CONTROL_WORD_FORMS[form]
+    # Intel leaves C0-C3 undefined after each of these (fist sets C1 to
+    # the rounding direction, which is not modelled: undefined is never
+    # equal to anything).
+    x87.undefine()
+    if name == "fnstcw":
+        _store(state, address, 2, current)
+        return
+    if name == "fldcw":
+        loaded = _load(state, address, 2)
+        require(
+            _low_byte(loaded) is not None and _low_byte(loaded) == _low_byte(SHARED_CONTROL_WORD),
+            f"{item.context}: the fldcw may change the exception masks of the shared control word",
+        )
+        fpu.cw = None if loaded == SHARED_CONTROL_WORD else loaded
+        x87.event(("fldcw", loaded))
+        return
+    width = 8 if name == "fistp64" else 4
+    value = ("fist", width * 8, x87.get(0), current)
+    x87.event(value)
+    _store(state, address, width, lin_atom(value) if width == 4 else ("b", 64, value))
+    if name != "fist32":
+        x87.pop()
+
+
 def _x87_step(state: PathState, item: _Instruction, undefined: _Undefined) -> None:
     """Execute one x87 instruction of the closed set (see the module docstring)."""
     context = item.context
@@ -1414,6 +1536,14 @@ def _x87_step(state: PathState, item: _Instruction, undefined: _Undefined) -> No
     mod, digit, index = item.modrm()
     refused = (
         f"{context}: the x87 instruction {item.raw.hex()} is outside the simulator's closed set"
+    )
+    if item.helper and mod != 3 and (op, digit) in _CONTROL_WORD_FORMS:
+        _control_word_step(state, item, x87, (op, digit))
+        return
+    require(
+        state.fpu.cw is None,
+        f"{context}: only fist, fistp, fldcw and fnstcw run while a helper has changed the x87 "
+        "control word",
     )
     if mod != 3:
         if op in (0xD8, 0xDC):
@@ -1591,16 +1721,179 @@ def _string_step(state: PathState, item: _Instruction, undefined: _Undefined) ->
         state.regs["ecx"] = lin(0)
 
 
+HELPER_MAX_STEPS = 8192
+
+
+@dataclass(frozen=True)
+class HelperCode:
+    """A compiler helper's verified body: the bytes a direct call to ``symbol`` runs.
+
+    ``code`` starts at the symbol and runs to the end of its section; the
+    caller (:mod:`reprobit.classic.toolchain_helpers`) reads it from an
+    authenticated library member that has no relocation, and ``sha256`` is
+    its digest, which the record pins.
+    """
+
+    symbol: str
+    code: bytes
+    sha256: str
+
+
+def run_helper(state: PathState, helper: HelperCode, undefined: _Undefined, context: str) -> None:
+    """A direct call to a compiler helper, run inline from the helper's own bytes.
+
+    The call pushes a return address: a fresh atom of this version (the two
+    versions' return addresses are different code addresses, so the atom
+    never equals the other version's), stored where the ``call`` stores it.
+    The helper's instructions then run on the caller's state, on its own
+    stack below the caller's ESP, through the same memory, frame and x87
+    model as the caller's, with the helper forms of :class:`_Instruction`
+    admitted.  The run must not fork: every branch is decided by constants
+    (or by the path's conditions), so a helper whose control flow depends on
+    an unknown value, or that loops past ``HELPER_MAX_STEPS``, is refused.
+    A helper may not call out (a call or an indirect transfer is refused,
+    and its body has no relocation, so it names no global).  It must return
+    with ``ret`` to exactly the pushed address, with ESP a constant offset
+    from the caller's and the control word restored.  In a whole-function
+    proof's frame model a read below ESP inside the helper (a stack probe)
+    is a fresh value of this version (``FrameModel.load``): the frame model
+    owns no memory there.  Everything else is the exact
+    instruction semantics the caller's code has, so the state after the
+    call is the helper's real effect on the caller's state.
+    """
+    where = f"{context}: the helper {helper.symbol}"
+    undefined.count += 1
+    returned = lin_atom(("retaddr", undefined.tag, undefined.count))
+    before = state.regs["esp"]
+    logged = len(state.stores)
+    _push(state, returned)
+    frame = state.frame
+    if frame is not None:
+        frame.helper_reads = undefined
+    decoded: dict[int, _Instruction] = {}
+    try:
+        offset = 0
+        steps = 0
+        while True:
+            steps += 1
+            require(steps <= HELPER_MAX_STEPS, f"{where} runs past {HELPER_MAX_STEPS} steps")
+            require(0 <= offset < len(helper.code), f"{where} reaches {offset}, outside its body")
+            item = decoded.get(offset)
+            if item is None:
+                item = _Instruction(helper.code, offset, {}, where, helper=True)
+                decoded[offset] = item
+            op = item.opcode
+            if op in (0xC3, 0xC2) and not item.operand16:
+                address = _load(state, state.regs["esp"], 4)
+                require(address == returned, f"{where} returns to another address")
+                pop = 4
+                if op == 0xC2:
+                    pop += int.from_bytes(item.raw[item.cursor : item.cursor + 2], "little")
+                state.regs["esp"] = lin_add(state.regs["esp"], lin(pop))
+                break
+            require(
+                op not in (0xE8, 0x9A) and not (op == 0xFF and item.modrm()[1] in (2, 3, 4, 5)),
+                f"{where} calls out or transfers control indirectly",
+            )
+            action, detail = _step(state, item, undefined)
+            following = offset + item.length
+            if action == "fall":
+                offset = following
+                continue
+            if action == "jump":
+                offset = detail
+                continue
+            code_value, target = detail
+            decided = condition(code_value, state.flags)
+            if not isinstance(decided, bool):
+                atom, polarity = decided
+                known = dict(state.conditions)
+                require(
+                    atom in known,
+                    f"{where} branches on a value that is not constant at the call",
+                )
+                decided = known[atom] == polarity
+            offset = target if decided else following
+    finally:
+        if frame is not None:
+            frame.helper_reads = None
+    require(state.fpu.cw is None, f"{where} returns with the x87 control word changed")
+    require(
+        const_of(lin_sub(state.regs["esp"], before)) is not None,
+        f"{where} returns with ESP at a non-constant offset from the caller's",
+    )
+    # The helper's stores wholly below the caller's ESP after the return (its
+    # return address, its own frame) are dead stack: memory below ESP is not
+    # part of the compared state, exactly as the return address and frame of
+    # every callee a call event stands for are not.  A frame model's private
+    # slots are not in the log and stay as they are.
+    state.stores[logged:] = [
+        entry for entry in state.stores[logged:] if not _below(entry, state.regs["esp"])
+    ]
+
+
+def _below(store: tuple[Term, int, Term], esp: Term) -> bool:
+    """Whether a store lies wholly below ESP (a constant offset from it)."""
+    offset = const_of(lin_sub(store[0], esp))
+    if offset is None:
+        return False
+    return _signed(offset, 32) + store[1] <= 0
+
+
+def _vtable_call(state: PathState, item: _Instruction, undefined: _Undefined, context: str) -> None:
+    """``call [reg+disp]`` through a slot of a vtable loaded from memory: an event.
+
+    The operand's address must be one 32-bit load (the vtable pointer, read
+    from an object) plus a constant (the slot).  The callee is the word in
+    that slot, a term: two versions name the same callee exactly when they
+    read the same slot of the same vtable from the same memory.  It is a
+    COM method (``__stdcall``: no register argument, the arguments popped
+    on return); the bytes it pops are ``item.indirect_pop``, determined by
+    the whole-function proof from each version's stack relation and part of
+    the event's name, so two versions that disagree make different calls.
+    """
+    address = item.address(state.regs)
+    terms: tuple[Any, ...] = address[2] if address[0] == "lin" else ()
+    require(
+        len(terms) == 1
+        and terms[0][1] == 1
+        and isinstance(terms[0][0], tuple)
+        and terms[0][0][0] == "ld"
+        and terms[0][0][2] == 4,
+        f"{context}: an indirect call whose operand is not a slot of a vtable loaded from memory "
+        "is outside the simulator's closed set",
+    )
+    target = _load(state, address, 4)
+    pop = cast(int, item.indirect_pop)
+    _call(state, ("indirect", target, ("pop", pop)), None, undefined, context, pop=pop)
+
+
 def _step(
     state: PathState,
     item: _Instruction,
     undefined: _Undefined,
     x87_returns: Mapping[str, int] | None = None,
+    helpers: Mapping[str, HelperCode] | None = None,
 ) -> tuple[str, Any]:
-    """Execute one instruction; return ("fall", None), ("jump", target) or ("branch", ...)."""
+    """Execute one instruction; return ("fall", None), ("jump", target) or ("branch", ...).
+
+    ``helpers`` maps a compiler helper's symbol to its verified body: a
+    direct call to it runs that body inline (:func:`run_helper`).
+    """
     op = item.opcode
     end = item.offset + item.length
     context = item.context
+    if item.helper and op == 0x9B and not item.operand16:
+        # fwait: every exception is masked (x4, and a helper's fldcw keeps the
+        # masks), so no exception is pending and it does nothing.
+        return ("fall", None)
+    if item.helper and op == 0xC9 and not item.operand16:
+        # leave: mov esp, ebp; pop ebp.
+        state.regs["esp"] = state.regs["ebp"]
+        value = _load(state, state.regs["esp"], 4)
+        state.regs["esp"] = lin_add(state.regs["esp"], lin(4))
+        state.regs["ebp"] = value
+        return ("fall", None)
     if item.operand16:
         require(
             op in (0x89, 0x8B, 0xC7, 0x81, 0x83, 0x39, 0x3B, 0x85),
@@ -1799,6 +2092,9 @@ def _step(
             symbol = item.relocations.get(item.modrm_at + 1 + item.offset)
             _call(state, ("indirect", callee), symbol, undefined, context)
             return ("fall", None)
+        if op == 0xFF and digit == 2 and mod != 3 and item.indirect_pop is not None:
+            _vtable_call(state, item, undefined, context)
+            return ("fall", None)
         require(
             op == 0xFF and digit == 6,
             f"{context}: an indirect call or jump is outside the simulator's closed set",
@@ -1811,6 +2107,9 @@ def _step(
         require(
             addend == 0, f"{context}: a call into the middle of a symbol is outside the closed set"
         )
+        if helpers is not None and symbol in helpers:
+            run_helper(state, helpers[symbol], undefined, context)
+            return ("fall", None)
         _call(state, ("direct", symbol), symbol, undefined, context, x87_returns)
         return ("fall", None)
     if op in (0xC1, 0xD1):
@@ -1924,6 +2223,7 @@ def simulate_region(
     begin: int | None = None,
     leave: bool = False,
     x87_returns: Mapping[str, int] | None = None,
+    helpers: Mapping[str, HelperCode] | None = None,
 ) -> list[PathResult]:
     """Every path of [start, end) from the symbolic entry state.
 
@@ -1939,7 +2239,8 @@ def simulate_region(
     entry; a run from a later ``begin`` is not asked to read the fields
     before it.  ``x87_returns`` maps a direct callee to the number of x87
     values it returns (see :func:`_call`); without it no x87 instruction may
-    follow a call.
+    follow a call.  ``helpers`` maps a compiler helper to its verified body,
+    which a direct call to it runs inline (:func:`run_helper`).
     """
     starts = region_boundaries(code, start, end, context)
     boundaries = set(starts) | {end}
@@ -1968,7 +2269,7 @@ def simulate_region(
             steps += 1
             require(steps <= MAX_STEPS, f"{context}: the region's paths exceed the step bound")
             item = instructions[offset]
-            action, detail = _step(state, item, undefined, x87_returns)
+            action, detail = _step(state, item, undefined, x87_returns, helpers)
             following = offset + item.length
             if action == "fall":
                 offset = following
@@ -2124,8 +2425,11 @@ __all__ = [
     "FCMP_BITS",
     "FCMP_OUTCOMES",
     "FLAG_NAMES",
+    "HELPER_MAX_STEPS",
     "MAX_PATHS",
+    "SHARED_CONTROL_WORD",
     "X87_CONDITION_BITS",
+    "HelperCode",
     "PathResult",
     "RelocationTarget",
     "X87State",
@@ -2140,6 +2444,7 @@ __all__ = [
     "mentions_x87_undefined",
     "region_boundaries",
     "register_free_callee",
+    "run_helper",
     "simulate_region",
     "store_normal_form",
     "stores_equivalent",

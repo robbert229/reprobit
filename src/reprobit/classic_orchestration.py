@@ -35,6 +35,7 @@ from reprobit.classic.semantic_contracts import (
 )
 from reprobit.classic.semantic_errors import ClassicSemanticError
 from reprobit.classic.source_refactor_semantics import validate_donor_source_semantics
+from reprobit.classic.toolchain_helpers import HelperLibrary
 from reprobit.classic_donors import (
     DonorCompileRequest,
     DonorSourceError,
@@ -84,6 +85,7 @@ class ClassicPreparedUnit:
     actions: tuple[ClassicRecipeIntervention | LegacyOracleInstallIntervention, ...]
     receipts: tuple[ClassicProofReceipt, ...]
     compiler_identity: Msvc420CompilerIdentity | None = None
+    helper_library: HelperLibrary | None = None
 
 
 def classic_unit_oracle_targets(unit: ClassicPreparedUnit, *, repair: bool) -> frozenset[str]:
@@ -619,8 +621,13 @@ def prepare_classic_units(
     *,
     clean_sources: Mapping[str, bytes],
     effective_sources: Mapping[str, bytes],
+    helper_library: HelperLibrary | None = None,
 ) -> tuple[ClassicPreparedUnit, ...]:
-    """Close every TU shard and render all private donor compile requests."""
+    """Close every TU shard and render all private donor compile requests.
+
+    ``helper_library`` is the authenticated toolchain library a producer
+    reads compiler-helper bodies from (`classic.toolchain_helpers`).
+    """
 
     if bundle.build_plan is None:
         raise ClassicProjectError("classic orchestration requires a build plan")
@@ -754,6 +761,7 @@ def prepare_classic_units(
                 actions,
                 unit_receipts,
                 compiler_identity,
+                helper_library,
             )
         )
     return tuple(prepared)
@@ -972,6 +980,7 @@ def compose_classic_unit(
             shape_identifiers=request.carrier_identifiers,
             candidate_constraints=values,
             compiler_identity=unit.compiler_identity,
+            helper_library=unit.helper_library,
         )
         dispatch = repair_dispatch.dispatch_classic_action(
             dispatcher,

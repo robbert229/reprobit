@@ -67,6 +67,7 @@ from reprobit.schema import (
     ProducerGraphBuildAdapter,
     ProjectBundle,
 )
+from reprobit.toolchain_helper_library import load_helper_library
 from reprobit.toolchains import (
     ClassicMSVCToolchain,
     ToolchainDoctorReport,
@@ -497,6 +498,7 @@ def prepare_classic_producer_graph_run(
         bundle,
         clean_sources=clean_sources,
         effective_sources=effective_sources,
+        helper_library=load_helper_library(installation.root, bundle.spec.toolchain.profile),
     )
     compile_records = _graph_compile_records(
         bundle,

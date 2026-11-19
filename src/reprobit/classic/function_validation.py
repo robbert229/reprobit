@@ -89,7 +89,8 @@ Checks (each is a refusal):
    instruction of its own program; there is no indirect transfer.  A call
    is a direct call to a callee whose MSVC C decoration fixes a
    register-free convention (``call rel32`` with its REL32 record, ``call
-   [abs32]``), exactly as in the region simulator.  Two forms are admitted
+   [abs32]``), exactly as in the region simulator, a call to a verified
+   compiler helper, or a COM vtable call (both below).  Two forms are admitted
    here and not in a region proof (`region_simulation._Instruction`'s
    ``extended``): ``lea r, [index*scale + disp32]`` with an unrelocated
    displacement (arithmetic on a constant), and the string forms MSVC 5.0
@@ -98,6 +99,42 @@ Checks (each is a refusal):
    ``repne scasb`` (one opaque term of AL, EDI, ECX and the memory state,
    recorded in the footprint; `region_simulation._string_step`), with the
    direction flag clear as the calling convention leaves it.
+
+   Compiler helpers.  A direct call to a compiler helper (``__ftol``,
+   ``__chkstk``: a ``__name`` the decoration rules refuse) is admitted when
+   its body comes from the authenticated toolchain library
+   (`toolchain_helpers.HelperLibrary`: ``lib/libc.lib`` whose bytes are the
+   profile's reviewed authority, the member its symbol index names, a code
+   section with no relocation).  The call runs that body inline
+   (`region_simulation.run_helper`): a return address of its own version is
+   pushed, the helper's instructions run on the caller's state with the
+   helper forms ``fwait``, ``leave``, ``fnstcw``/``fldcw`` and ``fist``/
+   ``fistp`` admitted, every branch must be decided by constants, and it
+   must return to the pushed address with the control word restored.  The
+   control word is a term (the shared word until a ``fldcw``); a ``fldcw``
+   must keep the shared word's exception masks, and ``fist`` names the word
+   it rounds under.  ``__chkstk``'s argument must be a constant (``mov eax,
+   n`` before the call), which makes its probe loop a fixed number of
+   steps, and a ``mov eax, n; call __chkstk`` prologue whose simulated
+   effect is ESP0 - n allocates the FPO locals block as ``sub esp, n``
+   does (check 7).  A helper that calls out or names a global (``__CIacos``,
+   ``__isctype``) is refused.  The record pins the library, its digest, the
+   member and the body's digest (check 8).
+
+   COM vtable calls.  ``call [reg+disp]`` whose address is one 32-bit load
+   (the vtable pointer, read from an object) plus a constant is an event
+   named like a direct call's, with its callee the slot's word (a term) and
+   the bytes it pops: two versions make the same indirect calls exactly
+   when they read the same slot of the same vtable from the same memory, in
+   the same order, with the same arguments.  After it EAX, ECX and EDX are
+   the call's results, EBX, ESI, EDI and EBP are preserved, memory is the
+   call's result and no x87 instruction may follow.  The pop is determined
+   per version (`indirect_call_pops`): the walk of its code gives ESP at
+   every instruction as a constant plus the unknown pops, equal wherever
+   edges meet and ESP0 at every return; every pop must be fixed uniquely,
+   a multiple of four, and it is part of the event's name, so versions that
+   disagree make different calls.  Two vtable calls on every path between
+   the same points fix only the sum of their pops and are refused.
 3. Relocations.  D's relocated fields are 32-bit `DIR32` fields or a call's
    REL32 field naming a symbol outside the function's own section.  P
    declares its relocated fields, sorted, as a bijection onto D's records:
@@ -199,7 +236,18 @@ allocated after the prologue the FPO record describes, so they lie in
 compared with the donor's, the same callee (with its fixed parameter
 count) reads the same arguments from both.  (a3) An access at a constant
 offset from ESP0 within the allocated frame or the parameter words does
-not fault (the stack is committed).  No other assumption is made: the
+not fault (the stack is committed).  (a4) The donor is compiled code
+whose static stack model is its callees' truth: ESP is one constant offset
+from ESP0 at every point on every path, and ESP0 at every return, so the
+pops its walk determines are the real pops of its vtable callees.  (a5) A
+COM method is ``__stdcall``: it takes no argument in a register and pops
+its own arguments.  (a6) The stack below ESP is not part of the compared
+state: an inlined helper's stores wholly below the caller's ESP after it
+returns (its return address, its own frame) are dropped from the store log
+-- as the return address and frame of every callee a call event stands for
+already are -- and in a private frame nothing below ESP is ever read.  (a7)
+The linked image's compiler helper is the library member's section
+unchanged (it has no relocation to apply).  No other assumption is made: the
 relation is inferred, nothing about the replacement is believed, and the
 simulator's term model is exact.
 """
@@ -210,6 +258,7 @@ import hashlib
 from collections import Counter
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from fractions import Fraction
 from typing import Any, cast
 
 from reprobit.binary import ByteIdentityError, require
@@ -231,8 +280,10 @@ from .coff import _comdat_child
 from .debug import MSVC50_FUNCTION_FILL_BYTE, parse_fpo_data
 from .foundation import require_payload_free_declaration, sha256_bytes
 from .region_simulation import (
+    _STRING_OPCODES,
     FLAG_NAMES,
     X87_CONDITION_BITS,
+    HelperCode,
     PathState,
     RelocationTarget,
     Term,
@@ -243,6 +294,7 @@ from .region_simulation import (
     _step,
     _Undefined,
     condition,
+    const_of,
     contradictory,
     lin,
     lin_atom,
@@ -260,6 +312,7 @@ from .rewriting_region_resize import (
     protected_code_offsets,
     resized_donor_object,
 )
+from .toolchain_helpers import HelperBody, HelperLibrary, compiler_helper
 
 FUNCTION_VALIDATION_KIND = "function_translation_validation_v1"
 FUNCTION_VALIDATION_CLASS = "retail_exact_function_translation_validation"
@@ -381,6 +434,9 @@ class FrameModel:
         self.slots = dict(slots or {})
         self.dirty = set(dirty)
         self.context = context
+        # While an inlined compiler helper runs (`region_simulation.
+        # run_helper`), the source of fresh values for its stack probes.
+        self.helper_reads: Any = None
 
     def fork(self) -> FrameModel:
         return FrameModel(self.facts, self.slots, self.dirty, self.context)
@@ -393,8 +449,12 @@ class FrameModel:
         )
         return cast(int, offset)
 
-    def _offset(self, state: PathState, address: Term) -> int | None:
-        """k for an access at ESP0 + k; None for other memory."""
+    def _offset(self, state: PathState, address: Term, *, probe: bool = False) -> int | None:
+        """k for an access at ESP0 + k; None for other memory.
+
+        With ``probe`` (a load inside an inlined helper) an access below ESP
+        is returned rather than refused; :meth:`load` makes it a fresh value.
+        """
         if address[0] != "lin":
             return None
         coefficients = dict(address[2])
@@ -406,7 +466,7 @@ class FrameModel:
             return None
         offset = _signed(address[1])
         require(
-            offset >= self._current(state),
+            offset >= self._current(state) or probe,
             f"{self.context}: a stack access at ESP0{offset:+d} lies below ESP",
         )
         return offset
@@ -424,7 +484,14 @@ class FrameModel:
         return [key for key in self.slots if key[0] < offset + width and offset < key[0] + key[1]]
 
     def load(self, state: PathState, address: Term, width: int) -> Term | None:
-        offset = self._offset(state, address)
+        offset = self._offset(state, address, probe=self.helper_reads is not None)
+        if offset is not None and offset < self._current(state):
+            # A helper's stack probe below ESP: memory no model owns, so a
+            # fresh value of this version (never equal to the other's).
+            state.footprint.add((address, width))
+            fresh = self.helper_reads
+            fresh.count += 1
+            return _width_term(("probe", fresh.tag, fresh.count), width)
         if offset is None or not self._owned(offset, width):
             return None
         key = (offset, width)
@@ -601,7 +668,12 @@ def _width_of(value: Term) -> int | None:
 
 
 class Program:
-    """One version's code: its instructions, static flow and cut points."""
+    """One version's code: its instructions, static flow and cut points.
+
+    ``helpers`` maps each compiler helper the code calls to its verified body
+    (check 2); every indirect call through a vtable slot gets the argument
+    pop its stack relation determines (:func:`indirect_call_pops`).
+    """
 
     def __init__(
         self,
@@ -609,11 +681,13 @@ class Program:
         relocations: Mapping[int, RelocationTarget],
         side: str,
         context: str,
+        helpers: Mapping[str, HelperCode] | None = None,
     ) -> None:
         self.code = code
         self.side = side
         self.context = context
         self.relocations = dict(relocations)
+        self.helpers = dict(helpers or {})
         starts = region_boundaries(code, 0, len(code), context)
         self.instructions = {
             offset: _Instruction(code, offset, self.relocations, context, extended=True)
@@ -624,6 +698,9 @@ class Program:
             self.successors[offset] = self._flow(item)
         self.reachable = self._reach()
         self.cuts = self._cut_points()
+        self.indirect_pops = indirect_call_pops(self)
+        for offset, pop in self.indirect_pops.items():
+            self.instructions[offset].indirect_pop = pop
 
     def is_return(self, item: _Instruction) -> bool:
         return item.opcode in (0xC3, 0xC2) and not item.operand16
@@ -711,6 +788,162 @@ class Program:
                 continue
             cuts.add(offset)
         return frozenset(cuts)
+
+
+def vtable_call(item: _Instruction) -> bool:
+    """Whether an instruction is ``call [reg+disp]`` (``FF /2``, memory, not ``[abs32]``)."""
+    if item.opcode != 0xFF or item.operand16:
+        return False
+    mod, digit, rm = item.modrm()
+    return digit == 2 and mod != 3 and not (mod == 0 and rm == 5)
+
+
+MAX_INDIRECT_POP = 4096
+
+
+def _scratch_state(eax: int | None) -> PathState:
+    regs = {name: lin_atom(("reg0", name)) for name in (*GENERAL_REGISTERS, "esp")}
+    if eax is not None:
+        regs["eax"] = lin(eax)
+    return PathState(regs, {name: ("flag0", name) for name in FLAG_NAMES})
+
+
+def _stack_change(program: Program, item: _Instruction, eax: int | None) -> int:
+    """ESP after the instruction minus ESP before it, by the simulator's own semantics.
+
+    ``eax`` is EAX when the instruction before is ``mov eax, imm32`` (the
+    argument of ``__chkstk``).  A change that is not a constant refuses.
+    """
+    if 0xD8 <= item.opcode <= 0xDF or item.opcode in _STRING_OPCODES:
+        return 0  # x87 and string instructions do not touch ESP
+    state = _scratch_state(eax)
+    before = state.regs["esp"]
+    _step(state, item, _Undefined(f"{program.side}-stack"), None, program.helpers)
+    change = const_of(lin_sub(state.regs["esp"], before))
+    require(
+        change is not None,
+        f"{item.context}: ESP changes by a non-constant amount, so the stack relation does not "
+        "determine an indirect callee's argument pop",
+    )
+    return _signed(cast(int, change))
+
+
+def indirect_call_pops(program: Program) -> dict[int, int]:
+    """The bytes each vtable call's callee pops, determined by the stack relation.
+
+    Each indirect call site i gets an unknown n_i.  A walk of the reachable
+    code from the entry (ESP = ESP0) gives ESP - ESP0 at every instruction
+    as a form c + sum(k_i n_i): every other instruction changes ESP by the
+    constant its simulated semantics give (a direct call by its decoration's
+    pop, a helper by its simulated effect), a vtable call by n_i.  Wherever
+    two edges meet the forms must be equal, and at every ``ret`` ESP is ESP0
+    (the return address is on top).  The solution must be unique for every
+    n_i, and each n_i a multiple of four in [0, MAX_INDIRECT_POP]; otherwise
+    the pop is not determined and the call is refused.  Under a4 (module
+    docstring) the donor's solution is its callees' real pops; the
+    replacement's must agree, which the call events check (the pop is part
+    of each event's name).
+    """
+    sites = [offset for offset in program.reachable if vtable_call(program.instructions[offset])]
+    if not sites:
+        return {}
+    index = {site: number for number, site in enumerate(sites)}
+    count = len(sites)
+    forms: dict[int, tuple[Fraction, ...]] = {}
+    equations: list[tuple[Fraction, ...]] = []
+    eax_before: dict[int, int | None] = {}
+    stack: list[tuple[int, tuple[Fraction, ...], int | None]] = [
+        (0, (Fraction(0),) * (count + 1), None)
+    ]
+    while stack:
+        offset, form, eax = stack.pop()
+        if offset in forms:
+            if forms[offset] != form:
+                equations.append(tuple(a - b for a, b in zip(forms[offset], form, strict=True)))
+            require(
+                eax_before[offset] == eax or not _helper_call(program, offset),
+                f"{program.context}: the helper call at {offset} is reached with different "
+                "arguments",
+            )
+            continue
+        forms[offset] = form
+        eax_before[offset] = eax
+        item = program.instructions[offset]
+        if program.is_return(item):
+            equations.append(form)
+            continue
+        if offset in index:
+            following = list(form)
+            following[1 + index[offset]] += 1
+            after: tuple[Fraction, ...] = tuple(following)
+        else:
+            change = _stack_change(program, item, eax)
+            after = (form[0] + change, *form[1:])
+        known = None
+        if item.opcode == 0xB8 and not item.operand16 and offset + 1 not in program.relocations:
+            known = int.from_bytes(item.raw[item.cursor : item.cursor + 4], "little")
+        for target in program.successors[offset]:
+            stack.append((target, after, known))
+    values = _solve(equations, count)
+    pops = {}
+    for site in sites:
+        value = values[index[site]]
+        require(
+            value is not None,
+            f"{program.context}: the stack relation does not determine the argument pop of the "
+            f"indirect call at {site}",
+        )
+        pop = cast(Fraction, value)
+        require(
+            pop.denominator == 1 and 0 <= pop <= MAX_INDIRECT_POP and int(pop) % 4 == 0,
+            f"{program.context}: the indirect call at {site} would pop {pop} bytes",
+        )
+        pops[site] = int(pop)
+    return pops
+
+
+def _helper_call(program: Program, offset: int) -> bool:
+    item = program.instructions[offset]
+    target = program.relocations.get(offset + 1)
+    return (
+        item.opcode == 0xE8
+        and isinstance(target, tuple)
+        and target[0] == "rel32"
+        and target[1] in program.helpers
+    )
+
+
+def _solve(equations: list[tuple[Fraction, ...]], count: int) -> list[Fraction | None]:
+    """The unknowns c + sum(k_i n_i) = 0 fix uniquely (None for one they do not), or refuse."""
+    rows = [list(row) for row in equations]
+    pivots: list[tuple[int, int]] = []
+    rank = 0
+    for column in range(1, count + 1):
+        chosen = next((r for r in range(rank, len(rows)) if rows[r][column] != 0), None)
+        if chosen is None:
+            continue
+        rows[rank], rows[chosen] = rows[chosen], rows[rank]
+        lead = rows[rank][column]
+        rows[rank] = [value / lead for value in rows[rank]]
+        for other in range(len(rows)):
+            if other != rank and rows[other][column] != 0:
+                factor = rows[other][column]
+                rows[other] = [a - factor * b for a, b in zip(rows[other], rows[rank], strict=True)]
+        pivots.append((rank, column))
+        rank += 1
+    for leftover in rows[rank:]:
+        require(
+            leftover[0] == 0,
+            "the stack relation is inconsistent: ESP differs between paths that meet",
+        )
+    values: list[Fraction | None] = [None] * count
+    pivot_columns = {column for _row, column in pivots}
+    for row, column in pivots:
+        if all(
+            rows[row][other] == 0 for other in range(1, count + 1) if other not in pivot_columns
+        ):
+            values[column - 1] = -rows[row][0]
+    return values
 
 
 def _displacement(item: _Instruction, size: int) -> int:
@@ -941,7 +1174,7 @@ def run_paths(
                 path.regs["esp"] = lin_sub(path.regs["esp"], lin(-pop))
                 results.append(PathEnd("ret", offset, path, start_depth, address))
                 break
-            action, detail = _step(path, item, undefined, x87_returns)
+            action, detail = _step(path, item, undefined, x87_returns, program.helpers)
             if frame.private:
                 for name in GENERAL_REGISTERS:
                     if mentions_stack_address(path.regs[name]):
@@ -1127,7 +1360,10 @@ def validate_function(
     x87_returns: Mapping[str, int],
     context: str,
 ) -> ValidationProof:
-    """Checks 4-6: pair the cut points, settle the relations, prove every path pair."""
+    """Checks 4-6: pair the cut points, settle the relations, prove every path pair.
+
+    Each program carries its verified helper bodies (``Program.helpers``).
+    """
     relations: dict[tuple[int, int], Relation | None] = {(0, 0): None}
     pair_of_donor = {0: 0}
     pair_of_image = {0: 0}
@@ -1250,11 +1486,14 @@ def locals_block_first(program: Program, base: int) -> bool:
 
     The FPO record's cdwLocals is the block MSVC 5.0's prologue allocates
     first, at ESP0; saved registers (some pushed lazily, after early calls),
-    spills and arguments all lie below it.
+    spills and arguments all lie below it.  A block of a page or more is
+    allocated by ``mov eax, n; call __chkstk`` instead: when the helper is a
+    verified body, its simulated effect on ESP (with EAX = n) must be -base.
     """
     if base == 0:
         return True
     offset = 0
+    eax: int | None = None
     for _ in range(len(program.instructions)):
         item = program.instructions[offset]
         raw, op = item.raw[item.cursor :], item.opcode
@@ -1262,6 +1501,11 @@ def locals_block_first(program: Program, base: int) -> bool:
             size = 1 if op == 0x83 else 4
             amount = int.from_bytes(raw[1 : 1 + size], "little", signed=True)
             return amount == -base
+        if _helper_call(program, offset) and eax is not None:
+            return _stack_change(program, item, eax) == base
+        eax = None
+        if op == 0xB8 and not item.operand16 and offset + 1 not in program.relocations:
+            eax = int.from_bytes(raw[:4], "little")
         changes_stack = (
             0x50 <= op <= 0x61
             or op in (0x68, 0x6A, 0xE8, 0xC2, 0xC3, 0x8F, 0x9C, 0x9D)
@@ -1288,14 +1532,16 @@ def prove_function(
     context: str,
     *,
     private_frame: FrameFacts | None = None,
+    helpers: Mapping[str, HelperCode] | None = None,
 ) -> ValidationProof:
     """Checks 2 and 4-7: a private frame when one is given and no stack address escapes.
 
     A refusal of the private frame because a stack address escapes falls back
-    to the shared frame; any other refusal stands.
+    to the shared frame; any other refusal stands.  ``helpers`` maps every
+    compiler helper either version calls to its verified body.
     """
-    donor = Program(donor_code, donor_relocations, "D", f"{context} donor")
-    image = Program(image_code, image_relocations, "P", f"{context} replacement")
+    donor = Program(donor_code, donor_relocations, "D", f"{context} donor", helpers)
+    image = Program(image_code, image_relocations, "P", f"{context} replacement", helpers)
     shared = FrameFacts(False, params_end=4 if private_frame is None else private_frame.params_end)
     if private_frame is not None and locals_block_first(donor, private_frame.base):
         try:
@@ -1303,8 +1549,8 @@ def prove_function(
                 donor, image, private_frame, x87_returns, f"{context} (private frame)"
             )
         except EscapeRefusal:
-            donor = Program(donor_code, donor_relocations, "D", f"{context} donor")
-            image = Program(image_code, image_relocations, "P", f"{context} replacement")
+            donor = Program(donor_code, donor_relocations, "D", f"{context} donor", helpers)
+            image = Program(image_code, image_relocations, "P", f"{context} replacement", helpers)
     return validate_function(donor, image, shared, x87_returns, f"{context} (shared frame)")
 
 
@@ -1359,6 +1605,7 @@ _SPEC_FIELDS = frozenset(
         "expected_instruction_count",
         "expected_procedure_range",
         "expected_collapsed_line_rows",
+        "expected_helper_callees",
     }
 )
 
@@ -1444,12 +1691,18 @@ class FunctionValidationMeasure:
 
 
 def measure_function_validation(
-    donor_bytes: bytes, mangled: str, spec: dict[str, Any], closure: Iterable[str]
+    donor_bytes: bytes,
+    mangled: str,
+    spec: dict[str, Any],
+    closure: Iterable[str],
+    helper_library: HelperLibrary | None = None,
 ) -> FunctionValidationMeasure:
     """Checks 1-7 and 9 on a donor object and a declaration; the measured pins of check 8.
 
     ``spec`` needs the replacement, its relocations and debug end, and the
     procedure size and fill alignment (both checked against the donor).
+    ``helper_library`` is the authenticated toolchain library the bodies of
+    the compiler helpers the donor calls are read from (check 2).
     """
     label = "function-validation"
     donor = CoffObject(donor_bytes)
@@ -1484,9 +1737,21 @@ def measure_function_validation(
     )
     require(not named, f"{label}: a symbol or closure record names the donor's offsets {named}")
     donor_targets = donor_relocation_targets(rows, dp["number"], proc, label)
+    helper_symbols = sorted(
+        {row["target"] for row in rows if row["type"] == _REL32 and compiler_helper(row["target"])}
+    )
+    bodies: dict[str, HelperBody] = {}
+    if helper_symbols:
+        require(
+            helper_library is not None,
+            f"{label}: the donor calls the compiler helpers {helper_symbols}, and no "
+            "authenticated toolchain library is supplied to read their bodies from",
+        )
+        bodies = cast(HelperLibrary, helper_library).helpers(helper_symbols)
+    helpers = {symbol: body.code for symbol, body in bodies.items()}
     code, boundaries, image_targets, reseat, debug_end = validate_replacement(spec, rows, label)
     require(
-        sorted(Program(code, image_targets, "P", label).instructions) == boundaries,
+        sorted(Program(code, image_targets, "P", label, helpers).instructions) == boundaries,
         f"{label}: the replacement does not decode on its declared boundaries",
     )
     private_frame = None
@@ -1513,6 +1778,7 @@ def measure_function_validation(
         x87_returns,
         f"{label} proof",
         private_frame=private_frame,
+        helpers=helpers,
     )
     image = code + bytes([MSVC50_FUNCTION_FILL_BYTE]) * (
         _padded_length(len(code), fill_alignment) - len(code)
@@ -1533,18 +1799,21 @@ def measure_function_validation(
         debug_range=(0, debug_end),
     )
     moved = {old: new for old, new in reseat}
+    pins: dict[str, Any] = {
+        "expected_proof": proof_summary(proof),
+        "expected_relocation_reseat": reseat,
+        "expected_instruction_count": len(boundaries),
+        "expected_procedure_range": derived_detail["procedure_range"],
+        "expected_collapsed_line_rows": derived_detail["collapsed_line_rows"],
+    }
+    if bodies:
+        pins["expected_helper_callees"] = [body.pin() for body in bodies.values()]
     return FunctionValidationMeasure(
         image,
         derived,
         [{**row, "offset": moved.get(row["offset"], row["offset"])} for row in rows],
         reseat,
-        {
-            "expected_proof": proof_summary(proof),
-            "expected_relocation_reseat": reseat,
-            "expected_instruction_count": len(boundaries),
-            "expected_procedure_range": derived_detail["procedure_range"],
-            "expected_collapsed_line_rows": derived_detail["collapsed_line_rows"],
-        },
+        pins,
     )
 
 
@@ -1600,20 +1869,33 @@ def require_composed_relocations(
 
 
 def produce_function_validation_candidate(
-    seed_bytes: bytes, donor_bytes: bytes, function: dict[str, Any]
+    seed_bytes: bytes,
+    donor_bytes: bytes,
+    function: dict[str, Any],
+    helper_library: HelperLibrary | None = None,
 ) -> tuple[bytes, dict[str, Any]]:
-    """Produce the translation-validated replacement of a fresh donor body (checks 1-9)."""
+    """Produce the translation-validated replacement of a fresh donor body (checks 1-9).
+
+    ``helper_library`` is the authenticated toolchain library, needed when
+    the donor calls a compiler helper.
+    """
     label = "function-validation"
     seats = open_candidate_seats(seed_bytes, donor_bytes, function, FUNCTION_VALIDATION_RECIPE)
     mangled, spec = seats.mangled, seats.spec
     pin_candidate_bodies(seats, function, FUNCTION_VALIDATION_RECIPE)
     require(set(spec) <= _SPEC_FIELDS, f"{label} declaration names an unknown field")
-    measured = measure_function_validation(donor_bytes, mangled, spec, seats.expected_closure)
+    measured = measure_function_validation(
+        donor_bytes, mangled, spec, seats.expected_closure, helper_library
+    )
     for key, value in measured.pins.items():
         require(
             spec.get(key) == value,
             f"{label} {key.removeprefix('expected_')} differs from its declaration",
         )
+    require(
+        ("expected_helper_callees" in spec) == ("expected_helper_callees" in measured.pins),
+        f"{label} helper callees differ from its declaration",
+    )
     image = measured.image
     require(
         sha256_bytes(image) == function["expected_body_sha256"],
@@ -1649,6 +1931,11 @@ def produce_function_validation_candidate(
             "instruction_count": measured.pins["expected_instruction_count"],
             "collapsed_line_rows": measured.pins["expected_collapsed_line_rows"],
             "procedure_range": measured.pins["expected_procedure_range"],
+            **(
+                {"helper_callees": measured.pins["expected_helper_callees"]}
+                if "expected_helper_callees" in measured.pins
+                else {}
+            ),
         },
         semantic_detail,
     )

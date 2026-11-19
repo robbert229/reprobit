@@ -37,6 +37,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 PROFILE_IDENTIFIERS = (MSVC_50_RTM, MSVC_50_SP1, MSVC_50_SP2, MSVC_50_SP3)
 CMAKE_FRONTEND_PATH = "bin/nmake.exe"
+# Members of the library tree a proof reads compiler-helper bodies from
+# (reprobit.classic.toolchain_helpers); each lies inside the audited "lib" tree.
+HELPER_LIBRARY_PATHS = ("lib/libc.lib",)
 AUTHORITIES_MODULE = REPO_ROOT / "src" / "reprobit" / "msvc50_authorities.py"
 
 
@@ -163,6 +166,9 @@ def audit_profile(
             for relative in _declared_trees(installation_profile)
         },
         "cmake_frontend": {CMAKE_FRONTEND_PATH: _file_authority(checkout, CMAKE_FRONTEND_PATH)},
+        "libraries": {
+            relative: _file_authority(checkout, relative) for relative in HELPER_LIBRARY_PATHS
+        },
     }
 
 
@@ -206,8 +212,18 @@ def _format_authorities(audited: dict[str, dict[str, dict[str, object]]]) -> str
         ("files", "MSVC50_FILE_AUTHORITIES"),
         ("trees", "MSVC50_TREE_AUTHORITIES"),
         ("cmake_frontend", "MSVC50_CMAKE_FRONTEND_AUTHORITIES"),
+        ("libraries", "MSVC50_LIBRARY_AUTHORITIES"),
     )
     for section, attribute in sections:
+        if attribute == "MSVC50_LIBRARY_AUTHORITIES":
+            lines.extend(
+                [
+                    "# Single files inside the audited lib tree that a proof reads compiler-helper",
+                    "# bodies from (reprobit.classic.toolchain_helpers). Each digest is the file's",
+                    "# bytes in a tree whose portable-tree-v1 receipt is the profile's reviewed",
+                    "# lib authority above, so these bytes are exactly the tree's.",
+                ]
+            )
         if attribute == "MSVC50_CMAKE_FRONTEND_AUTHORITIES":
             lines.extend(
                 [
@@ -264,6 +280,7 @@ def load_committed_authorities(path: Path) -> dict[str, dict[str, dict[str, obje
         "files": module.MSVC50_FILE_AUTHORITIES,
         "trees": module.MSVC50_TREE_AUTHORITIES,
         "cmake_frontend": module.MSVC50_CMAKE_FRONTEND_AUTHORITIES,
+        "libraries": module.MSVC50_LIBRARY_AUTHORITIES,
     }
     loaded: dict[str, dict[str, dict[str, object]]] = {}
     for identifier in PROFILE_IDENTIFIERS:
@@ -275,7 +292,7 @@ def load_committed_authorities(path: Path) -> dict[str, dict[str, dict[str, obje
                     field_name: getattr(authority, field_name)
                     for field_name in authority.__dataclass_fields__
                 }
-                if section in ("files", "cmake_frontend"):
+                if section in ("files", "cmake_frontend", "libraries"):
                     entries[relative] = (fields["size"], fields["sha256"])
                 else:
                     entries[relative] = {
