@@ -169,7 +169,16 @@ def _ia32_bijection_table() -> dict[int, Any]:
     table[5] = _bijection_form(
         reads=frozenset({"eax"}), writes=frozenset({"eax"}), implicit_frozen=frozenset({"eax"})
     )
+    # mov al, moffs8 and mov moffs8, al: the byte forms touch only AL, but
+    # the table names whole registers, so A0 is modelled as reading and
+    # writing EAX (the upper bytes flow through it) and A2 as reading EAX.
+    # Over-stating the reads can only refuse a rewrite, never admit a wrong
+    # one; EAX stays frozen because the encoding names it implicitly.
+    table[160] = _bijection_form(
+        reads=frozenset({"eax"}), writes=frozenset({"eax"}), implicit_frozen=frozenset({"eax"})
+    )
     table[161] = _bijection_form(writes=frozenset({"eax"}), implicit_frozen=frozenset({"eax"}))
+    table[162] = _bijection_form(reads=frozenset({"eax"}), implicit_frozen=frozenset({"eax"}))
     table[163] = _bijection_form(reads=frozenset({"eax"}), implicit_frozen=frozenset({"eax"}))
     table[104] = _bijection_form(reads=stack, writes=stack)
     table[106] = _bijection_form(reads=stack, writes=stack)
