@@ -10,6 +10,7 @@ in-body relocations of its switch tables and CodeView label records.
 from __future__ import annotations
 
 import struct
+from typing import Any
 
 import pytest
 from test_classic_register_bijection_reencoding_full import codeview_stream
@@ -20,7 +21,12 @@ from reprobit.classic.region_simulation import contradictory, lin, lin_atom
 from reprobit.classic.rewriting_region_resize import resized_donor_object
 from reprobit.coff_format import CoffObject, coff_body, detailed_relocations
 from reprobit.discovery_authoring import DiscoveryAuthoringError, build_extern_run_donor
-from reprobit.discovery_function_validation import build_function_validation_rewriting
+from reprobit.discovery_function_validation import (
+    _label_renaming,
+    _pair_relocations,
+    build_function_validation_rewriting,
+)
+from reprobit.msvc_discovery_coff import qualify_msvc_reference_object
 
 SYMBOL = "_switch_fn"
 UNIT = "tu.switch"
@@ -185,6 +191,8 @@ def switch_coff(
     stray_debug: str | None = None,
     recorded_proc: int | None = None,
     debug_end: int | None = None,
+    externs: tuple[str, ...] = ("_g",),
+    statics: tuple[tuple[str, int], ...] = (),
 ) -> bytes:
     """One function COMDAT (padded to 16 with NOP fill) with an FPO and CodeView closure.
 
@@ -193,6 +201,8 @@ def switch_coff(
     ``debug_labels`` adds a CodeView record (S_LABEL32 0x0209 or
     S_LDATA32_ST 0x1007) whose offset and segment fields relocate to the
     named label.  ``recorded_proc`` writes a stale procedure size.
+    ``externs`` are undefined functions or data; each of ``statics`` (name,
+    value) a file static (storage class 3) in a 16-byte ``.data`` section.
     """
     proc = len(body) if proc is None else proc
     raw = body + b"\x90" * ((-len(body)) % 16)
@@ -237,7 +247,8 @@ def switch_coff(
             _aux(("<I", 0, len(debug_s)), ("<H", 4, len(debug_rows)), ("<H", 12, 1), ("<B", 14, 5)),
         ),
         *[(name, value, 1, 0, 6, None) for name, value in labels],
-        ("_g", 0, 0, 0x20, 2, None),
+        *[(name, 0, 0, 0x20, 2, None) for name in externs],
+        *[(name, value, 4, 0, 3, None) for name, value in statics],
     ]
     index = {}
     count = 0
@@ -256,6 +267,8 @@ def switch_coff(
         (".debug$F", fpo, [(0, index[SYMBOL], 0x0007)], b"", 0x42101040),
         (".debug$S", debug_s, [(o, index[n], t) for o, n, t in debug_rows], b"", 0x42101048),
     ]
+    if statics:
+        section_inputs.append((".data", bytes(16), [], b"", 0xC0300040))
     cursor = 20 + 40 * len(section_inputs)
     payload = bytearray()
     headers = bytearray()
@@ -318,7 +331,7 @@ def _donor():
     )
 
 
-def _author(seed: bytes, reference: bytes):
+def _author(seed: bytes, reference: bytes, donor: bytes | None = None):
     return build_function_validation_rewriting(
         donor=_donor(),
         target_id="program",
@@ -326,25 +339,41 @@ def _author(seed: bytes, reference: bytes):
         build_target="program",
         symbol=SYMBOL,
         seed_object=seed,
-        donor_object=seed,
+        donor_object=seed if donor is None else donor,
         reference_object=reference,
     )
 
 
+def _grind(seed: bytes, donor: bytes, reference: bytes) -> Any:
+    """Grind's path: author from a donor of other counters, then qualify the candidate."""
+    authored = _author(seed, reference, donor)
+    qualify_msvc_reference_object(
+        reference_object=reference, candidate_object=authored.candidate_object, symbol=SYMBOL
+    )
+    return authored
+
+
 def _switch_object(
-    code: bytes, tail: Tail, table: int, cases: tuple[int, ...], base_field: int
+    code: bytes,
+    tail: Tail,
+    table: int,
+    cases: tuple[int, ...],
+    base_field: int,
+    serial: int = 0,
 ) -> bytes:
-    names = [f"$L{target}" for target in cases]
+    """``serial`` shifts every label's compile-order number, as an extern run does."""
+    base = f"$L{900 + serial}"
+    names = [f"$L{target + serial}" for target in cases]
     relocations = (
-        (base_field, "$L900", DIR32),
+        (base_field, base, DIR32),
         *((table + 4 * k, name, DIR32) for k, name in enumerate(names)),
     )
-    labels = (("$L900", table), *dict.fromkeys((f"$L{t}", t) for t in cases))
+    labels = ((base, table), *dict.fromkeys((f"$L{t + serial}", t) for t in cases))
     return switch_coff(
         code + tail.data,
         relocations=relocations,
         labels=tuple(dict.fromkeys(labels)),
-        debug_labels=((0x1007, "$L900"),),
+        debug_labels=((0x1007, base),),
         proc=len(code) + len(tail.data),
         debug_end=len(code) - 1,
     )
@@ -466,3 +495,153 @@ def test_a_reference_with_a_stale_procedure_size_is_measured_from_its_body() -> 
     authored = _author(seed, reference)
     spec = authored.function.intervention.parameters[0].value
     assert spec["replacement_debug_end"] == len(LOOP_P) - 1
+
+
+# --- two compiles of one unit under different counters ----------------------------
+#
+# Grind compiles its donor with an extern run before the function, which
+# shifts MSVC 5.0's counters: the donor's ``$L`` labels, ``goto`` labels and
+# file statics carry other serials than the seed's and the reference's (a
+# synthetic reference made from the seed's compile).
+
+
+def test_a_switch_whose_labels_an_extern_run_renumbered_is_authored_and_qualifies() -> None:
+    donor_code = SWITCH_D[:34] + _code("33c0 8bc0 8bc0 c3")
+    donor_tail = Tail(_code("8d4900") + _table(16, 22, 28), {})
+    seed = _switch_object(donor_code, donor_tail, 44, (16, 22, 28), 12)
+    donor = _switch_object(donor_code, donor_tail, 44, (16, 22, 28), 12, serial=10)
+    reference = _switch_object(SWITCH_P, SWITCH_P_TAIL, 40, (22, 28, 16), 12)
+    donor_coff, reference_coff = CoffObject(donor), CoffObject(reference)
+    assert _label_renaming(
+        donor_coff,
+        donor_coff.function_section(SYMBOL),
+        reference_coff,
+        reference_coff.function_section(SYMBOL),
+    ) == {"$L26": "$L16", "$L32": "$L22", "$L38": "$L28", "$L910": "$L900"}
+    authored = _grind(seed, donor, reference)
+    spec = authored.function.intervention.parameters[0].value
+    assert spec["replacement_labels"] == [[16, 16], [22, 22], [28, 28], [44, 40]]
+    composed = CoffObject(authored.candidate_object)
+    section = composed.function_section(SYMBOL)
+    assert bytes(coff_body(composed, section)) == bytes(
+        coff_body(reference_coff, reference_coff.function_section(SYMBOL))
+    )
+    # The composed table names the seed's labels, each at the reference's place.
+    assert {
+        row["offset"]: (row["target"], row["target_value"])
+        for row in detailed_relocations(composed, section)
+    } == {
+        12: ("$L900", 40),
+        40: ("$L22", 22),
+        44: ("$L28", 28),
+        48: ("$L16", 16),
+    }
+
+
+def test_a_table_base_does_not_pair_with_a_case() -> None:
+    def row(offset: int, target: str, value: int) -> dict[str, Any]:
+        return {
+            "offset": offset,
+            "target": target,
+            "target_storage": 6,
+            "target_section": 1,
+            "target_value": value,
+            "target_type": 0,
+            "type": DIR32,
+            "addend": 0,
+        }
+
+    # The donor's field at 12 names its table (in the tail, at 40); the
+    # reference's names a case at 16 under the same renamed label.
+    donor = [row(12, "$L910", 40)]
+    reference = [row(12, "$L900", 16)]
+    with pytest.raises(DiscoveryAuthoringError, match="play different parts"):
+        _pair_relocations(donor, reference, 1, 1, renaming={"$L910": "$L900"}, code_ends=(37, 37))
+    assert _pair_relocations(donor, reference, 1, 1, renaming={"$L910": "$L900"}) == [[12, 12]]
+
+
+# 0: mov ecx,[_s] / 6: xor eax,eax / 8: add eax,ecx / 10: dec ecx / 11: jne 8 / 13: ret
+STATIC_LOOP_D = _code("8b0d00000000 33c0 03c1 49 75fb c3")
+# 0: mov edx,[_s] / 6: mov eax,0 / 11: add eax,edx / 13: dec edx / 14: jne 11 / 16: ret
+STATIC_LOOP_P = _code("8b1500000000 b800000000 03c2 4a 75fb c3")
+
+
+def _static_loop(code: bytes, label: str, place: int, static: str, **kwargs: Any) -> bytes:
+    return switch_coff(
+        code,
+        relocations=((2, static, DIR32),),
+        labels=((label, place),),
+        debug_labels=((0x0209, label),),
+        statics=((static, 0),),
+        **kwargs,
+    )
+
+
+def test_a_renumbered_goto_label_and_file_static_are_authored_and_qualify() -> None:
+    seed = _static_loop(STATIC_LOOP_D, "$again$3", 8, "_s$S5")
+    donor = _static_loop(STATIC_LOOP_D, "$again$14", 8, "_s$S16")
+    reference = _static_loop(STATIC_LOOP_P, "$again$3", 11, "_s$S5", debug_end=16)
+    authored = _grind(seed, donor, reference)
+    spec = authored.function.intervention.parameters[0].value
+    assert spec["replacement_labels"] == [[8, 11]]
+    assert spec["replacement_relocations"] == [[2, 2]]
+    composed = CoffObject(authored.candidate_object)
+    section = composed.function_section(SYMBOL)
+    assert bytes(coff_body(composed, section))[: len(STATIC_LOOP_P)] == STATIC_LOOP_P
+    assert [row["target"] for row in detailed_relocations(composed, section)] == ["_s$S5"]
+    # The seed's goto label, named by its CodeView record, lies at the image's join.
+    assert {
+        item["name"]: item["value"]
+        for item in composed.symbols.values()
+        if item["section"] == section["number"] and item["name"].startswith("$again")
+    } == {"$again$3": 11}
+
+
+def test_a_goto_label_of_another_name_is_not_renamed() -> None:
+    seed = _static_loop(STATIC_LOOP_D, "$again$3", 8, "_s$S5")
+    donor = _static_loop(STATIC_LOOP_D, "$loop$14", 8, "_s$S16")
+    reference = _static_loop(STATIC_LOOP_P, "$again$3", 11, "_s$S5", debug_end=16)
+    with pytest.raises(DiscoveryAuthoringError, match="has no one place in the reference"):
+        _grind(seed, donor, reference)
+
+
+def test_two_donor_statics_are_not_renamed_to_one() -> None:
+    def row(offset: int, target: str) -> dict[str, Any]:
+        return {
+            "offset": offset,
+            "target": target,
+            "target_storage": 3,
+            "target_section": 4,
+            "target_value": 0,
+            "target_type": 0,
+            "type": DIR32,
+            "addend": 0,
+        }
+
+    donor = [row(2, "_count$S10"), row(8, "_count$S11")]
+    with pytest.raises(DiscoveryAuthoringError, match="renames the file statics inconsistently"):
+        _pair_relocations(donor, [row(2, "_count$S20"), row(8, "_count$S20")], 1, 1)
+    assert _pair_relocations(donor, [row(2, "_count$S20"), row(8, "_count$S21")], 1, 1) == [
+        [2, 2],
+        [8, 8],
+    ]
+
+
+# 0: mov eax,[_a] / 5: mov ecx,[_b] / 11: add eax,ecx / 13: ret
+LOADS_D = _code("a100000000 8b0d00000000 03c1 c3")
+# 0: mov ecx,[_b] / 6: mov eax,[_a] / 11: add eax,ecx / 13: ret
+LOADS_P = _code("8b0d00000000 a100000000 03c1 c3")
+
+
+def test_records_moved_past_each_other_qualify_in_offset_order() -> None:
+    seed = switch_coff(
+        LOADS_D, relocations=((1, "_a", DIR32), (7, "_b", DIR32)), externs=("_a", "_b")
+    )
+    reference = switch_coff(
+        LOADS_P, relocations=((2, "_b", DIR32), (7, "_a", DIR32)), externs=("_a", "_b")
+    )
+    authored = _grind(seed, seed, reference)
+    composed = CoffObject(authored.candidate_object)
+    rows = detailed_relocations(composed, composed.function_section(SYMBOL))
+    # The donor's records re-seated, in the donor's order: not the compiler's.
+    assert [(row["offset"], row["target"]) for row in rows] == [(7, "_a"), (2, "_b")]

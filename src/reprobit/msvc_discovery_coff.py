@@ -264,6 +264,7 @@ def _require_primary_structural_pair(
     left_index: CoffMetadataIndex | None = None,
     right_index: CoffMetadataIndex | None = None,
     static_serials: bool = False,
+    offset_order: bool = False,
 ) -> None:
     if not left_record.isolated_primary or not right_record.isolated_primary:
         raise DiscoveryError(f"{context} is not an isolated COMDAT pair")
@@ -283,6 +284,7 @@ def _require_primary_structural_pair(
             seed_index=left_index,
             donor_index=right_index,
             static_serials=static_serials,
+            offset_order=offset_order,
         )
     except ByteIdentityError as exc:
         raise DiscoveryError(f"{context} has incompatible relocations: {exc}") from exc
@@ -467,6 +469,9 @@ def qualify_msvc_reference_object(
         # The reference is a compile of the same unit with other declaration
         # counts, so its file statics carry other compile-order serials.
         static_serials=True,
+        # A composed candidate keeps its donor's records in the donor's order,
+        # re-seated; the reference, a compile, lists them by offset.
+        offset_order=True,
     )
     candidate_body = _normalized_body(candidate, candidate_record, candidate_index)
     reference_body = _normalized_body(

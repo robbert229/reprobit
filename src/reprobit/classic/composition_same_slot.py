@@ -50,6 +50,24 @@ from .source_proofs import (
 )
 
 
+def _numbered_local(name: str) -> str | None:
+    """The kind of a symbol the compiler numbers by compile order, else None.
+
+    A compiler local (`local_symbol_kind`), or a C ``goto`` label
+    ``$<label>$<n>`` of kind ``goto:$<label>``: declarations added to the
+    unit before the function renumber its serial as they do a ``$L``
+    label's, so a label pairs by its own name and the mapped symbol's class,
+    never by its serial.
+    """
+    kind = local_symbol_kind(name)
+    if kind is not None:
+        return kind
+    base, separator, serial = name.rpartition("$")
+    if separator and len(base) > 1 and base.startswith("$") and serial.isdigit():
+        return f"goto:{base}"
+    return None
+
+
 def _pair_same_slot_relocations(
     seed_rows: list[dict[str, Any]],
     donor_rows: list[dict[str, Any]],
@@ -83,13 +101,15 @@ def _pair_same_slot_relocations(
             == role(right["target_section"], donor_primary, donor_xdata),
             f"{context}: relocation target role differs",
         )
-        left_local = local_symbol_kind(left["target"]) is not None
-        right_local = local_symbol_kind(right["target"]) is not None
+        left_kind = _numbered_local(left["target"])
+        right_kind = _numbered_local(right["target"])
+        left_local = left_kind is not None
+        right_local = right_kind is not None
         if left_local or right_local:
             require(
                 left_local
                 and right_local
-                and (left["target"][1] == right["target"][1])
+                and left_kind == right_kind
                 and (left["target_type"] == right["target_type"])
                 and (left["target_storage"] == right["target_storage"]),
                 f"{context}: local relocation target class differs",
@@ -290,8 +310,10 @@ def _pair_reloc_divergent(
     substitutions: dict[int, int] = {}
     for ordinal, (left, right) in enumerate(zip(seed_rows, donor_rows, strict=True)):
         require(left["type"] == right["type"], f"{context}: relocation type differs")
-        left_local = local_symbol_kind(left["target"]) is not None
-        right_local = local_symbol_kind(right["target"]) is not None
+        left_kind = _numbered_local(left["target"])
+        right_kind = _numbered_local(right["target"])
+        left_local = left_kind is not None
+        right_local = right_kind is not None
         if left_local or right_local:
             require(left["addend"] == right["addend"], f"{context}: relocation addend differs")
             require(
@@ -302,7 +324,7 @@ def _pair_reloc_divergent(
             require(
                 left_local
                 and right_local
-                and (left["target"][1] == right["target"][1])
+                and left_kind == right_kind
                 and (left["target_type"] == right["target_type"])
                 and (left["target_storage"] == right["target_storage"]),
                 f"{context}: local relocation target class differs",

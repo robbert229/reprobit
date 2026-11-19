@@ -436,12 +436,19 @@ def require_mosaic_relocation_compatibility(
     seed_index: CoffMetadataIndex | None = None,
     donor_index: CoffMetadataIndex | None = None,
     static_serials: bool = False,
+    offset_order: bool = False,
 ) -> None:
     """Require same-offset relocation semantics for a donor range campaign.
 
     With ``static_serials`` a file static's compile-order serial is ignored
     (``_s$S395`` pairs with ``_s$S398``): for comparing two compiles of one
     unit whose declaration counts differ, never for pairing unrelated objects.
+
+    With ``offset_order`` the two tables are compared record by record in
+    offset order, not table order: a composed candidate keeps its donor's
+    records re-seated in the donor's order, where a compiler writes them by
+    offset.  Each table's offsets must be distinct, so each is one set of
+    records in either order, and the linker applies every record alone.
     """
 
     symbol_kind = _static_serial_kind if static_serials else _local_symbol_kind
@@ -461,6 +468,14 @@ def require_mosaic_relocation_compatibility(
         else tuple(detailed_relocations(donor, donor_section))
     )
     require(len(left) == len(right), f"{context}: relocation counts differ")
+    if offset_order:
+        for rows, side in ((left, "seed"), (right, "donor")):
+            require(
+                len({row["offset"] for row in rows}) == len(rows),
+                f"{context}: two {side} relocation records share an offset",
+            )
+        left = tuple(sorted(left, key=lambda row: row["offset"]))
+        right = tuple(sorted(right, key=lambda row: row["offset"]))
     for index, (seed_row, donor_row) in enumerate(zip(left, right, strict=True)):
         require(
             all(seed_row[key] == donor_row[key] for key in ("offset", "type", "width", "addend")),

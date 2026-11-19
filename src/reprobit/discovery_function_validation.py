@@ -80,11 +80,74 @@ _RELOCATION_FIELDS = (
 )
 
 
+def _numbered_label(name: str) -> tuple[str, int] | None:
+    """(kind, serial) of a label MSVC 5.0 numbers by compile order, else None.
+
+    A ``$L<n>`` label (a switch table, a case) is of kind ``$L``; a C
+    ``goto`` label ``$<name>$<n>`` of kind ``$<name>``.  Any declaration the
+    grind donor's extern run adds before the function renumbers both.
+    """
+    if len(name) > 2 and name.startswith("$L") and name[2:].isdigit():
+        return "$L", int(name[2:])
+    base, separator, serial = name.rpartition("$")
+    if separator and len(base) > 1 and base.startswith("$") and serial.isdigit():
+        return base, int(serial)
+    return None
+
+
+def _label_renaming(
+    donor: CoffObject,
+    donor_section: dict[str, Any],
+    reference: CoffObject,
+    reference_section: dict[str, Any],
+) -> dict[str, str]:
+    """Each numbered label of the donor's section and the reference's label it is.
+
+    Labels pair by kind, in serial order: the extern run before the function
+    shifts every serial the function takes, never their order.  The renaming
+    is a bijection by construction; a kind with another count of labels in
+    the two sections is not renamed (its labels keep their names, as before
+    any renaming).  It is only a proposal: the producer proves whatever
+    pairing the record declares.
+    """
+
+    def kinds(coff: CoffObject, section: dict[str, Any]) -> dict[str, list[tuple[int, str]]]:
+        found: dict[str, list[tuple[int, str]]] = {}
+        for item in coff.symbols.values():
+            if item["section"] != section["number"]:
+                continue
+            numbered = _numbered_label(str(item["name"]))
+            if numbered is not None:
+                found.setdefault(numbered[0], []).append((numbered[1], str(item["name"])))
+        return {kind: sorted(set(names)) for kind, names in found.items()}
+
+    mine, theirs = kinds(donor, donor_section), kinds(reference, reference_section)
+    renaming: dict[str, str] = {}
+    for kind in sorted(set(mine) | set(theirs)):
+        left, right = mine.get(kind, []), theirs.get(kind, [])
+        if len(left) != len(right):
+            continue
+        renaming.update((name, other) for (_s, name), (_t, other) in zip(left, right, strict=True))
+    return renaming
+
+
+def _require_bijection(pairs: list[tuple[str, str]], what: str) -> None:
+    """Refuse a renaming that takes one name to two, or two names to one."""
+    forward: dict[str, str] = {}
+    backward: dict[str, str] = {}
+    for mine, theirs in pairs:
+        if forward.setdefault(mine, theirs) != theirs or backward.setdefault(theirs, mine) != mine:
+            raise DiscoveryAuthoringError(f"the pairing renames the {what} inconsistently")
+
+
 def _pair_relocations(
     donor_rows: list[dict[str, Any]],
     reference_rows: list[dict[str, Any]],
     donor_section: int | None = None,
     reference_section: int | None = None,
+    *,
+    renaming: dict[str, str] | None = None,
+    code_ends: tuple[int, int] | None = None,
 ) -> list[list[int]]:
     """Each reference field with an unused donor record of the same symbol and type.
 
@@ -93,34 +156,64 @@ def _pair_relocations(
     addend is in the bytes), but the installed table's records are the
     donor's re-seated and must match the image's fields addend for addend:
     so when two fields of one symbol move past each other, each still takes
-    the record of its own displacement.
+    the record of its own displacement.  A file static pairs by base name
+    (`_symbol_identity`), and the statics' renaming must be one bijection.
 
     A record naming the function's own section (a switch table's base or
-    entry, a recursive call) takes the donor record of the same symbol name
-    and type, occurrence by occurrence in offset order: the label's place
+    entry, a recursive call) takes the donor record of the same symbol and
+    type, occurrence by occurrence in offset order: the label's place
     differs between the two bodies, and the producer proves whatever pairing
-    is declared.
+    is declared.  A numbered label is the reference's label ``renaming``
+    gives (`_label_renaming`), never the reference's label of the donor's
+    own serial.  With ``code_ends`` (the donor's, the reference's), a field
+    in a data tail (a table entry) pairs only with a field in a data tail,
+    and a field naming a label in the tail (a table base) only with one
+    naming a label in the tail.
     """
+    names = renaming or {}
     own_donor = [row for row in donor_rows if row["target_section"] == donor_section]
     own_reference = [row for row in reference_rows if row["target_section"] == reference_section]
     pairs: list[list[int]] = []
-    for name in sorted({row["target"] for row in own_donor + own_reference}):
+    own_pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for name in sorted(
+        {names.get(row["target"], row["target"]) for row in own_donor}
+        | {row["target"] for row in own_reference}
+    ):
         for kind in sorted({row["type"] for row in own_donor + own_reference}):
             mine = sorted(
-                row["offset"] for row in own_donor if (row["target"], row["type"]) == (name, kind)
+                (
+                    row
+                    for row in own_donor
+                    if (names.get(row["target"], row["target"]), row["type"]) == (name, kind)
+                ),
+                key=lambda row: row["offset"],
             )
             theirs = sorted(
-                row["offset"]
-                for row in own_reference
-                if (row["target"], row["type"]) == (name, kind)
+                (row for row in own_reference if (row["target"], row["type"]) == (name, kind)),
+                key=lambda row: row["offset"],
             )
             if len(mine) != len(theirs):
+                donor_names = sorted({row["target"] for row in mine})
                 raise DiscoveryAuthoringError(
                     f"the reference names its own {name} {len(theirs)} times, the donor "
                     f"{len(mine)} times"
+                    + (f" (as {', '.join(donor_names)})" if donor_names != [name] and mine else "")
                 )
-            pairs.extend([local, donor] for local, donor in zip(theirs, mine, strict=True))
+            own_pairs.extend(zip(mine, theirs, strict=True))
+    if code_ends is not None:
+        donor_end, reference_end = code_ends
+        for mine_row, their_row in own_pairs:
+            if (mine_row["offset"] >= donor_end) != (their_row["offset"] >= reference_end) or (
+                mine_row["target_value"] >= donor_end
+            ) != (their_row["target_value"] >= reference_end):
+                raise DiscoveryAuthoringError(
+                    f"the donor's field at {mine_row['offset']} naming {mine_row['target']} "
+                    f"and the reference's at {their_row['offset']} naming "
+                    f"{their_row['target']} play different parts (code or table)"
+                )
+    pairs.extend([their_row["offset"], mine_row["offset"]] for mine_row, their_row in own_pairs)
     unused = [row for row in donor_rows if row["target_section"] != donor_section]
+    statics: list[tuple[str, str]] = []
     for row in sorted(
         (row for row in reference_rows if row["target_section"] != reference_section),
         key=lambda item: item["offset"],
@@ -141,11 +234,18 @@ def _pair_relocations(
                 "the donor"
             )
         unused.remove(match)
+        if _symbol_identity(row)[0] == "static":
+            statics.append((match["target"], row["target"]))
         pairs.append([row["offset"], match["offset"]])
     if unused:
         raise DiscoveryAuthoringError(
             f"the donor relocates {unused[0]['target']} more often than the reference"
         )
+    _require_bijection(statics, "file statics")
+    _require_bijection(
+        [(mine_row["target"], their_row["target"]) for mine_row, their_row in own_pairs],
+        "function's own labels",
+    )
     return sorted(pairs)
 
 
@@ -157,13 +257,16 @@ def _labels(
     pairs: list[list[int]],
     donor_rows: list[dict[str, Any]],
     reference_rows: list[dict[str, Any]],
+    renaming: dict[str, str] | None = None,
 ) -> list[list[int]]:
     """Where each label of the donor's section lies in the reference.
 
     A label a paired field names lies where the reference's paired record
     names its own label; every other label (a ``goto`` label) where the
-    reference's symbol of the same name lies.
+    reference's symbol of the same name lies, a numbered label's name being
+    the one ``renaming`` gives (`_label_renaming`).
     """
+    names_of = renaming or {}
     places: dict[int, int] = {}
     by_donor = {row["offset"]: row for row in donor_rows}
     by_reference = {row["offset"]: row for row in reference_rows}
@@ -190,7 +293,9 @@ def _labels(
             for item in donor.symbols.values()
             if item["section"] == donor_section["number"] and item["value"] == value
         )
-        found = {named[name] for name in names if name in named}
+        found = {
+            named[names_of.get(name, name)] for name in names if names_of.get(name, name) in named
+        }
         if len(found) != 1:
             raise DiscoveryAuthoringError(
                 f"the donor's label {names} at {value} has no one place in the reference"
@@ -324,8 +429,16 @@ def build_function_validation_rewriting(
             code[start:end].hex()
             for start, end in zip(starts, [*starts[1:], len(code)], strict=True)
         ]
-        pairs = _pair_relocations(donor_rows, reference_rows, dp["number"], rp["number"])
-        labels = _labels(donor_coff, dp, reference, rp, pairs, donor_rows, reference_rows)
+        renaming = _label_renaming(donor_coff, dp, reference, rp)
+        pairs = _pair_relocations(
+            donor_rows,
+            reference_rows,
+            dp["number"],
+            rp["number"],
+            renaming=renaming,
+            code_ends=(code_end, reference_code_end),
+        )
+        labels = _labels(donor_coff, dp, reference, rp, pairs, donor_rows, reference_rows, renaming)
         spec: dict[str, Any] = {
             "kind": FUNCTION_VALIDATION_KIND,
             "replacement_instructions": instructions,
