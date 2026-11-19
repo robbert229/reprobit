@@ -32,7 +32,10 @@ Bounds propagation narrows each unknown's domain to the values some
 assignment of the others allows; every remaining value is kept, so the
 true assignment survives.  The depth set at an instruction is then the
 interval of its form over the narrowed domains, an over-approximation.  The
-analysis fails (returns None) when a domain empties.
+analysis fails (returns None) when a domain empties.  A C callee whose
+domain narrows to one value has that return count
+(:func:`x87_stack_solution`); the region simulator uses it to run x87 code
+after a direct call to that callee inside a region.
 
 Assumption (MSVC 5.0's x87 discipline).  The donor is compiled code: its
 depth at a point is one number on every path that reaches it (the
@@ -218,6 +221,26 @@ def x87_stack_depths(
     An item the walk does not reach is None.  See the module docstring for
     the model and its assumption.
     """
+    solution = x87_stack_solution(items, successors, entries, code, relocations)
+    return None if solution is None else solution[0]
+
+
+def x87_stack_solution(
+    items: list[dict[str, Any]],
+    successors: list[list[int]],
+    entries: list[int],
+    code: bytes,
+    relocations: Mapping[int, Any],
+) -> tuple[list[tuple[int, int] | None], dict[str, int]] | None:
+    """The depth intervals and the callees' determined return counts, or None.
+
+    The second part maps each C function (any callee symbol but a compiler
+    helper) whose number of returned x87 values the donor's discipline fixes
+    to that number, 0 or 1.  A callee whose count stays undetermined
+    (0 or 1 both consistent), a helper and an indirect call site are absent.
+    Under assumption x1 (the module docstring) the number is the callee's:
+    bounds propagation removes only values no consistent assignment has.
+    """
     domains: list[set[int]] = []
     symbol_variable: dict[str, int] = {}
     forms: list[Form | None] = [None] * len(items)
@@ -313,7 +336,13 @@ def x87_stack_depths(
                     changed = True
             if not form[1] and ((kind == "eq" and form[0] != 0) or (kind == "ge" and form[0] < 0)):
                 return None
-    return [None if form is None else _bounds(form, domains) for form in forms]
+    depths = [None if form is None else _bounds(form, domains) for form in forms]
+    returns = {
+        symbol: next(iter(domains[index]))
+        for symbol, index in symbol_variable.items()
+        if not _is_helper(symbol) and len(domains[index]) == 1
+    }
+    return depths, returns
 
 
 def _condition_effect(
@@ -413,4 +442,5 @@ __all__ = [
     "x87_environment_exposures",
     "x87_stack_depths",
     "x87_stack_effect",
+    "x87_stack_solution",
 ]
