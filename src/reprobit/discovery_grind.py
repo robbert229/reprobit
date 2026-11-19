@@ -18,12 +18,15 @@ from reprobit.authority_snapshot import (
     JsonAuthorityDirectorySnapshot,
     assert_json_authority_unchanged,
 )
+from reprobit.binary import ByteIdentityError
+from reprobit.classic.toolchain_helpers import HelperLibrary, HelperLibraryError
 from reprobit.classic_donors import (
     generate_declaration_shape,
     generate_extern_run,
     merge_candidate_constraints,
 )
 from reprobit.classic_project import ClassicDispatchMaterials, ClassicFamilyDispatcher
+from reprobit.coff_format import CoffObject, coff_body
 from reprobit.costs import calculate_cost
 from reprobit.discovery_authoring import (
     AuthoredClassicRecord,
@@ -90,19 +93,32 @@ SeedProbe = Callable[[Path, str], bytes]
 DonorProgress = Callable[[int, int, str], None]
 DonorProbe = Callable[[Path, tuple[str, ...], DonorProgress | None], Mapping[str, bytes]]
 ColdVerifier = Callable[[Path], ColdTrialEvidence]
+HelperLibraryLoader = Callable[[str], HelperLibrary | None]
 GrindProgress = Callable[
     [int, int, str, str, ProgressKind, str | None],
     None,
 ]
 
 
+def no_helper_library(profile: str) -> HelperLibrary | None:
+    """No toolchain library: a proof whose donor calls a compiler helper refuses."""
+    del profile
+    return None
+
+
 @dataclass(frozen=True, slots=True)
 class ProjectGrindCallbacks:
-    """Execution seams supplied by the CLI's authenticated runtime."""
+    """Execution seams supplied by the CLI's authenticated runtime.
+
+    ``helper_library`` maps the sealed project's toolchain profile to the
+    authenticated ``lib/libc.lib`` under the toolchain root the probes compile
+    with (`reprobit.toolchain_helper_library.load_helper_library`), or None.
+    """
 
     probe_seed: SeedProbe
     probe_donors: DonorProbe
     cold_verify: ColdVerifier
+    helper_library: HelperLibraryLoader = no_helper_library
 
 
 @dataclass(frozen=True, slots=True)
@@ -380,12 +396,15 @@ def _state_rewriting(
     seed_object: bytes,
     donor_object: bytes,
     reference_object: bytes,
+    helper_library: HelperLibrary | None = None,
 ) -> DeclarationShapeEqualBodyAuthoring:
     """Author the state's extern-run donor and a donor rewriting reaching the reference.
 
     A reordering is tried first; when none reaches the reference, a
     region-resize rewriting (whose replacements may change the length); when
     no region replacement proves, a whole-function translation validation.
+    ``helper_library`` is the authenticated toolchain library both proofs
+    simulate compiler helpers from; without it they refuse helper calls.
     """
 
     _require_grind_family(state)
@@ -430,9 +449,10 @@ def _state_rewriting(
                 seed_object=seed_object,
                 donor_object=donor_object,
                 reference_object=reference_object,
+                helper_library=helper_library,
             )
-        except DiscoveryAuthoringError:
-            pass
+        except DiscoveryAuthoringError as error:
+            resize_error = error
         # The difference spans the function (registers, spill slots and
         # scheduling across joins and loops): prove the whole body join by join.
         try:
@@ -445,9 +465,152 @@ def _state_rewriting(
                 seed_object=seed_object,
                 donor_object=donor_object,
                 reference_object=reference_object,
+                helper_library=helper_library,
             )
-        except DiscoveryAuthoringError:
-            raise rewriting_error from None
+        except DiscoveryAuthoringError as validation_error:
+            raise DiscoveryAuthoringError(
+                f"{rewriting_error}; region resize: {resize_error}; "
+                f"function validation: {validation_error}"
+            ) from None
+
+
+def function_body(object_bytes: bytes, symbol: str) -> bytes | None:
+    """The function's COMDAT body in one compiled object, or None when it cannot be read."""
+    try:
+        coff = CoffObject(object_bytes)
+        return bytes(coff_body(coff, coff.function_section(symbol)))
+    except (ByteIdentityError, KeyError, ValueError):
+        return None
+
+
+def seed_body_states(
+    donors: tuple[tuple[DeclarationState, bytes], ...],
+    seed_object: bytes,
+    symbol: str,
+) -> tuple[frozenset[str], bool]:
+    """The states whose donor compiles the function to the seed's body, and phase sensitivity.
+
+    Returns the ids of those states and whether the function is
+    phase-sensitive: some state compiles it to another body (or a body that
+    cannot be read), so the declarations move it.
+    """
+
+    seed_body = function_body(seed_object, symbol)
+    same = frozenset(
+        declaration_state_id(state)
+        for state, donor_object in donors
+        if seed_body is not None and function_body(donor_object, symbol) == seed_body
+    )
+    return same, len(same) != len(donors)
+
+
+def seed_body_choice(
+    states: tuple[tuple[str, str], ...],
+    seed_body_ids: frozenset[str],
+    saved_donor_ids: frozenset[str],
+) -> str | None:
+    """The state a seed-body rewriting is authored with: the cheapest donor.
+
+    ``states`` are (state id, donor id) in campaign order.  A state whose
+    donor is already saved adds only the function record; otherwise every
+    donor of the campaign costs the same and the first is taken.
+    """
+
+    candidates = [
+        (state_id, donor_id) for state_id, donor_id in states if state_id in seed_body_ids
+    ]
+    for state_id, donor_id in candidates:
+        if donor_id in saved_donor_ids:
+            return state_id
+    return candidates[0][0] if candidates else None
+
+
+def qualify_state(
+    state: DeclarationState,
+    context: ProjectGrindContext,
+    *,
+    seed_object: bytes,
+    donor_object: bytes,
+    reference_object: bytes,
+    seed_body: bool = False,
+    helper_library: HelperLibrary | None = None,
+) -> DeclarationShapeEqualBodyAuthoring:
+    """Author one state's records and check the candidate against the reference object.
+
+    The equal-body families come first, then a rewriting of the donor's body
+    (a reorder, then a region resize).  A donor that compiles the seed's own
+    body (``seed_body``) can only be rewritten -- an equal-body family has
+    nothing to splice -- so it goes straight to the rewriting.
+    ``helper_library`` is passed to the rewriting's proofs
+    (:func:`_state_rewriting`).
+    """
+
+    if seed_body:
+        try:
+            authored = _state_rewriting(
+                state,
+                context,
+                seed_object=seed_object,
+                donor_object=donor_object,
+                reference_object=reference_object,
+                helper_library=helper_library,
+            )
+        except DiscoveryAuthoringError as rewriting_error:
+            raise DiscoveryAuthoringError(
+                f"the donor compiles the seed's body; rewriting: {rewriting_error}"
+            ) from None
+        qualify_msvc_reference_object(
+            reference_object=reference_object,
+            candidate_object=authored.candidate_object,
+            symbol=context.symbol,
+        )
+        return authored
+    try:
+        authored = _state_equal_body(
+            state,
+            context,
+            seed_object=seed_object,
+            donor_object=donor_object,
+        )
+        qualify_msvc_reference_object(
+            reference_object=reference_object,
+            candidate_object=authored.candidate_object,
+            symbol=context.symbol,
+        )
+    except (DiscoveryAuthoringError, DiscoveryError) as splice_error:
+        # The donor holds the reference's instructions in another
+        # order: a proved reorder of its body reaches the reference.
+        try:
+            authored = _state_rewriting(
+                state,
+                context,
+                seed_object=seed_object,
+                donor_object=donor_object,
+                reference_object=reference_object,
+                helper_library=helper_library,
+            )
+        except DiscoveryAuthoringError as rewriting_error:
+            raise DiscoveryAuthoringError(f"{splice_error}; rewriting: {rewriting_error}") from None
+        qualify_msvc_reference_object(
+            reference_object=reference_object,
+            candidate_object=authored.candidate_object,
+            symbol=context.symbol,
+        )
+    return authored
+
+
+def _grind_helper_library(
+    callbacks: ProjectGrindCallbacks, context: ProjectGrindContext
+) -> HelperLibrary | None:
+    """The authenticated toolchain library of the sealed project's profile, or None.
+
+    Loaded at most once per grind.  Library bytes that are not the reviewed ones
+    supply no library, so the proofs refuse helper calls as without one.
+    """
+    try:
+        return callbacks.helper_library(context.bundle.spec.toolchain.profile)
+    except HelperLibraryError:
+        return None
 
 
 def describe_state(state: DeclarationState) -> str:
@@ -677,6 +840,14 @@ def run_project_grind(
         original_shard_cost = calculate_cost(
             context.intervention_document.interventions
         ).project_total
+        # Read on the first donor rewriting, then reused for every state.
+        loaded_library: list[HelperLibrary | None] = []
+
+        def helper_library() -> HelperLibrary | None:
+            if not loaded_library:
+                loaded_library.append(_grind_helper_library(callbacks, context))
+            return loaded_library[0]
+
         try:
             states = enumerate_declaration_states(context.config.plan)
         except DiscoveryError as exc:
@@ -746,41 +917,47 @@ def run_project_grind(
         reference_object = context.reference_path.read_bytes()
         qualified: list[_QualifiedCandidate] = []
         original_ids = {item.id for item in context.intervention_document.interventions}
+        # A function no declaration state moves compiles to the seed's body in
+        # every state: those donors are interchangeable, so its rewriting is
+        # authored once, with the cheapest of them, and the others are skipped
+        # with that reason.
+        seed_body_ids, body_phase_sensitive = seed_body_states(
+            tuple((state, donor_objects[record.intervention.id]) for state, record in provisional),
+            seed_object,
+            context.symbol,
+        )
+        seed_body_attempt = (
+            None
+            if body_phase_sensitive
+            else seed_body_choice(
+                tuple(
+                    (declaration_state_id(state), record.intervention.id)
+                    for state, record in provisional
+                ),
+                seed_body_ids,
+                frozenset(original_ids),
+            )
+        )
         for state, provisional_record in provisional:
             state_id = declaration_state_id(state)
             rejected = False
             try:
                 donor_object = donor_objects[provisional_record.intervention.id]
-                try:
-                    authored = _state_equal_body(
-                        state,
-                        context,
-                        seed_object=seed_object,
-                        donor_object=donor_object,
+                seed_body = seed_body_attempt is not None and state_id in seed_body_ids
+                if seed_body and state_id != seed_body_attempt:
+                    raise DiscoveryAuthoringError(
+                        "every state compiles the seed's body; its rewriting is authored once, "
+                        f"with {seed_body_attempt}"
                     )
-                    qualify_msvc_reference_object(
-                        reference_object=reference_object,
-                        candidate_object=authored.candidate_object,
-                        symbol=context.symbol,
-                    )
-                except (DiscoveryAuthoringError, DiscoveryError) as splice_error:
-                    # The donor holds the reference's instructions in another
-                    # order: a proved reorder of its body reaches the reference.
-                    try:
-                        authored = _state_rewriting(
-                            state,
-                            context,
-                            seed_object=seed_object,
-                            donor_object=donor_object,
-                            reference_object=reference_object,
-                        )
-                    except DiscoveryAuthoringError:
-                        raise splice_error from None
-                    qualify_msvc_reference_object(
-                        reference_object=reference_object,
-                        candidate_object=authored.candidate_object,
-                        symbol=context.symbol,
-                    )
+                authored = qualify_state(
+                    state,
+                    context,
+                    seed_object=seed_object,
+                    donor_object=donor_object,
+                    reference_object=reference_object,
+                    seed_body=seed_body,
+                    helper_library=helper_library(),
+                )
                 if authored.donor.intervention.id != provisional_record.intervention.id:
                     raise GrindError("final donor identity differs from its compiler probe")
                 final_documents = merge_authored_records(
@@ -984,8 +1161,10 @@ __all__ = [
     "GrindError",
     "GrindRejection",
     "GrindSolution",
+    "HelperLibraryLoader",
     "ProjectGrindCallbacks",
     "ProjectGrindResult",
+    "no_helper_library",
     "require_single_acceptance",
     "run_project_grind",
 ]

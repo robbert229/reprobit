@@ -268,7 +268,7 @@ from .debug import (
     parse_fpo_data,
     shifted_pointer,
 )
-from .foundation import require_payload_free_declaration, sha256_bytes
+from .foundation import local_symbol_kind, require_payload_free_declaration, sha256_bytes
 from .region_simulation import (
     FLAG_NAMES,
     X87_CONDITION_BITS,
@@ -318,6 +318,13 @@ _OFFSET_FREE_CODEVIEW_TYPES = frozenset(
     {0x0001, 0x0002, 0x0003, 0x0004, 0x0006, 0x0200, 0x1001, 0x1002, 0x1003, 0x1006}
 )
 _BRANCH_FORMS = {**{0x70 | code: 1 for code in range(16)}, 0xEB: 1, 0xE9: 4}
+# CodeView records whose code offset is a relocated field naming a symbol:
+# S_LABEL32 (a C ``goto`` label) and S_LDATA32_ST (MSVC 5.0's nameless
+# record for a switch table), by the local offset of that field.  Its segment
+# field follows it.
+CARRIED_DEBUG_RECORDS = {0x0209: 4, 0x1007: 8}
+_SECREL = 0x000B
+_SECTION = 0x000A
 
 
 class RegionRefusal(ByteIdentityError):
@@ -1636,6 +1643,7 @@ def resized_donor_object(
     context: str,
     *,
     debug_range: tuple[int, int] | None = None,
+    carried_labels: bool = False,
 ) -> tuple[bytes, dict[str, Any]]:
     """Re-seat one COMDAT's dependent COFF records around a resized body.
 
@@ -1650,6 +1658,14 @@ def resized_donor_object(
     handed to the installation delegate.  ``debug_range``, when given, is the
     image's CodeView debug range (start, end) in place of the donor's carried
     through the offset map (a whole-function replacement declares its own).
+    ``carried_labels`` admits the CodeView records of
+    ``CARRIED_DEBUG_RECORDS`` (a ``goto`` label, a switch table's data
+    record) whose offset and segment fields relocate to a symbol of the
+    function's section with a zero inline offset: the record names the
+    symbol, which is carried like every other symbol of the section, so the
+    record follows it.  The proof's optional ``symbol_map`` carries a
+    symbol at an offset the offset map does not name (a label inside a
+    region interior, whose line rows still collapse).
     """
     donor = CoffObject(donor_bytes)
     primary = donor.function_section(mangled)
@@ -1705,7 +1721,28 @@ def resized_donor_object(
         len(procedures) == 1 and procedures[0]["offset"] == 0,
         f"{context}: the donor debug$S does not open with its one procedure record",
     )
+    label_fields: dict[int, dict[str, Any]] = {}
+    if carried_labels:
+        label_fields = {
+            row["offset"]: row
+            for row in detailed_relocations(donor, debug_child)
+            if row["target_section"] == primary["number"]
+        }
     for record in records[1:]:
+        if carried_labels and record["type"] in CARRIED_DEBUG_RECORDS:
+            at = record["offset"] + CARRIED_DEBUG_RECORDS[record["type"]]
+            offset_row, segment_row = label_fields.get(at), label_fields.get(at + 4)
+            require(
+                offset_row is not None
+                and segment_row is not None
+                and offset_row["type"] == _SECREL
+                and segment_row["type"] == _SECTION
+                and offset_row["target"] == segment_row["target"]
+                and debug_raw[at : at + 4] == bytes(4),
+                f"{context}: the CodeView record at {record['offset']} does not name a symbol "
+                "of the function's section",
+            )
+            continue
         require(
             record["type"] in _OFFSET_FREE_CODEVIEW_TYPES,
             f"{context}: the debug$S record of type {record['type']:#x} may carry a code offset",
@@ -1815,6 +1852,7 @@ def resized_donor_object(
     output[new_symbol_offset + end_index * 18 + 8 : new_symbol_offset + end_index * 18 + 12] = (
         image_proc.to_bytes(4, "little")
     )
+    symbol_map = cast(dict[int, int], proof.get("symbol_map", {}))
     carried_symbols = []
     for symbol_index, item in donor.symbols.items():
         if item["section"] != primary["number"]:
@@ -1824,11 +1862,11 @@ def resized_donor_object(
         if item["name"] in (".bf", ".lf"):
             continue
         require(
-            item["value"] in offset_map,
+            item["value"] in offset_map or item["value"] in symbol_map,
             f"{context}: the symbol {item['name']} at {item['value']} is not a boundary outside "
             "every region",
         )
-        target = offset_map[item["value"]]
+        target = offset_map.get(item["value"], symbol_map.get(item["value"], 0))
         if target != item["value"]:
             at = new_symbol_offset + symbol_index * 18
             output[at + 8 : at + 12] = target.to_bytes(4, "little")
@@ -1910,6 +1948,25 @@ def protected_code_offsets(
     _length, start, end = coff_unpack("<III", debug_raw, 16, f"{context} debug range")
     offsets |= {start, end}
     return frozenset(offsets)
+
+
+def _composed_identity(row: dict[str, Any]) -> tuple[Any, ...]:
+    """A relocation as the composed object must carry it from the derived donor.
+
+    The same-slot composer names a compiler local (``$T<n>``, ``$L<n>``) by
+    the seed's symbol of the same kind at the same section and value, after
+    proving that section byte-identical in both objects; any declaration
+    added to the unit renumbers those serials, so only kind and place are
+    compared.  Every other target keeps its name.
+    """
+    kind = local_symbol_kind(str(row["target"]))
+    if kind is not None:
+        return (
+            row["offset"],
+            ("local", kind, row["target_section"], row["target_value"]),
+            row["type"],
+        )
+    return (row["offset"], row["target"], row["type"])
 
 
 def produce_region_resize_rewriting_candidate(
@@ -2083,8 +2140,8 @@ def produce_region_resize_rewriting_candidate(
         declared_donor_extras=function.get("expected_donor_extra_functions") or None,
     )
     require(
-        [(row["offset"], row["target"], row["type"]) for row in detailed_relocations(checked, cp)]
-        == [(row["offset"], row["target"], row["type"]) for row in installed_rows],
+        [_composed_identity(row) for row in detailed_relocations(checked, cp)]
+        == [_composed_identity(row) for row in installed_rows],
         "region-resize composed relocation table is not the proved reseat",
     )
     return composed, candidate_proof(

@@ -81,6 +81,7 @@ def _context(
             spec=SimpleNamespace(
                 project_id=f"project.{label}",
                 state_dir=".reprobit-state",
+                toolchain=SimpleNamespace(profile=f"profile.{label}"),
             ),
             interventions=(),
         ),
@@ -602,3 +603,202 @@ def test_no_solution_never_publishes_even_with_advance_acceptance(
     assert result.cold_trials == 1
     assert len(result.rejections) == 2
     assert trace.publication_calls == 0
+
+
+# --- a function no declaration state moves ---------------------------------------------
+
+
+def _coff_with_body(body: bytes) -> bytes:
+    from test_classic_register_bijection_reencoding_full import codeview_stream, make_coff
+
+    return make_coff(
+        body=body,
+        relocations=(6, len(body) - 9),
+        lines=((4, 11),),
+        debug_stream=codeview_stream(len(body), 4, len(body) - 5),
+    )
+
+
+SEED_BODY = bytes.fromhex("535657558b1d000000008b43048b0d000000005d5f5e5bc3")
+MOVED_BODY = bytes.fromhex("535657558b1d000000008b4b048b0d000000005d5f5e5bc3")
+
+
+def test_seed_body_states_name_the_states_that_compile_the_seeds_body() -> None:
+    from test_classic_register_bijection_reencoding_full import TARGET_SYMBOL
+
+    seed = _coff_with_body(SEED_BODY)
+    states = (_state(1, 1), _state(2, 2))
+    same, sensitive = grind.seed_body_states(
+        tuple((state, seed) for state in states), seed, TARGET_SYMBOL
+    )
+    assert same == {declaration_state_id(state) for state in states} and not sensitive
+    moved = _coff_with_body(MOVED_BODY)
+    same, sensitive = grind.seed_body_states(
+        ((states[0], seed), (states[1], moved)), seed, TARGET_SYMBOL
+    )
+    assert same == {declaration_state_id(states[0])} and sensitive
+    # A body that cannot be read is never the seed's.
+    same, sensitive = grind.seed_body_states(((states[0], b"junk"),), seed, TARGET_SYMBOL)
+    assert same == frozenset() and sensitive
+
+
+def test_the_seed_body_rewriting_takes_a_saved_donor_before_a_new_one() -> None:
+    states = (("state.a", "donor.a"), ("state.b", "donor.b"), ("state.c", "donor.c"))
+    every = frozenset({"state.a", "state.b", "state.c"})
+    assert grind.seed_body_choice(states, every, frozenset()) == "state.a"
+    assert grind.seed_body_choice(states, every, frozenset({"donor.b"})) == "state.b"
+    assert grind.seed_body_choice(states, frozenset(), frozenset()) is None
+
+
+def test_a_seed_body_donor_goes_straight_to_the_rewriting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def splice(*_args: object, **_kwargs: object) -> object:
+        calls.append("equal body")
+        raise grind.DiscoveryAuthoringError("seed and donor function bodies are identical")
+
+    def rewrite(*_args: object, **_kwargs: object) -> object:
+        calls.append("rewriting")
+        return SimpleNamespace(candidate_object=b"candidate")
+
+    monkeypatch.setattr(grind, "_state_equal_body", splice)
+    monkeypatch.setattr(grind, "_state_rewriting", rewrite)
+    monkeypatch.setattr(grind, "qualify_msvc_reference_object", lambda **_kwargs: None)
+    context = SimpleNamespace(symbol="_f")
+    kwargs = {"seed_object": b"s", "donor_object": b"d", "reference_object": b"r"}
+    grind.qualify_state(_state(1, 1), context, seed_body=True, **kwargs)
+    assert calls == ["rewriting"]
+    calls.clear()
+    grind.qualify_state(_state(1, 1), context, **kwargs)
+    assert calls == ["equal body", "rewriting"]
+
+    def refuse(*_args: object, **_kwargs: object) -> object:
+        raise grind.DiscoveryAuthoringError("no region replacement reaches the reference")
+
+    monkeypatch.setattr(grind, "_state_rewriting", refuse)
+    with pytest.raises(grind.DiscoveryAuthoringError) as refused:
+        grind.qualify_state(_state(1, 1), context, **kwargs)
+    # Both reasons are reported, not only the splice's.
+    assert "bodies are identical; rewriting: no region replacement" in str(refused.value)
+
+
+def test_grind_authors_a_seed_body_rewriting_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    states = (_state(1, 1), _state(2, 2), _state(3, 3))
+    live_root, _staged_root, trace, callbacks = _install_grind_fixture(
+        monkeypatch, tmp_path, live_states=states
+    )
+    monkeypatch.setattr(
+        grind,
+        "seed_body_states",
+        lambda donors, _seed, _symbol: (
+            frozenset(declaration_state_id(state) for state, _object in donors),
+            False,
+        ),
+    )
+    rewritten: list[DeclarationState] = []
+
+    def rewrite(state: DeclarationState, _context: object, **_kwargs: object) -> object:
+        rewritten.append(state)
+        classes, functions = _state_shape_for_test(state)
+        donor = SimpleNamespace(intervention=SimpleNamespace(id=_donor_id(classes, functions)))
+        function = SimpleNamespace(
+            intervention=SimpleNamespace(id=f"function.{classes}.{functions}")
+        )
+        return SimpleNamespace(
+            donor=donor,
+            function=function,
+            candidate_object=f"candidate {classes}.{functions}".encode(),
+            records=(donor, function),
+        )
+
+    monkeypatch.setattr(grind, "_state_rewriting", rewrite)
+
+    result = run_project_grind(live_root, callbacks=callbacks, accept_exact=True)
+
+    assert rewritten == [states[0]]
+    assert trace.equal_body_authoring == []
+    assert result.solution is not None and result.solution.state == states[0]
+    assert [rejection.reason for rejection in result.rejections] == [
+        "every state compiles the seed's body; its rewriting is authored once, with "
+        + declaration_state_id(states[0])
+    ] * 2
+
+
+def test_the_sealed_profile_s_toolchain_library_reaches_every_donor_rewriting(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from reprobit.discovery_authoring import DiscoveryAuthoringError
+
+    live_root, _staged_root, _trace, callbacks = _install_grind_fixture(
+        monkeypatch,
+        tmp_path,
+        live_states=(_state(1, 1), _state(2, 2)),
+        qualification_rejections=frozenset({(1, 1), (2, 2)}),
+    )
+    library = object()
+    loads: list[str] = []
+    received: list[object] = []
+
+    def load(profile: str) -> object:
+        loads.append(profile)
+        return library
+
+    def rewriting(*_args: object, helper_library: object = None, **_kwargs: object) -> None:
+        received.append(helper_library)
+        raise DiscoveryAuthoringError("fixture rewriting refusal")
+
+    monkeypatch.setattr(grind, "_state_rewriting", rewriting)
+    callbacks = ProjectGrindCallbacks(
+        callbacks.probe_seed,
+        callbacks.probe_donors,
+        callbacks.cold_verify,
+        helper_library=load,
+    )
+
+    result = run_project_grind(live_root, callbacks=callbacks)
+
+    assert result.solution is None
+    assert loads == ["profile.sealed"]
+    assert received == [library, library]
+
+
+def test_an_unreviewed_toolchain_library_supplies_none(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from reprobit.classic.toolchain_helpers import HelperLibraryError
+    from reprobit.discovery_authoring import DiscoveryAuthoringError
+
+    live_root, _staged_root, _trace, callbacks = _install_grind_fixture(
+        monkeypatch,
+        tmp_path,
+        live_states=(_state(1, 1),),
+        qualification_rejections=frozenset({(1, 1)}),
+    )
+    received: list[object] = []
+
+    def load(_profile: str) -> object:
+        raise HelperLibraryError("the toolchain library lib/libc.lib is not the reviewed one")
+
+    def rewriting(*_args: object, helper_library: object = None, **_kwargs: object) -> None:
+        received.append(helper_library)
+        raise DiscoveryAuthoringError("fixture rewriting refusal")
+
+    monkeypatch.setattr(grind, "_state_rewriting", rewriting)
+    callbacks = ProjectGrindCallbacks(
+        callbacks.probe_seed,
+        callbacks.probe_donors,
+        callbacks.cold_verify,
+        helper_library=load,
+    )
+
+    result = run_project_grind(live_root, callbacks=callbacks)
+
+    assert result.solution is None
+    assert received == [None]
