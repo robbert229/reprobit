@@ -20,6 +20,7 @@ from reprobit.classic_runtime_graph import (
     ClassicCompileRecord,
     classic_compiler_product_refs,
 )
+from reprobit.coff_weak_alias import COFF_WEAK_ALIAS_OPERATION
 from reprobit.costs import calculate_intervention_cost, intervention_cost_row_digest
 from reprobit.execution import (
     FileReceipt,
@@ -296,6 +297,7 @@ class _ClassicEvidenceAssembler:
         self._add_donor_outputs()
         self._apply_translation_unit_transforms()
         self._apply_object_repack_transforms()
+        self._add_coff_weak_alias_outputs()
         self._add_role_outputs(ProducerRole.LIBRARIAN)
         self._add_role_outputs(ProducerRole.LINKER)
         self._publish_targets()
@@ -969,6 +971,71 @@ class _ClassicEvidenceAssembler:
                 step_id=node.id,
                 inputs=inputs,
                 captured=False,
+            )
+            self.current_by_reference[reference.casefold()] = artifact_id
+
+    def _add_coff_weak_alias_outputs(self) -> None:
+        """Record ReproBit-written weak-alias objects as descendants of the graph.
+
+        No toolchain program produced them, so they carry no locked producer
+        and no producer attestation.  Their one parent is the sealed producer
+        graph whose declaration fixes every byte; the auditor re-derives the
+        bytes from that declaration (:mod:`reprobit.coff_weak_alias`).
+        """
+
+        nodes = [
+            node for node in self.inputs.graph.nodes if node.role is ProducerRole.COFF_WEAK_ALIAS
+        ]
+        if not nodes:
+            return
+        layout = self.context.bundle.spec.layout.producer_graph.replace("\\", "/")
+        graph_path = self.project_root.joinpath(*PurePosixPath(layout).parts).resolve(strict=False)
+        graph_receipt = self.input_receipts.get(graph_path)
+        if graph_receipt is None:
+            raise ClassicProjectError("weak-alias objects lack the producer graph's input receipt")
+        authority = self._leaf_artifact(
+            path=graph_path,
+            logical_path=layout,
+            digest=graph_receipt.digest,
+            size=graph_receipt.size,
+            kind=ArtifactKind.SOURCE,
+            origin=ArtifactOrigin.FRESH_SEED,
+            first_party=True,
+        )
+        for node in nodes:
+            declaration = node.coff_weak_alias
+            (reference,) = node.outputs
+            path = _reference(self.inputs, reference)
+            if declaration is None or path is None:
+                raise ClassicProjectError(f"weak-alias node {node.id!r} is malformed")
+            receipt = self.output_receipts.get(path.resolve(strict=False))
+            if (
+                receipt is None
+                or receipt.producer_step != node.id
+                or receipt.digest != declaration.output_digest
+                or receipt.size != declaration.output_size
+            ):
+                raise ClassicProjectError(
+                    f"weak-alias output differs from its pinned declaration: {reference!r}"
+                )
+            artifact_id = _evidence_identifier(
+                "artifact", "coff-weak-alias", node.id, reference, receipt.digest, receipt.size
+            )
+            self._add_artifact(
+                Artifact(
+                    id=artifact_id,
+                    kind=ArtifactKind.OBJECT,
+                    logical_path=self._project_logical_path(path),
+                    digest=receipt.digest,
+                    size=receipt.size,
+                    origin=ArtifactOrigin.FRESH_SEED,
+                    inputs=(authority,),
+                    receipt_path=str(path.resolve(strict=False)),
+                ),
+                kind=ProvenanceKind.PRODUCER,
+                operation=COFF_WEAK_ALIAS_OPERATION,
+                origin=ArtifactOrigin.FRESH_SEED,
+                parent_artifacts=(authority,),
             )
             self.current_by_reference[reference.casefold()] = artifact_id
 

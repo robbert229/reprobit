@@ -52,6 +52,7 @@ from reprobit.developer_authority import DeveloperAuthority
 from reprobit.incremental_executor import IncrementalProgress, PreparedNodeInputs
 from reprobit.model import Digest, Scope
 from reprobit.producer_graph import (
+    TOOL_PRODUCER_ROLES,
     ProducerGraphDocument,
     ProducerNode,
     ProducerRole,
@@ -954,11 +955,11 @@ def _patch_planner(
         ),
     )
     monkeypatch.setattr(incremental_planning, "ClassicMSVCToolchain", _FakeInstallation)
-    relatives = {role: f"bin/{role.value}.exe" for role in ProducerRole}
+    relatives = {role: f"bin/{role.value}.exe" for role in TOOL_PRODUCER_ROLES}
     monkeypatch.setattr(
         incremental_planning,
         "_graph_role_bindings",
-        lambda *_args: ({role: role.value for role in ProducerRole}, relatives),
+        lambda *_args: ({role: role.value for role in TOOL_PRODUCER_ROLES}, relatives),
     )
     monkeypatch.setattr(
         incremental_planning,

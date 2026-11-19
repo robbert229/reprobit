@@ -19,6 +19,7 @@ from typing import Annotated, Literal
 
 from pydantic import Field, field_validator, model_validator
 
+from reprobit.coff_weak_alias import CoffWeakAliasDeclaration
 from reprobit.model import BuildTarget, Digest, Identifier, StrictModel
 from reprobit.secure_path_contracts import SecurePathError, canonical_relative_path
 from reprobit.strict_json import canonical_json, strict_load_bytes
@@ -131,6 +132,19 @@ class ProducerRole(StrEnum):
     RESOURCE = "resource-compiler"
     LIBRARIAN = "librarian"
     LINKER = "linker"
+    # ReproBit's own in-run producer (reprobit.coff_weak_alias); no toolchain
+    # program runs for it and its argv is empty.
+    COFF_WEAK_ALIAS = "coff-weak-alias"
+
+
+TOOL_PRODUCER_ROLES = frozenset(
+    {
+        ProducerRole.COMPILER,
+        ProducerRole.RESOURCE,
+        ProducerRole.LIBRARIAN,
+        ProducerRole.LINKER,
+    }
+)
 
 
 def _relative(value: str, *, label: str) -> str:
@@ -282,7 +296,7 @@ def _role_argument_edges(
     files and emits ``/out`` plus optional secondary paths.
     """
 
-    if node.role is ProducerRole.COMPILER:
+    if node.role in {ProducerRole.COMPILER, ProducerRole.COFF_WEAK_ALIAS}:
         return frozenset(), frozenset(), frozenset()
 
     inputs: set[str] = set()
@@ -363,7 +377,7 @@ def _role_argument_edges(
 def _validate_noncompiler_option_grammar(node: ProducerNode) -> None:
     """Reject every role option that is not explicitly modeled as safe or seated."""
 
-    if node.role is ProducerRole.COMPILER:
+    if node.role in {ProducerRole.COMPILER, ProducerRole.COFF_WEAK_ALIAS}:
         return
     expect_value = False
     for value in node.arguments:
@@ -509,18 +523,23 @@ class ProducerNode(StrictModel):
     ``arguments`` excludes the executable.  The runtime chooses that executable
     from the toolchain lock, so a committed project cannot replace a producer.
     Symbolic roots are expanded without a shell immediately before execution.
+
+    A ``coff-weak-alias`` node runs no program: its ``coff_weak_alias``
+    declaration is its whole authority, its argv is empty, and its one output
+    is the object ReproBit writes from that declaration.
     """
 
     id: Identifier
     role: ProducerRole
     owner: BuildTarget
     target_id: Identifier | None = None
-    arguments: Annotated[tuple[str, ...], Field(min_length=1)]
+    arguments: tuple[str, ...]
     inputs: tuple[str, ...] = ()
     directive_inputs: tuple[str, ...] = ()
     outputs: Annotated[tuple[str, ...], Field(min_length=1)]
     depends_on: tuple[Identifier, ...] = ()
     timeout_seconds: Annotated[int, Field(ge=1, le=86_400)] = 900
+    coff_weak_alias: CoffWeakAliasDeclaration | None = None
 
     @field_validator("arguments")
     @classmethod
@@ -584,6 +603,25 @@ class ProducerNode(StrictModel):
 
     @model_validator(mode="after")
     def validate_role_shape(self) -> ProducerNode:
+        if self.role is ProducerRole.COFF_WEAK_ALIAS:
+            if self.coff_weak_alias is None:
+                raise ValueError("coff-weak-alias nodes require their alias declaration")
+            if self.arguments or self.inputs or self.directive_inputs or self.depends_on:
+                raise ValueError(
+                    "coff-weak-alias nodes take no argv, inputs or dependencies; "
+                    "their declaration is their whole authority"
+                )
+            if self.target_id is not None:
+                raise ValueError("only a terminal linker node may name a project target")
+            if len(self.outputs) != 1 or PurePosixPath(self.outputs[0]).suffix.casefold() != (
+                ".obj"
+            ):
+                raise ValueError("coff-weak-alias nodes write exactly one .obj output")
+            return self
+        if self.coff_weak_alias is not None:
+            raise ValueError("only coff-weak-alias nodes carry an alias declaration")
+        if not self.arguments:
+            raise ValueError("toolchain producer nodes require argv")
         if self.role is not ProducerRole.LINKER and self.target_id is not None:
             raise ValueError("only a terminal linker node may name a project target")
         if self.role is ProducerRole.LINKER and self.target_id is None:
@@ -962,6 +1000,7 @@ def write_producer_graph(path: Path, graph: ProducerGraphDocument) -> None:
 
 
 __all__ = [
+    "TOOL_PRODUCER_ROLES",
     "CMakeImportRecipe",
     "ProducerGraphDocument",
     "ProducerGraphError",
