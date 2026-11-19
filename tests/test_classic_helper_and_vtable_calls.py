@@ -516,3 +516,126 @@ def test_a_build_without_the_library_refuses_the_record() -> None:
 def test_authoring_without_the_library_authors_nothing() -> None:
     with pytest.raises(DiscoveryAuthoringError, match="no authenticated toolchain library"):
         _author(None)
+
+
+# --- grind: the library reaches both proofs, and its records build -----------------------
+
+
+def _grind_rewriting(monkeypatch, library, *, region_resize=True):
+    """Grind's donor rewriting for the ``__ftol`` fixture; the refusals each proof raised."""
+    from types import SimpleNamespace
+
+    import reprobit.discovery_grind as grind
+    from reprobit.discovery_contracts import DeclarationFamily
+
+    refusals: list[str] = []
+
+    def recording(builder):
+        def build(**kwargs):
+            try:
+                return builder(**kwargs)
+            except DiscoveryAuthoringError as exc:
+                refusals.append(str(exc))
+                raise
+
+        return build
+
+    def no_region_resize(**_kwargs):
+        raise DiscoveryAuthoringError("region resize refused")
+
+    monkeypatch.setattr(
+        grind,
+        "build_region_resize_rewriting",
+        recording(grind.build_region_resize_rewriting if region_resize else no_region_resize),
+    )
+    monkeypatch.setattr(
+        grind,
+        "build_function_validation_rewriting",
+        recording(grind.build_function_validation_rewriting),
+    )
+    monkeypatch.setattr(grind, "_require_grind_family", lambda _state: None)
+    monkeypatch.setattr(
+        grind,
+        "_extern_run",
+        lambda _state: SimpleNamespace(
+            header_prefix="ReproBitPad",
+            header_count=1,
+            seat_prefix="ReproBitPadSeat",
+            seat_count=0,
+            width=3,
+        ),
+    )
+    monkeypatch.setattr(grind, "_header_placement", lambda _context: "after_includes")
+    context = SimpleNamespace(
+        unit=SimpleNamespace(target_id="program", id=UNIT, build_target="program"),
+        symbol=TARGET_SYMBOL,
+    )
+    seed = _call_coff(FTOL_D, 5)
+
+    def author():
+        return grind._state_rewriting(
+            SimpleNamespace(family=DeclarationFamily.EXTERN_RUN_PAIR),
+            context,
+            seed_object=seed,
+            donor_object=seed,
+            reference_object=_call_coff(FTOL_P, 5),
+            helper_library=library,
+        )
+
+    return author, refusals
+
+
+def test_grind_authors_a_function_validation_record_pinning_the_helper(monkeypatch) -> None:
+    library = _library()
+    author, refusals = _grind_rewriting(monkeypatch, library, region_resize=False)
+    authored = author()
+    assert refusals == ["region resize refused"]
+    values = authored.function.receipt.expected_values
+    assert values["function_validation.expected_helper_callees"] == [library.helper("__ftol").pin()]
+    composed = CoffObject(authored.candidate_object)
+    assert bytes(coff_body(composed, composed.function_section(TARGET_SYMBOL))) == FTOL_P
+    assert _dispatch(authored, library).output == authored.candidate_object
+
+
+def test_grind_without_the_library_refuses_the_helper_call(monkeypatch) -> None:
+    author, refusals = _grind_rewriting(monkeypatch, None, region_resize=False)
+    with pytest.raises(DiscoveryAuthoringError):
+        author()
+    assert len(refusals) == 2
+    assert "the donor calls the compiler helpers ['__ftol']" in refusals[1]
+    assert "no authenticated toolchain library is supplied" in refusals[1]
+
+
+def test_grind_s_region_resize_record_builds_with_the_library(monkeypatch) -> None:
+    library = _library()
+    author, refusals = _grind_rewriting(monkeypatch, library)
+    authored = author()
+    assert refusals == []
+    assert _dispatch(authored, library).output == authored.candidate_object
+
+
+def test_grind_loads_the_library_the_producer_reads(monkeypatch, tmp_path) -> None:
+    import reprobit.toolchain_helper_library as toolchain_library
+    from reprobit.backends import NativeWindowsBackend
+    from reprobit.discovery_grind_cli import _helper_library_loader
+    from reprobit.project_execution import ProjectExecutionOptions
+
+    profile = "msvc_5_0_rtm"
+    data = _library().data
+    authority = Msvc50FileAuthority(len(data), hashlib.sha256(data).hexdigest())
+    monkeypatch.setattr(
+        toolchain_library, "MSVC50_LIBRARY_AUTHORITIES", {profile: {HELPER_LIBRARY: authority}}
+    )
+    root = tmp_path / "toolchain"
+    (root / "lib").mkdir(parents=True)
+    options = ProjectExecutionOptions(jobs=1, backend=NativeWindowsBackend(), toolchain_root=root)
+    assert _helper_library_loader(options)(profile) is None
+    (root / "lib" / "libc.lib").write_bytes(data)
+    load = _helper_library_loader(options)
+    library = load(profile)
+    assert library is not None and load(profile) is library
+    assert library.sha256 == authority.sha256
+    produced = toolchain_library.load_helper_library(root, profile)
+    assert produced is not None
+    authored = _author(library)
+    assert _dispatch(authored, produced).output == authored.candidate_object
