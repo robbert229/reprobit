@@ -7,8 +7,11 @@ the reference.  `retail_exact_region_resize_rewriting` replaces whole regions
 of the donor by instructions a path simulation proves equivalent, then lays
 the function out at its new length.  This module aligns the donor's
 instructions with the reference object's, takes each maximal run of
-differing instructions (merged with its neighbours while the proof refuses),
-offers the reference's instructions for that run as the replacement, measures
+differing instructions, chooses the region around it whose boundaries are
+points where the two versions agree (`discovery_region_selection`: the same
+ESP and x87 changes, no live value left by one version only; merged with
+neighbouring runs when only that agrees, and while the proof refuses),
+offers the reference's instructions for that region as the replacement, measures
 every pin the producer checks, and finally requires the ordinary producer to
 accept the record and compose the reference body.  The reference object is
 the project-owned COFF the grind plan names; nothing here reads a reference
@@ -70,6 +73,14 @@ from reprobit.discovery_authoring import (
     _record_receipt,
     _stable_id,
 )
+from reprobit.discovery_region_selection import (
+    CERTAIN,
+    MAX_AGREEING_SHAPES,
+    MAX_CONTEXT,
+    Selection,
+    VersionProfile,
+    version_profile,
+)
 from reprobit.discovery_rewriting import msvc50_code_end
 from reprobit.intervention_metadata import ClassicRecipeFamily, ClassicRecipeRole
 from reprobit.model import Scope
@@ -119,6 +130,9 @@ CONTEXT_EXTENTS = (
 MAX_ATTEMPTS = 400
 # A region never grows past this many donor instructions by absorbing runs.
 MAX_REGION_INSTRUCTIONS = 64
+# A group with no agreeing shape absorbs at most this many neighbouring
+# groups on one side to find one.
+MAX_MERGED_GROUPS = 4
 # When no plain search reaches the reference, this many register bijections
 # are tried, drawn from at most this many registers that differ in aligned
 # fields.
@@ -246,11 +260,34 @@ def derive_region_candidates(
 
 @dataclass
 class _Group:
-    """A region under search: the base runs it covers and its context shape."""
+    """A region under search: the base runs it covers, its shapes and the one tried."""
 
     first: int
     last: int
     shape: int = 0
+    shapes: tuple[tuple[int, int], ...] | None = None
+
+
+def _shape_range(
+    group: _Group,
+    extent: tuple[int, int],
+    runs: list[tuple[int, int, int, int]],
+    donor_count: int,
+    reference_count: int,
+) -> tuple[int, int, int, int]:
+    """A group's index ranges with ``extent`` (back, ahead) aligned instructions of context."""
+    back, ahead = extent
+    i1, j1 = runs[group.first][0], runs[group.first][2]
+    i2, j2 = runs[group.last][1], runs[group.last][3]
+    back = min(back, i1, j1)
+    ahead = min(ahead, donor_count - i2, reference_count - j2)
+    i1, i2, j1, j2 = i1 - back, i2 + ahead, j1 - back, j2 + ahead
+    if i1 == i2:
+        if i1 > 0 and j1 > 0:
+            i1, j1 = i1 - 1, j1 - 1
+        else:
+            i2, j2 = i2 + 1, j2 + 1
+    return i1, i2, j1, j2
 
 
 def _group_ranges(
@@ -262,21 +299,88 @@ def _group_ranges(
     """Each group's index ranges with its context, or None when two collide."""
     ranges: list[tuple[int, int, int, int]] = []
     for group in groups:
-        back, ahead = CONTEXT_EXTENTS[group.shape]
-        i1, j1 = runs[group.first][0], runs[group.first][2]
-        i2, j2 = runs[group.last][1], runs[group.last][3]
-        back = min(back, i1, j1)
-        ahead = min(ahead, donor_count - i2, reference_count - j2)
-        i1, i2, j1, j2 = i1 - back, i2 + ahead, j1 - back, j2 + ahead
-        if i1 == i2:
-            if i1 > 0 and j1 > 0:
-                i1, j1 = i1 - 1, j1 - 1
-            else:
-                i2, j2 = i2 + 1, j2 + 1
+        shapes = CONTEXT_EXTENTS if group.shapes is None else group.shapes
+        i1, i2, j1, j2 = _shape_range(
+            group, shapes[group.shape], runs, donor_count, reference_count
+        )
         if ranges and (i1 < ranges[-1][1] or j1 < ranges[-1][3]):
             return None
         ranges.append((i1, i2, j1, j2))
     return ranges
+
+
+def plan_group_shapes(
+    groups: list[_Group],
+    position: int,
+    runs: list[tuple[int, int, int, int]],
+    donor_count: int,
+    reference_count: int,
+    selection: Selection | None,
+) -> tuple[tuple[tuple[int, int], ...], tuple[str, str] | None]:
+    """The shapes a group is tried in, and why it has none that agrees.
+
+    The agreeing shapes inside the group's neighbouring equal blocks come
+    first, smallest first (at most `MAX_AGREEING_SHAPES`); then the fixed
+    ladder of `CONTEXT_EXTENTS`, less the shapes the prover certainly
+    refuses.  The second value is None when an agreeing shape exists, else
+    the (kind, reason) the smallest shape disagrees for.
+    """
+    if selection is None:
+        return CONTEXT_EXTENTS, None
+    group = groups[position]
+    core = (
+        runs[group.first][0],
+        runs[group.last][1],
+        runs[group.first][2],
+        runs[group.last][3],
+    )
+    previous_end = runs[groups[position - 1].last][1] if position > 0 else 0
+    next_start = runs[groups[position + 1].first][0] if position + 1 < len(groups) else donor_count
+    room_back = min(core[0] - previous_end, MAX_CONTEXT)
+    room_ahead = min(next_start - core[1], MAX_CONTEXT)
+    span = core[1] - core[0]
+    if span:
+        hopeless = selection.structure(core[0], core[1])
+        if hopeless is not None:
+            # Growing a region never removes what its differing core holds.
+            return (), ("structure", hopeless)
+    verdicts: dict[tuple[int, int], tuple[str, str] | None] = {}
+
+    def verdict(extent: tuple[int, int]) -> tuple[str, str] | None:
+        if extent not in verdicts:
+            verdicts[extent] = selection.verdict(
+                _shape_range(group, extent, runs, donor_count, reference_count), core
+            )
+        return verdicts[extent]
+
+    agreeing: list[tuple[int, int]] = []
+    for total in range(room_back + room_ahead + 1):
+        if len(agreeing) >= MAX_AGREEING_SHAPES or span + total > MAX_REGION_INSTRUCTIONS:
+            break
+        for back in range(max(0, total - room_ahead), min(total, room_back) + 1):
+            extent = (back, total - back)
+            if verdict(extent) is None:
+                agreeing.append(extent)
+                if len(agreeing) >= MAX_AGREEING_SHAPES:
+                    break
+    ladder = []
+    for extent in CONTEXT_EXTENTS:
+        if extent in agreeing:
+            continue
+        back, ahead = extent
+        # Past the room on a side with a neighbour, the shape meets that
+        # neighbour and the search merges the two; elsewhere it is clamped.
+        if (back <= room_back or position == 0) and (
+            ahead <= room_ahead or position + 1 == len(groups)
+        ):
+            found = verdict(extent)
+            if found is not None and found[0] in CERTAIN:
+                continue
+        ladder.append(extent)
+    disagreement = None
+    if not agreeing:
+        disagreement = verdict((0, 0)) or ("bound", "no agreeing shape within the bounds")
+    return tuple(agreeing) + tuple(ladder), disagreement
 
 
 def _regions_for(
@@ -573,6 +677,34 @@ def build_region_resize_rewriting(
                 body=donor_body,
             )["cbProlog"]
         protected = protected_code_offsets(donor_coff, dp, context)
+        # Without both profiles the search proposes the fixed ladder alone.
+        profiles: tuple[VersionProfile, VersionProfile] | None
+        try:
+            profiles = (
+                version_profile(
+                    donor_body,
+                    donor_rows,
+                    code_end,
+                    f"{context} donor profile",
+                    section_number=dp["number"],
+                    external_entries=frozenset(external_entries),
+                    protected_offsets=protected,
+                ),
+                version_profile(
+                    reference_body,
+                    reference_rows,
+                    reference_code_end,
+                    f"{context} reference profile",
+                    section_number=rp["number"],
+                    external_entries=frozenset(
+                        relational_form_external_entries(
+                            reference, rp, f"{context} reference external entries"
+                        )
+                    ),
+                ),
+            )
+        except ByteIdentityError:
+            profiles = None
         donor_targets = _branch_targets(donor_body, donor_rows, code_end, f"{context} donor")
         reference_targets = _branch_targets(
             reference_body, reference_rows, reference_code_end, f"{context} reference"
@@ -593,7 +725,76 @@ def build_region_resize_rewriting(
             scope_bound: int | None = None
             attempt: tuple[list[dict[str, Any]], bytes, dict[str, Any]] | None = None
             failure: str | None = None
+            selection = (
+                None
+                if profiles is None
+                else Selection(
+                    *profiles,
+                    prologue,
+                    () if bijection is None else tuple(sorted(bijection["mapping"].items())),
+                    ()
+                    if bijection is None
+                    else tuple((left, right) for left, right in bijection["scopes"]),
+                )
+            )
+            disagreements: dict[int, str] = {}
+
+            def span(first: int, last: int) -> int:
+                return runs[last][1] - runs[first][0]
+
+            def label_of(group: _Group) -> int:
+                first_index = runs[group.first][0]
+                return keys[first_index][0] if first_index < len(keys) else code_end
+
+            def settle(position: int) -> int:
+                """Plan a group's shapes; merge it with neighbours when that makes it agree.
+
+                A group with no agreeing shape absorbs the fewest neighbouring
+                groups (at most `MAX_MERGED_GROUPS` on one side, forward first)
+                whose merged region has one.  A disagreement merging cannot
+                cure (a barrier in the run itself) or one no bounded merge
+                cures leaves the group as it is, with the ladder.  Returns the
+                settled group's position.
+                """
+                shapes, disagreement = plan_group_shapes(
+                    groups, position, runs, len(keys), len(reference_keys), selection
+                )
+                group = groups[position]
+                group.shapes, group.shape = shapes, 0
+                if disagreement is None:
+                    return position
+                disagreements.setdefault(label_of(group), disagreement[1])
+                if disagreement[0] == "structure":
+                    return position
+                for reach in range(1, MAX_MERGED_GROUPS + 1):
+                    for first, last in ((position, position + reach), (position - reach, position)):
+                        if first < 0 or last >= len(groups):
+                            continue
+                        if span(groups[first].first, groups[last].last) > MAX_REGION_INSTRUCTIONS:
+                            continue
+                        merged = _Group(groups[first].first, groups[last].last)
+                        trial = [*groups[:first], merged, *groups[last + 1 :]]
+                        shapes, disagreement = plan_group_shapes(
+                            trial, first, runs, len(keys), len(reference_keys), selection
+                        )
+                        if disagreement is None:
+                            merged.shapes = shapes
+                            groups[first : last + 1] = [merged]
+                            return first
+                return position
+
+            position = 0
+            while position < len(groups):
+                position = settle(position) + 1
             for _ in range(MAX_ATTEMPTS):
+                empty = next((group for group in groups if not group.shapes), None)
+                if empty is not None:
+                    label = label_of(empty)
+                    failure = (
+                        f"the region at {label} has no boundary where the versions agree: "
+                        + disagreements.get(label, "every shape breaks the region's shape checks")
+                    )
+                    break
                 ranges = _group_ranges(groups, runs, len(keys), len(reference_keys))
                 refused: int | None = None
                 message: str | None = None
@@ -610,11 +811,10 @@ def build_region_resize_rewriting(
                         )
                         is None
                     )
-                    # The merged region is tried again from its own plain shape.
+                    # The merged region is tried again from its own first shape.
                     groups[position - 1].last = groups[position].last
-                    groups[position - 1].shape = 0
                     del groups[position]
-                    varied = position - 1
+                    varied = settle(position - 1)
                     continue
                 else:
                     try:
@@ -663,39 +863,35 @@ def build_region_resize_rewriting(
                         break
                 group = groups[refused]
                 varied = refused
-                first_index = runs[group.first][0]
-                label = keys[first_index][0] if first_index < len(keys) else code_end
+                label = label_of(group)
                 if message is not None:
                     first_refusals.setdefault(label, message)
                     last_refusals[label] = message
                 group.shape += 1
-                if group.shape == len(CONTEXT_EXTENTS):
+                if group.shape == len(group.shapes or ()):
                     # Every shape refuses: the region absorbs a neighbouring run,
                     # while it stays a bounded region.
-                    def span(first: int, last: int) -> int:
-                        return runs[last][1] - runs[first][0]
-
                     if (
                         refused + 1 < len(groups)
                         and span(group.first, groups[refused + 1].last) <= MAX_REGION_INSTRUCTIONS
                     ):
                         group.last = groups[refused + 1].last
-                        group.shape = 0
                         del groups[refused + 1]
-                        varied = refused
+                        varied = settle(refused)
                     elif (
                         refused > 0
                         and span(groups[refused - 1].first, group.last) <= MAX_REGION_INSTRUCTIONS
                     ):
                         groups[refused - 1].last = group.last
-                        groups[refused - 1].shape = 0
                         del groups[refused]
-                        varied = refused - 1
+                        varied = settle(refused - 1)
                     else:
                         failure = (
                             f"the region at {label} refuses in every shape it can take; "
                             "first refusal: "
-                            + first_refusals.get(label, "every context meets a neighbour")
+                            + first_refusals.get(
+                                label, disagreements.get(label, "every context meets a neighbour")
+                            )
                             + (
                                 f"; last refusal: {last_refusals[label]}"
                                 if label in last_refusals
