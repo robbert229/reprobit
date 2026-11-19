@@ -54,10 +54,12 @@ Checks (each is a refusal):
 3. Forward CFG, any exits.  Inside R_i and P_i every instruction falls
    through, branches strictly forward to an instruction of the same region
    or to its end, or leaves for a point outside every region interior (or a
-   declared entry of another region) in the code; there is no call, return,
-   indirect transfer or relocated branch.  The CFG is therefore a DAG; its
-   paths from each entry are enumerated (at most 64) and each ends at the
-   region's end or at the point a branch leaves for.
+   declared entry of another region) in the code, or is a direct call to a
+   register-free callee (``call rel32`` with its REL32 record, ``call
+   [abs32]``); there is no other call, no return, indirect transfer or
+   relocated branch.  The CFG is therefore a DAG; its paths from each entry
+   are enumerated (at most 64) and each ends at the region's end or at the
+   point a branch leaves for.
 4. Decoding.  P_i decodes, instruction by instruction, to exactly the
    declared encodings, and I re-decodes to exhaustion with each P_i on its
    own boundaries.
@@ -93,8 +95,12 @@ Checks (each is a refusal):
    b. every register with an atom live at the exit in D or in I is equal;
    c. every flag live at the exit in D or in I is equal (ZF compared by its
       exact normal form, see `region_simulation.canonical_flag`);
-   d. the two store sequences are equal up to reordering provably disjoint
-      stores (pushes included);
+   d. the two versions make the same calls (event terms, see
+      `region_simulation._call`: a call is admitted only to a callee whose C
+      decoration fixes a register-free convention, and is named by the
+      callee, ESP, the canonical store log since the previous call and that
+      call), and the store sequences after the last call are equal up to
+      reordering provably disjoint stores (pushes included);
    e. the two memory footprints (address and width of every access) are
       equal, so one faults exactly when the other does; and
    f. every entry register and flag that any compared term, store, access
@@ -212,9 +218,11 @@ from .debug import (
 from .foundation import require_payload_free_declaration, sha256_bytes
 from .region_simulation import (
     FLAG_NAMES,
+    RelocationTarget,
     canonical_flag,
     contradictory,
     lin_atom,
+    register_free_callee,
     simulate_region,
     stores_equivalent,
     term_atoms,
@@ -270,7 +278,7 @@ def _region_refusals(ordinal: int) -> Iterator[None]:
 
 _BYTE_REGISTERS = frozenset({"eax", "ecx", "edx", "ebx"})
 _CALL_CLOBBERED = frozenset({"eax", "ecx", "edx"})
-_C_IDENTIFIER = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
+_REL32 = 0x0014
 
 
 class ScopeBoundRefusal(ByteIdentityError):
@@ -279,29 +287,6 @@ class ScopeBoundRefusal(ByteIdentityError):
     def __init__(self, message: str, offset: int) -> None:
         super().__init__(message)
         self.offset = offset
-
-
-def register_free_callee(symbol: object) -> bool:
-    """Whether a callee's MSVC C decoration says it takes no argument in a register.
-
-    MSVC decorates a C ``__cdecl`` function ``_name`` and a ``__stdcall`` one
-    ``_name@N``; only ``__fastcall`` (``@name@N``) and C++ member functions
-    (``?...``) receive arguments in registers, and the import thunk of either C
-    form is ``__imp_`` before it.  A name whose identifier itself starts with
-    an underscore (``__chkstk``, ``__aullshr``, ``__ftol``) is a compiler or
-    runtime helper with its own register convention and is not admitted.
-    """
-    if not isinstance(symbol, str):
-        return False
-    name = symbol[len("__imp_") :] if symbol.startswith("__imp_") else symbol
-    if not name.startswith("_") or name.startswith("__"):
-        return False
-    core = name[1:]
-    if "@" in core:
-        core, _at, size = core.rpartition("@")
-        if not size.isdigit() or "@" in core:
-            return False
-    return bool(core) and not core.startswith("_") and set(core) <= _C_IDENTIFIER
 
 
 def refine_call_reads(
@@ -802,7 +787,7 @@ def apply_region_resize(
                 if not start <= item["offset"] < end:
                     continue
                 require(
-                    item["flow"] in ("fall", "jcc", "jmp") and not item["indirect"],
+                    item["flow"] in ("fall", "jcc", "jmp", "call") and not item["indirect"],
                     f"{region_context}: the region holds a {item['flow']} at {item['offset']}",
                 )
                 if item["flow"] in ("jcc", "jmp"):
@@ -815,14 +800,24 @@ def apply_region_resize(
                         "the region or leaves the code",
                     )
             region_rows = [row for row in rows if start <= row["offset"] < end]
+            call_fields = {
+                item["offset"] + 1
+                for item in instructions
+                if start <= item["offset"] < end
+                and item["flow"] == "call"
+                and body[item["offset"]] == 0xE8
+            }
             for row in region_rows:
                 require(
                     row["offset"] + row["width"] <= end
-                    and row["type"] == _DIR32
+                    and (
+                        row["type"] == _DIR32
+                        or (row["type"] == _REL32 and row["offset"] in call_fields)
+                    )
                     and row["width"] == 4
                     and row["target_section"] != section_number,
-                    f"{region_context}: the relocation at {row['offset']} is not an external "
-                    "DIR32 field",
+                    f"{region_context}: the relocation at {row['offset']} is neither an external "
+                    "DIR32 field nor a call's REL32 field",
                 )
             # Check 5: a bijection of relocated fields, each keeping its record.
             pairs = region["relocations"]
@@ -943,7 +938,7 @@ def apply_region_resize(
             branch_repairs.append(new_at)
     reseat: list[list[int]] = []
     image_view: dict[int, dict[str, Any]] = {}
-    region_maps: list[dict[int, str]] = [{} for _region in declared]
+    region_maps: list[dict[int, RelocationTarget]] = [{} for _region in declared]
     for row in rows:
         owner = next(
             (
@@ -959,7 +954,9 @@ def apply_region_resize(
             region = declared[owner]
             local = next(local for local, donor in region["relocations"] if donor == row["offset"])
             new_offset = region["image_start"] + local
-            region_maps[owner][local] = row["target"]
+            region_maps[owner][local] = (
+                ("rel32", row["target"]) if row["type"] == _REL32 else row["target"]
+            )
         if new_offset != row["offset"]:
             reseat.append([row["offset"], new_offset])
         image_view[new_offset] = {"width": row["width"], "target": row["target"]}
@@ -1152,7 +1149,10 @@ def apply_region_resize(
             start, end = region["start"], region["end"]
             image_start = region["image_start"]
             image_end = image_start + len(region["replacement"])
-            donor_relocations = {row["offset"]: row["target"] for row in region["rows"]}
+            donor_relocations: dict[int, RelocationTarget] = {
+                row["offset"]: ("rel32", row["target"]) if row["type"] == _REL32 else row["target"]
+                for row in region["rows"]
+            }
             pairs = 0
             donor_count = 0
             image_count = 0
@@ -1248,8 +1248,8 @@ def apply_region_resize(
 def _prove_region_entry(
     donor_body: bytes,
     region: dict[str, Any],
-    image_relocations: dict[int, str],
-    donor_relocations: dict[int, str],
+    image_relocations: dict[int, RelocationTarget],
+    donor_relocations: dict[int, RelocationTarget],
     donor_entry: int,
     image_local: int,
     entry_sigma: dict[str, str],
@@ -1332,6 +1332,10 @@ def _prove_region_entry(
             )
             compared_union |= set(compared_registers)
             flags_union |= set(compared_flags)
+            require(
+                left.events == right.events,
+                f"{context}: the two versions make different calls",
+            )
             require(
                 left.regs["esp"] == right.regs["esp"],
                 f"{context}: the two versions leave a different stack pointer",
@@ -1867,6 +1871,5 @@ __all__ = [
     "produce_region_resize_rewriting_candidate",
     "protected_code_offsets",
     "refine_call_reads",
-    "register_free_callee",
     "resized_donor_object",
 ]

@@ -156,8 +156,16 @@ return's live set, is refused), each region whose start or end lies in a
 scope is proved with the replacement's registers renamed, and the
 correspondence changes only where every moved register is dead in both
 bodies. EBP may move only with the frame-pointer-free proof; ESP never
-moves. The module docstring of `reprobit.classic.rewriting_region_resize`
-states the theorem and its ten checks.
+moves. A region may also declare interior entries (each paired with a
+replacement instruction, so branches into it are re-encoded), leave by any
+forward branch for a point outside every region (both versions must leave at
+corresponding points and are compared there), and hold direct calls to
+callees whose C decoration fixes a register-free convention: a call is an
+event named by the callee, ESP, the canonical store log before it and the
+previous call, both versions must make the same events, and memory after a
+call is that call's result. The module docstring of
+`reprobit.classic.rewriting_region_resize` states the theorem and its ten
+checks.
 
 #### Project-level families (role `project`)
 

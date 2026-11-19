@@ -622,3 +622,116 @@ def test_discovery_maps_a_branch_into_a_run_through_the_aligned_branch() -> None
         branches,
     )
     assert region["replacement_entries"] == [[17, 3]]
+
+
+def test_an_empty_replacement_is_one_path_that_changes_nothing() -> None:
+    (path,) = simulate_region(b"", 0, 0, {}, "t", "empty")
+    assert path.exit == 0 and path.stores == () and path.events == ()
+
+
+# --- calls inside a region -------------------------------------------------------------
+
+
+def _calls(code, relocations, **kwargs):
+    return simulate_region(code, 0, len(code), relocations, "t", "calls", **kwargs)
+
+
+def test_a_call_is_an_event_named_by_everything_it_can_read() -> None:
+    # push eax; call _f; add esp, 4 -- twice the same call from the same state.
+    code = bytes.fromhex("50e80000000083c404")
+    (first,) = _calls(code, {2: ("rel32", "_f")})
+    (second,) = _calls(code, {2: ("rel32", "_f")})
+    assert first.events == second.events and len(first.events) == 1
+    assert first.regs["eax"] == lin_atom(("callret", "eax", first.events[0]))
+    assert first.regs["esp"] == lin_atom(("reg0", "esp"))
+    # The callee may have written the pushed argument: a reload names the call.
+    (reload,) = _calls(bytes.fromhex("50e8000000008b0424"), {2: ("rel32", "_f")})
+    assert reload.regs["eax"][2][0][0][-1] == reload.events[0]
+
+
+def test_a_call_from_a_different_state_is_a_different_event() -> None:
+    (one,) = _calls(bytes.fromhex("50e800000000"), {2: ("rel32", "_f")})
+    (other,) = _calls(bytes.fromhex("51e800000000"), {2: ("rel32", "_f")})
+    assert one.events != other.events
+
+
+def test_a_stdcall_callee_pops_its_arguments() -> None:
+    (path,) = _calls(bytes.fromhex("50e800000000"), {2: ("rel32", "_f@4")})
+    assert path.regs["esp"] == lin_atom(("reg0", "esp"))
+    (thunk,) = _calls(bytes.fromhex("50ff1500000000"), {3: "__imp__Sleep@4"})
+    assert thunk.regs["esp"] == lin_atom(("reg0", "esp"))
+
+
+@pytest.mark.parametrize(
+    ("code", "relocations", "why"),
+    [
+        ("e800000000", {1: ("rel32", "@fast@8")}, "register-free"),
+        ("e800000000", {1: ("rel32", "?m@C@@QAEXXZ")}, "register-free"),
+        ("e800000000", {1: ("rel32", "__chkstk")}, "register-free"),
+        ("e800000000", {}, "PC-relative relocation"),
+        ("e804000000", {1: ("rel32", "_f")}, "middle of a symbol"),
+        ("ffd0", {}, "indirect call"),
+        ("ff10", {}, "indirect call"),
+        ("8b0500000000", {2: ("rel32", "_f")}, "PC-relative relocated field is read"),
+    ],
+)
+def test_calls_outside_the_model_are_refused(code: str, relocations: dict, why: str) -> None:
+    with pytest.raises(ByteIdentityError, match=why):
+        _calls(bytes.fromhex(code), relocations)
+
+
+def test_the_normal_form_of_a_store_log_is_canonical_for_disjoint_swaps() -> None:
+    from reprobit.classic.region_simulation import lin, store_normal_form
+
+    base = lin_atom(("reg0", "ebx"))
+    a = (base, 4, lin(1))
+    b = (lin(4, base[2]), 4, lin(2))
+    c = (lin(2, base[2]), 4, lin(3))  # overlaps both
+    assert store_normal_form((a, b)) == store_normal_form((b, a))
+    assert store_normal_form((a, c)) != store_normal_form((c, a))
+
+
+CALLING_DONOR = bytes.fromhex(
+    HEAD + "8b4304" + "50" + "e800000000" + "83c404" + "8bc8" + "890b" + TAIL
+)
+CALLING_IMAGE = bytes.fromhex(
+    HEAD + "8b4b04" + "51" + "e800000000" + "83c404" + "8bc8" + "890b" + TAIL
+)
+
+
+def _calling(replacement, pairs, callee="_callee"):
+    return apply_region_resize(
+        CALLING_DONOR,
+        [
+            {
+                "region_start": 10,
+                "region_end": 22,
+                "replacement_instructions": replacement,
+                "replacement_relocations": pairs,
+            }
+        ],
+        [*_rows((6,)), {**_rows((15,))[0], "type": 0x14, "target": callee}],
+        1,
+        "fixture",
+        prologue_length=4,
+    )
+
+
+def test_a_region_holding_the_same_call_from_the_same_state_is_proved() -> None:
+    # mov eax, [ebx+4]; push eax  ==  mov ecx, [ebx+4]; push ecx, then the
+    # call: the argument the callee reads is the same, and both registers are
+    # the call's to clobber.
+    image, proof = _calling(["8b4b04", "51", "e800000000", "83c404"], [[5, 15]])
+    assert image == CALLING_IMAGE
+    (region,) = proof["regions"]
+    assert region["compared_registers"] == ["eax", "ebx"]
+
+
+def test_a_region_whose_call_reads_another_argument_is_refused() -> None:
+    with pytest.raises(ByteIdentityError, match="different calls"):
+        _calling(["8b4b08", "51", "e800000000", "83c404"], [[5, 15]])
+
+
+def test_a_region_calling_a_register_convention_callee_is_refused() -> None:
+    with pytest.raises(ByteIdentityError, match="register-free"):
+        _calling(["8b4b04", "51", "e800000000", "83c404"], [[5, 15]], callee="@fast@4")

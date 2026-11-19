@@ -74,9 +74,10 @@ accumulator form (8/16/32-bit), ``test``, ``inc``/``dec``, ``neg``/``not``,
 operand), ``mul``, ``div`` and ``idiv`` (32-bit; a division is an event both
 versions must perform on the same operands), ``setcc``, ``push`` (register,
 immediate, memory), ``pop`` (register), ``nop``, ``jcc`` and ``jmp``
-(rel8/rel32).  No call, return, string
-instruction, x87 instruction or indirect transfer is admitted: a call's
-register inputs and its effect on memory cannot be bounded from the bytes.
+(rel8/rel32), and a direct call (``call rel32``, ``call [abs32]``) to a
+callee whose MSVC C decoration fixes a register-free convention
+(:func:`_call` states its exact model).  No other call, no return, string
+instruction, x87 instruction or indirect transfer is admitted.
 """
 
 from __future__ import annotations
@@ -105,6 +106,9 @@ MAX_PATHS = 64
 MAX_STEPS = 4096
 
 Term: TypeAlias = Any
+# A relocated field's target: a symbol read as an absolute value (DIR32), or
+# ``("rel32", symbol)`` for a call's PC-relative field.
+RelocationTarget: TypeAlias = str | tuple[str, str]
 
 
 def lin(const: int = 0, terms: Iterable[tuple[Term, int]] = ()) -> Term:
@@ -376,6 +380,8 @@ class PathState:
     footprint: set[Term] = field(default_factory=set)
     conditions: list[tuple[Term, bool]] = field(default_factory=list)
     relocations_read: set[int] = field(default_factory=set)
+    epoch: Term = None
+    events: list[Term] = field(default_factory=list)
 
     def fork(self) -> PathState:
         return PathState(
@@ -385,6 +391,8 @@ class PathState:
             set(self.footprint),
             list(self.conditions),
             set(self.relocations_read),
+            self.epoch,
+            list(self.events),
         )
 
 
@@ -399,6 +407,7 @@ class PathResult:
     footprint: frozenset[Term]
     relocations_read: frozenset[int]
     exit: int = 0
+    events: tuple[Term, ...] = ()
 
 
 def entry_state(entry_names: Mapping[str, str] | None = None) -> PathState:
@@ -435,7 +444,10 @@ def _load(state: PathState, address: Term, width: int) -> Term:
         deps.append(entry)
         if relation == "same":
             break
-    term = ("ld", address, width, tuple(reversed(deps)))
+    term: Term = ("ld", address, width, tuple(reversed(deps)))
+    if state.epoch is not None:
+        # Memory since the last call is that call's result: the load names it.
+        term = (*term, state.epoch)
     return lin_atom(term) if width == 4 else ("b", width * 8, term)
 
 
@@ -451,7 +463,7 @@ class _Instruction:
         self,
         code: bytes,
         offset: int,
-        relocations: Mapping[int, str],
+        relocations: Mapping[int, RelocationTarget],
         context: str,
     ) -> None:
         self.offset = offset
@@ -489,8 +501,24 @@ class _Instruction:
         symbol = self.relocations.get(at)
         if symbol is None:
             return None
+        require(
+            isinstance(symbol, str),
+            f"{self.context}: a PC-relative relocated field is read as an absolute value",
+        )
         self.consumed.add(at)
         return lin_atom(("sym", symbol))
+
+    def call_target(self, local: int) -> str:
+        """The symbol of a ``call rel32``'s PC-relative relocated field."""
+        at = self.offset + local
+        symbol = self.relocations.get(at)
+        require(
+            isinstance(symbol, tuple) and symbol[0] == "rel32",
+            f"{self.context}: a relative call without a PC-relative relocation is outside the "
+            "simulator's closed set",
+        )
+        self.consumed.add(at)
+        return cast(tuple[str, str], symbol)[1]
 
     def immediate(self, local: int, size: int, signed: bool = True) -> Term:
         raw = self.raw[local : local + size]
@@ -718,6 +746,106 @@ def _wide(state: PathState, digit: int, source: Term, undefined: _Undefined) -> 
         state.flags[name] = undefined(name)
 
 
+_C_IDENTIFIER = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
+
+
+def callee_stack_pop(symbol: object) -> int | None:
+    """The bytes a register-free callee pops on return, or None when the name does not say.
+
+    MSVC decorates a C ``__cdecl`` function ``_name`` (the caller pops) and a
+    ``__stdcall`` one ``_name@N`` (the callee pops N bytes); the import
+    thunk's slot of either is ``__imp_`` before it.  Only ``__fastcall``
+    (``@name@N``) and C++ member functions (``?...``) receive arguments in
+    registers.  A name whose identifier itself starts with an underscore
+    (``__chkstk``, ``__aullshr``, ``__ftol``) is a compiler or runtime helper
+    with its own register convention and is not admitted.
+    """
+    if not isinstance(symbol, str):
+        return None
+    name = symbol[len("__imp_") :] if symbol.startswith("__imp_") else symbol
+    if not name.startswith("_") or name.startswith("__"):
+        return None
+    core, pop = name[1:], 0
+    if "@" in core:
+        core, _at, size = core.rpartition("@")
+        if not size.isdigit() or "@" in core or int(size) % 4:
+            return None
+        pop = int(size)
+    if not core or core.startswith("_") or not set(core) <= _C_IDENTIFIER:
+        return None
+    return pop
+
+
+def register_free_callee(symbol: object) -> bool:
+    """Whether a callee's MSVC C decoration says it takes no argument in a register."""
+    return callee_stack_pop(symbol) is not None
+
+
+def store_normal_form(stores: Iterable[tuple[Term, int, Term]]) -> tuple[Any, ...]:
+    """The canonical order of a store log up to swapping provably disjoint stores.
+
+    Two logs leave the same memory under :func:`stores_equivalent` exactly
+    when they are the same trace over the independence relation "the two
+    byte ranges are disjoint" (symmetric and irreflexive), and the
+    lexicographically least linearisation of a trace is unique: repeatedly
+    take the least store (by its representation) that is disjoint from every
+    store still before it.
+    """
+    remaining = list(stores)
+    ordered = []
+    while remaining:
+        best = None
+        for index, item in enumerate(remaining):
+            if all(
+                address_relation(item[0], item[1], other[0], other[1]) == "disjoint"
+                for other in remaining[:index]
+            ) and (best is None or repr(item) < repr(remaining[best])):
+                best = index
+        ordered.append(remaining.pop(cast(int, best)))
+    return tuple(ordered)
+
+
+def _call(
+    state: PathState, callee: Term, symbol: object, undefined: _Undefined, context: str
+) -> None:
+    """A call to a register-free callee: one event named by everything it can read.
+
+    Under the model every classic rewriting uses (callees honour the
+    convention their decoration names), the callee reads memory and the
+    stack pointer and no general register, may write any memory, returns in
+    EDX:EAX, clobbers ECX and the flags, preserves EBX, ESI, EDI and EBP, and
+    pops the bytes its decoration states.  The event's term is the callee,
+    ESP, the canonical form of every store since the previous event, and
+    that event, so two versions' events are equal terms exactly when they
+    call the same function from the same state.  Memory after the call is
+    unknown: the store log restarts and every later load names the event.
+    The pushed return address is part of the call, as for every call the
+    layout moves.
+    """
+    pop = callee_stack_pop(symbol)
+    require(
+        pop is not None,
+        f"{context}: a call to {symbol!r}, whose decoration does not fix a register-free "
+        "convention, is outside the simulator's closed set",
+    )
+    identity = (
+        "call",
+        callee,
+        state.regs["esp"],
+        store_normal_form(state.stores),
+        state.epoch,
+    )
+    state.events.append(identity)
+    state.footprint.add(("event", identity))
+    state.stores = []
+    state.epoch = identity
+    for name in ("eax", "ecx", "edx"):
+        state.regs[name] = lin_atom(("callret", name, identity))
+    state.regs["esp"] = lin_add(state.regs["esp"], lin(cast(int, pop)))
+    for name in FLAG_NAMES:
+        state.flags[name] = undefined(name)
+
+
 def _push(state: PathState, value: Term) -> None:
     state.regs["esp"] = lin_add(state.regs["esp"], lin(-4))
     _store(state, state.regs["esp"], 4, value)
@@ -914,11 +1042,25 @@ def _step(state: PathState, item: _Instruction, undefined: _Undefined) -> tuple[
                     state.flags[name] = ("flag", name, kind, width, value, "")
             _write_rm(state, item, width, result)
             return ("fall", None)
+        if op == 0xFF and digit == 2 and mod == 0 and _rm == 5:
+            # call [abs32]: an import thunk's slot, read like any operand.
+            callee = _read_rm(state, item, 32)
+            symbol = item.relocations.get(item.modrm_at + 1 + item.offset)
+            _call(state, ("indirect", callee), symbol, undefined, context)
+            return ("fall", None)
         require(
             op == 0xFF and digit == 6,
             f"{context}: an indirect call or jump is outside the simulator's closed set",
         )
         _push(state, _read_rm(state, item, 32))
+        return ("fall", None)
+    if op == 0xE8:
+        symbol = item.call_target(item.cursor)
+        addend = int.from_bytes(item.raw[item.cursor : item.cursor + 4], "little", signed=True)
+        require(
+            addend == 0, f"{context}: a call into the middle of a symbol is outside the closed set"
+        )
+        _call(state, ("direct", symbol), symbol, undefined, context)
         return ("fall", None)
     if op in (0xC1, 0xD1):
         mod, digit, _rm = item.modrm()
@@ -1023,7 +1165,7 @@ def simulate_region(
     code: bytes,
     start: int,
     end: int,
-    relocations: Mapping[int, str],
+    relocations: Mapping[int, RelocationTarget],
     tag: str,
     context: str,
     entry_names: Mapping[str, str] | None = None,
@@ -1048,7 +1190,10 @@ def simulate_region(
     starts = region_boundaries(code, start, end, context)
     boundaries = set(starts) | {end}
     first = start if begin is None else begin
-    require(first in starts, f"{context}: the entry {first} is not an instruction of the region")
+    require(
+        first in starts or first == start == end,
+        f"{context}: the entry {first} is not an instruction of the region",
+    )
     instructions = {offset: _Instruction(code, offset, relocations, context) for offset in starts}
     undefined = _Undefined(tag)
     results: list[PathResult] = []
@@ -1120,6 +1265,7 @@ def simulate_region(
                 frozenset(state.footprint),
                 frozenset(state.relocations_read),
                 offset,
+                tuple(state.events),
             )
         )
     if first == start:
@@ -1192,13 +1338,17 @@ __all__ = [
     "FLAG_NAMES",
     "MAX_PATHS",
     "PathResult",
+    "RelocationTarget",
     "address_relation",
+    "callee_stack_pop",
     "canonical_flag",
     "condition",
     "contradictory",
     "entry_state",
     "region_boundaries",
+    "register_free_callee",
     "simulate_region",
+    "store_normal_form",
     "stores_equivalent",
     "term_atoms",
 ]
