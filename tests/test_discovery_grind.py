@@ -106,6 +106,7 @@ def _install_grind_fixture(
     live_states: tuple[DeclarationState, ...],
     staged_states: tuple[DeclarationState, ...] | None = None,
     existing_donor_ids: tuple[str, ...] = (),
+    seat_collisions: dict[str, str] | None = None,
     qualification_rejections: frozenset[tuple[int, int]] = frozenset(),
     cold_reasons: tuple[str | None, ...] = (None,),
 ) -> tuple[Path, Path, _Trace, ProjectGrindCallbacks]:
@@ -127,7 +128,9 @@ def _install_grind_fixture(
         reference=b"sealed reference",
     )
     for context in (live, staged):
-        existing = tuple(SimpleNamespace(id=donor_id) for donor_id in existing_donor_ids)
+        existing = tuple(
+            SimpleNamespace(id=donor_id, parameters=()) for donor_id in existing_donor_ids
+        )
         context.bundle.interventions = existing
         context.intervention_document.interventions = existing
     trace = _Trace()
@@ -175,7 +178,10 @@ def _install_grind_fixture(
                 functions,
             )
         )
-        return SimpleNamespace(intervention=SimpleNamespace(id=_donor_id(classes, functions)))
+        return SimpleNamespace(
+            intervention=SimpleNamespace(id=_donor_id(classes, functions), parameters=()),
+            receipt=None,
+        )
 
     def equal_body_authoring(
         *,
@@ -273,6 +279,19 @@ def _install_grind_fixture(
         return SimpleNamespace(interventions=tuple(merged.values())), proofs
 
     monkeypatch.setattr(grind, "merge_authored_records", merge_records)
+    # A saved donor's seat is its own; a collision names the saved donor whose
+    # seat a candidate donor would take.
+    collisions = seat_collisions or {}
+    monkeypatch.setattr(
+        grind,
+        "saved_donor_seats",
+        lambda document, _proofs: {f"seat.{item.id}": item for item in document.interventions},
+    )
+    monkeypatch.setattr(
+        grind,
+        "donor_compiler_seat",
+        lambda intervention, _receipt: f"seat.{collisions.get(intervention.id, intervention.id)}",
+    )
     monkeypatch.setattr(grind, "_write_staged_documents", lambda *_args: None)
     published_ids = tuple(
         SimpleNamespace(id=identifier)
@@ -602,3 +621,130 @@ def test_no_solution_never_publishes_even_with_advance_acceptance(
     assert result.cold_trials == 1
     assert len(result.rejections) == 2
     assert trace.publication_calls == 0
+
+
+def test_grind_skips_a_state_that_would_share_a_saved_donors_seat(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    live_root, staged_root, trace, callbacks = _install_grind_fixture(
+        monkeypatch,
+        tmp_path,
+        live_states=(_state(1, 1), _state(2, 2)),
+        existing_donor_ids=("donor.saved",),
+        seat_collisions={"donor.1.1": "donor.saved"},
+    )
+
+    result = run_project_grind(live_root, callbacks=callbacks)
+
+    assert result.solution is not None
+    assert result.solution.state == _state(2, 2)
+    assert trace.donor_calls == [(staged_root, ("donor.2.2",))]
+    assert [(item.state_id, item.stage) for item in result.rejections] == [
+        (declaration_state_id(_state(1, 1)), "qualification")
+    ]
+    assert "saved donor 'donor.saved'" in result.rejections[0].reason
+    assert "one seat holds one donor" in result.rejections[0].reason
+
+
+def test_grind_finishes_when_every_state_shares_a_saved_donors_seat(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    live_root, _staged_root, trace, callbacks = _install_grind_fixture(
+        monkeypatch,
+        tmp_path,
+        live_states=(_state(1, 1),),
+        existing_donor_ids=("donor.saved",),
+        seat_collisions={"donor.1.1": "donor.saved"},
+    )
+
+    result = run_project_grind(live_root, callbacks=callbacks, accept_progress=True)
+
+    assert result.solution is None
+    assert not result.published
+    assert trace.donor_calls == []
+    assert trace.cold_calls == []
+    assert len(result.rejections) == 1
+
+
+def _extern_run_state(count: int) -> DeclarationState:
+    return DeclarationState(
+        family=DeclarationFamily.EXTERN_RUN_PAIR,
+        parameters=(
+            DeclarationParameter(name="header_count", value=count),
+            DeclarationParameter(name="header_prefix", value="ReproBitPad"),
+            DeclarationParameter(name="seat_count", value=0),
+            DeclarationParameter(name="seat_prefix", value="ReproBitPadSeat"),
+            DeclarationParameter(name="width", value=3),
+        ),
+    )
+
+
+def _extern_run_context(placement: str, *saved: object) -> SimpleNamespace:
+    from reprobit.discovery_authoring import merge_authored_records
+    from reprobit.schema import InterventionDocument, ProofDocument
+
+    interventions = InterventionDocument(
+        schema_version=3,
+        target_id="program",
+        translation_unit_id="tu.unit",
+        build_target="program",
+        interventions=(),
+    )
+    proofs = ProofDocument(
+        schema_version=3,
+        target_id="program",
+        translation_unit_id="tu.unit",
+        expected_observations=(),
+    )
+    if saved:
+        interventions, proofs = merge_authored_records(interventions, proofs, saved)
+    return SimpleNamespace(
+        unit=SimpleNamespace(target_id="program", id="tu.unit", build_target="program"),
+        config=SimpleNamespace(extern_runs=SimpleNamespace(placement=placement)),
+        intervention_document=interventions,
+        proof_document=proofs,
+        symbol="_second",
+    )
+
+
+def _saved_extern_run(count: int, placement: str) -> object:
+    from reprobit.discovery_authoring import build_extern_run_donor
+
+    return build_extern_run_donor(
+        target_id="program",
+        translation_unit_id="tu.unit",
+        build_target="program",
+        header_prefix="ReproBitPad",
+        header_count=count,
+        seat_prefix="ReproBitPadSeat",
+        seat_count=0,
+        width=3,
+        beneficiary_symbols=("_first",),
+        header_placement=placement,
+    )
+
+
+def test_an_extern_run_in_another_placement_than_a_saved_donor_is_skipped() -> None:
+    saved = _saved_extern_run(10, "prefix")
+    context = _extern_run_context("after_includes", saved)
+    states = (_extern_run_state(9), _extern_run_state(10), _extern_run_state(11))
+
+    admitted, skipped = grind._admit_against_saved_seats(states, context)
+
+    assert [state for state, _record in admitted] == [states[0], states[2]]
+    assert [item.state_id for item in skipped] == [declaration_state_id(states[1])]
+    reason = skipped[0].reason
+    assert saved.intervention.id in reason
+    assert "header_placement is 'prefix' there and '(default)' here" in reason
+
+
+def test_an_extern_run_a_saved_donor_already_is_reuses_it() -> None:
+    saved = _saved_extern_run(10, "prefix")
+    context = _extern_run_context("prefix", saved)
+
+    admitted, skipped = grind._admit_against_saved_seats((_extern_run_state(10),), context)
+
+    assert skipped == []
+    assert [record.intervention.id for _state, record in admitted] == [saved.intervention.id]
