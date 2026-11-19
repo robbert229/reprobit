@@ -24,6 +24,7 @@ from reprobit.classic.function_validation import (
     Program,
     produce_function_validation_candidate,
     prove_function,
+    require_composed_relocations,
 )
 from reprobit.classic_donors import merge_candidate_constraints
 from reprobit.classic_project import ClassicDispatchMaterials, ClassicFamilyDispatcher
@@ -222,6 +223,58 @@ def test_a_string_instruction_stays_outside_the_region_simulator() -> None:
 
     with pytest.raises(ByteIdentityError, match="prefixed instruction"):
         simulate_region(MEMSET_D, 0, 13, {}, "donor", "fixture")
+
+
+def _row(offset, target, *, storage=2, section=0, value=0):
+    return {
+        "offset": offset,
+        "target": target,
+        "type": 6,
+        "target_type": 0,
+        "target_storage": storage,
+        "target_section": section,
+        "target_value": value,
+    }
+
+
+def test_the_composed_table_follows_the_composers_renumbering() -> None:
+    # The grind donor's extra declaration renumbers a file static and a
+    # compiler temporary; the composer names the seed's.
+    installed = [
+        _row(2, "_infoGlobs$S1131", storage=3),
+        _row(8, "$T823", storage=3, section=4, value=16),
+        _row(14, "_info_message_remove_instance"),
+    ]
+    composed = [
+        _row(2, "_infoGlobs$S1130", storage=3),
+        _row(8, "$T817", storage=3, section=4, value=16),
+        _row(14, "_info_message_remove_instance"),
+    ]
+    require_composed_relocations(composed, installed, "fixture")
+    with pytest.raises(ByteIdentityError, match="not the proved reseat"):
+        require_composed_relocations(
+            [_row(2, "_otherGlobs$S1130", storage=3), *composed[1:]], installed, "fixture"
+        )
+    with pytest.raises(ByteIdentityError, match="not the proved reseat"):
+        require_composed_relocations(
+            [*composed[:1], _row(8, "$T817", storage=3, section=4, value=20), composed[2]],
+            installed,
+            "fixture",
+        )
+    with pytest.raises(ByteIdentityError, match="not the proved reseat"):
+        require_composed_relocations(
+            [*composed[:2], _row(14, "_info_message_add_instance")], installed, "fixture"
+        )
+
+
+def test_two_statics_of_one_base_are_never_taken_for_each_other() -> None:
+    installed = [_row(2, "_count$S10", storage=3), _row(8, "_count$S11", storage=3)]
+    swapped = [_row(2, "_count$S20", storage=3), _row(8, "_count$S20", storage=3)]
+    with pytest.raises(ByteIdentityError, match="inconsistently"):
+        require_composed_relocations(swapped, installed, "fixture")
+    require_composed_relocations(
+        [_row(2, "_count$S20", storage=3), _row(8, "_count$S21", storage=3)], installed, "fixture"
+    )
 
 
 # --- the record, its producer and grind ----------------------------------------------
