@@ -2620,10 +2620,26 @@ def simulate_region(
 
 
 def contradictory(left: Iterable[tuple[Term, bool]], right: Iterable[tuple[Term, bool]]) -> bool:
-    """Whether two path conditions assign one atom different values."""
+    """Whether two path conditions assign one atom different values.
+
+    A whole-function proof's switch dispatch adds ``(("case", v, i), True)``:
+    the index value v is the constant i on that path.  Two such facts for
+    one value term and different constants contradict each other.  Region
+    proofs never make one.
+    """
     decided = dict(left)
     if any(atom in decided and decided[atom] != value for atom, value in right):
         return True
+    cases: dict[Term, int] = {}
+    for atom, value in (*left, *right):
+        if (
+            value
+            and isinstance(atom, tuple)
+            and len(atom) == 3
+            and atom[0] == "case"
+            and cases.setdefault(atom[1], atom[2]) != atom[2]
+        ):
+            return True
     return any(not outcomes for outcomes in _fcc_allowed([*left, *right]).values())
 
 

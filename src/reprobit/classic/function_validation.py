@@ -75,18 +75,45 @@ end states whose equal terms include every class of R(x, x') (check 6), so
 the concrete states satisfy R(x, x').  By induction every execution keeps
 the two programs at paired points in related states, and the comparison at
 the return is the theorem's.  A run that never returns makes the same
-calls in the same order on both sides.
+calls in the same order on both sides.  A table read is a branch like any
+other: the concrete index is one constant i, and the path of index i (and
+only paths whose indexes may equal i) is enabled on each side.  A
+recursive call names the function itself: by induction on the depth of
+recursion, an inner call of D and the same inner call of I (made with the
+same arguments from the same memory, check 5a) both return with the same
+returned state and memory outside the callee's dead stack, or neither
+returns, which is exactly what a call event assumes of its callee; under
+a1 the caller never reads the callee's dead stack.
 
 Checks (each is a refusal):
 
-1. Shape.  The donor body has no data tail (switch table) and no symbol,
-   in-body relocation or debug record naming an offset other than its
-   entry and end; the function has no external entry; no branch targets
-   offset 0.  P decodes, instruction by instruction, to exactly the
-   declared encodings.
+1. Shape.  D's code is [0, c) for the declared code end c and its data
+   tail [c, L_D); P's code is the declared encodings and its tail the
+   declared ``replacement_tail``.  A tail is MSVC 5.0 alignment fill up to
+   its first switch table, then switch tables, each extending to the next
+   table's base or the procedure's end: a jump table is wholly 4-byte
+   relocated fields naming offsets of the code, an index table holds no
+   relocated field, and every relocated field of the tail is some jump
+   table's entry (`Program._switches`).  Every relocated field of the code
+   that names an offset of the function is the base of a table read
+   (check 2); any other (a label's address taken as data) is refused.  A
+   symbol of the function's section other than the function, its section
+   and the ``.bf``/``.lf``/``.ef`` markers is a *label*; the declaration
+   gives each label's place in P (``replacement_labels``), inside P's
+   procedure.  A closure record naming an interior offset must be a
+   CodeView S_LABEL32 record (a C ``goto`` label) or S_LDATA32_ST record
+   (MSVC 5.0's nameless record for a switch table) of ``.debug$S``, whose
+   offset and segment fields relocate to a label: debug metadata, never an
+   entry (`debug_label_values`); every other one (an EH funclet head, say)
+   is refused as an external entry.  No other symbol, closure record or
+   debug range names an offset other than the entry and end; no branch
+   targets offset 0.  P decodes, instruction by instruction, to exactly
+   the declared encodings.  When an S_LABEL32 label lies at a cut point
+   the proof pairs, its declared place is the paired point.
 2. Closed set.  Every reachable instruction of both is in the simulator's
    closed set or is ``ret``/``ret imm16``; every branch targets an
-   instruction of its own program; there is no indirect transfer.  A call
+   instruction of its own program; there is no indirect transfer but a
+   switch table read (below).  A call
    is a direct call to a callee whose MSVC C decoration fixes a
    register-free convention (``call rel32`` with its REL32 record, ``call
    [abs32]``), exactly as in the region simulator, a call to a verified
@@ -134,6 +161,29 @@ Checks (each is a refusal):
    compared memory.  ``repe``/``repne`` with ``movs``/``stos`` and every
    ``cmps`` are refused.
 
+   Switch tables.  ``jmp [r*4 + T]`` (``FF /4`` with a scaled-index SIB and
+   no base) and ``mov r8, [r + X]`` (``8A /r``, disp32), whose displacement
+   is a relocated field naming a table of the tail, are table reads
+   (`Switch`, `_dispatch`).  The index register holds a term v.  If v is a
+   constant, or an earlier read on the path fixed it, the read takes that
+   one entry, which must lie in the table.  Otherwise the path's conditions
+   must bound it: ``not (N <u v)`` (the fall-through of ``cmp v, N; ja``)
+   or ``v <u N + 1`` (``jb``), each a fact of the path, with N below the
+   table's size (`switch_bound`); a read with no such bound is refused.
+   The read is then a multi-way branch into N + 1 paths, path i holding the
+   fact ``("case", v, i)``; `region_simulation.contradictory` knows two such
+   facts for one v and different constants contradict, so a donor path and
+   a replacement path are compared exactly when their indexes may be equal.
+   Path i of a jump table jumps to entry i's target; path i of an index
+   table writes byte i of the table, an exact constant, to its register.
+   The tables are the function's own read-only code, so the reads are not
+   in the footprint.  The pairing of the two tables is therefore not
+   declared: the paths of index i of both versions reach paired cut
+   points with related states (checks 4-6), or the proof refuses; so the
+   two bound checks agree wherever both versions could take the table, and
+   an index table must agree with the other version's dispatch value by
+   value.  Every entry must be read on some path (check 3).
+
    Compiler helpers.  A direct call to a compiler helper (``__ftol``,
    ``__chkstk``: a ``__name`` the decoration rules refuse) is admitted when
    its body comes from the authenticated toolchain library
@@ -175,8 +225,16 @@ Checks (each is a refusal):
    constrains nothing, and assuming the words pushed before a call are
    exactly its arguments would be an assumption about the callee that a5
    does not make.
-3. Relocations.  D's relocated fields are 32-bit `DIR32` fields or a call's
-   REL32 field naming a symbol outside the function's own section.  P
+3. Relocations.  D's relocated fields are 32-bit `DIR32` fields, a call's
+   REL32 field naming a symbol outside the function's own section or the
+   function itself (a recursive call: a call event naming the function's
+   symbol, below), or DIR32 fields naming an offset of the function (check
+   1), each resolved to that offset: its label's place plus its inline
+   addend (`donor_fields`).  P's field taking a record of the label at
+   donor place x resolves to the label's declared place in P plus P's own
+   inline addend (`replacement_internal`): exactly what the installed
+   object links to, since the install keeps the donor's records, moves each
+   label symbol to its declared place and keeps P's bytes as the addends.  P
    declares its relocated fields, sorted, as a bijection onto D's records:
    each field takes one record whole (type and target), every record once.
    The simulator names a relocated value by its target alone, so the order
@@ -274,9 +332,15 @@ Checks (each is a refusal):
    donor object is re-seated around it (`rewriting_region_resize.
    resized_donor_object`: relocation offsets through the pairing, every
    line row to the image's entry, the FPO and CodeView sizes and the COFF
-   lengths), the CodeView debug range is [0, the declared end] within P
-   (debug metadata only, which no check relies on), and the same-slot resize
-   delegate installs it.
+   lengths), the procedure size is P's code and tail, each label symbol
+   moves to its declared place (with the CodeView label and switch-table
+   records that name it), the CodeView debug range is [0, the declared end]
+   within P (debug metadata only, which no check relies on), and the
+   same-slot resize delegate installs it.  The delegate moves a compiler
+   local (``$L<n>``) a relocation names to the derived donor's place; a C
+   ``goto`` label's symbol (not a compiler local) keeps the seed's place in
+   the installed object, which changes only the debug record, never a
+   linked byte.
 
 Assumptions beyond the region kinds'.  (a1) The callee owns its argument
 words: its caller does not read them after the call returns (MSVC 5.0's
@@ -336,15 +400,14 @@ from .candidate_recipe import (
     candidate_proof,
     candidate_relocation_semantics,
     install_same_slot,
-    internal_relocation_targets,
     open_candidate_seats,
     pin_candidate_bodies,
     relocation_symbol_map,
     require_pinned_length,
     same_slot_effective,
 )
-from .coff import _comdat_child
-from .debug import MSVC50_FUNCTION_FILL_BYTE, parse_fpo_data
+from .coff import _comdat_child, _comdat_child_closure
+from .debug import MSVC50_FUNCTION_FILL_BYTE, parse_codeview_symbol_stream, parse_fpo_data
 from .foundation import require_payload_free_declaration, sha256_bytes
 from .region_simulation import (
     _STRING_OPCODES,
@@ -358,6 +421,8 @@ from .region_simulation import (
     _fcc_allowed,
     _Instruction,
     _load,
+    _set,
+    _small,
     _step,
     _Undefined,
     condition,
@@ -371,8 +436,9 @@ from .region_simulation import (
     stores_equivalent,
 )
 from .region_x87 import x87_stack_solution
-from .relational import ia32_relational_flow_walk, relational_form_external_entries
+from .relational import ia32_relational_flow_walk
 from .rewriting_region_resize import (
+    CARRIED_DEBUG_RECORDS,
     _hex_instruction,
     _padded_length,
     protected_code_offsets,
@@ -824,6 +890,117 @@ def _width_of(value: Term) -> int | None:
     return None
 
 
+# --- switch tables (checks 1 and 2) ----------------------------------------------------
+
+# The alignment fill MSVC 5.0 emits between a function's last instruction and
+# the switch tables after it: nop, mov edi,edi, and the lea no-ops.
+_ALIGNMENT_FILL = frozenset(
+    {
+        b"\x90",
+        b"\x8b\xff",
+        b"\x8d\x49\x00",
+        b"\x8d\x64\x24\x00",
+        b"\x8d\xa4\x24\x00\x00\x00\x00",
+        b"\x8d\x9b\x00\x00\x00\x00",
+    }
+)
+SWITCH_JUMP = "jump"
+SWITCH_INDEX = "index"
+_REGISTER_NAMES = ("eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi")
+
+
+@dataclass(frozen=True)
+class Tail:
+    """One version's data tail and the fields that name its own offsets (check 1).
+
+    ``data`` is the bytes the code is followed by, up to the procedure's end
+    (alignment fill, then the switch tables); ``internal`` maps every
+    relocated 32-bit field of the code or the tail that names an offset of
+    this function to the offset the linked image resolves it to (the
+    symbol's place plus the field's inline addend).
+    """
+
+    data: bytes = b""
+    internal: Mapping[int, int] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class Switch:
+    """A table read of the code: ``jmp [r*4 + T]`` or ``mov r8, [r + X]`` (check 2).
+
+    ``register`` is the index register's number, ``field`` the relocated
+    displacement naming the table, ``base`` the table's offset in the tail
+    and ``size`` its number of entries (4-byte jump-table entries, or the
+    bytes of an index table); ``destination`` is an index read's 8-bit
+    register.
+    """
+
+    kind: str
+    register: int
+    field: int
+    base: int
+    size: int
+    destination: int = 0
+
+
+def _switch_form(item: _Instruction, at: int) -> tuple[str, int, int] | None:
+    """(kind, index register, destination) when ``item`` reads a table through ``at``."""
+    if item.operand16 or item.repeat is not None or item.opcode not in (0xFF, 0x8A):
+        return None
+    local = at - item.offset
+    mod, digit, rm = item.modrm()
+    if item.opcode == 0xFF and (mod, digit, rm) == (0, 4, 4):
+        sib = item.raw[item.modrm_at + 1]
+        index = (sib >> 3) & 7
+        if sib >> 6 == 2 and sib & 7 == 5 and index != 4 and local == item.modrm_at + 2:
+            return (SWITCH_JUMP, index, 0)
+    if item.opcode == 0x8A and mod == 2 and rm != 4 and local == item.modrm_at + 1:
+        return (SWITCH_INDEX, rm, digit)
+    return None
+
+
+def _require_alignment_fill(data: bytes, context: str) -> None:
+    """The bytes between the code and its first table are MSVC 5.0 alignment fill."""
+    offset = 0
+    while offset < len(data):
+        piece = next(
+            (
+                form
+                for form in sorted(_ALIGNMENT_FILL, key=len, reverse=True)
+                if data[offset : offset + len(form)] == form
+            ),
+            None,
+        )
+        require(
+            piece is not None,
+            f"{context}: the bytes between the code and its first switch table are not "
+            "MSVC 5.0 alignment fill",
+        )
+        offset += len(cast(bytes, piece))
+
+
+def switch_bound(conditions: Iterable[tuple[Term, bool]], value: Term) -> int | None:
+    """The least N the path conditions establish for ``value <= N`` (unsigned), else None.
+
+    The fall-through of ``cmp v, N; ja default`` holds ``not (N <u v)``; the
+    taken side of ``cmp v, M; jb case`` (or the fall-through of ``jae``)
+    holds ``v <u M``.  Each is a fact of the path, so the bound is exact.
+    """
+    best: int | None = None
+    for atom, holds in conditions:
+        if not (isinstance(atom, tuple) and len(atom) == 4 and atom[:2] == ("ltu", 32)):
+            continue
+        left, right = atom[2], atom[3]
+        bound: int | None = None
+        if not holds and right == value and const_of(left) is not None:
+            bound = cast(int, const_of(left))
+        elif holds and left == value and const_of(right):
+            bound = cast(int, const_of(right)) - 1
+        if bound is not None:
+            best = bound if best is None else min(best, bound)
+    return best
+
+
 # --- programs and their cut points ---------------------------------------------------
 
 
@@ -832,7 +1009,10 @@ class Program:
 
     ``helpers`` maps each compiler helper the code calls to its verified body
     (check 2); every indirect call through a vtable slot gets the argument
-    pop its stack relation determines (:func:`indirect_call_pops`).
+    pop its stack relation determines (:func:`indirect_call_pops`).  ``tail``
+    is the data tail after the code and the fields that name this function's
+    own offsets; every such field of the code is a switch table's base
+    (:class:`Switch`), and every such field of the tail a jump-table entry.
     """
 
     def __init__(
@@ -842,17 +1022,24 @@ class Program:
         side: str,
         context: str,
         helpers: Mapping[str, HelperCode] | None = None,
+        tail: Tail | None = None,
     ) -> None:
         self.code = code
         self.side = side
         self.context = context
         self.relocations = dict(relocations)
         self.helpers = dict(helpers or {})
+        self.tail = tail or Tail()
+        self.code_end = len(code)
+        self.end = self.code_end + len(self.tail.data)
         starts = region_boundaries(code, 0, len(code), context)
         self.instructions = {
             offset: _Instruction(code, offset, self.relocations, context, extended=True)
             for offset in starts
         }
+        self.switches = self._switches()
+        # The jump-table entries a path has read (check 3).
+        self.entries_read: set[int] = set()
         self.successors: dict[int, tuple[int, ...]] = {}
         for offset, item in self.instructions.items():
             self.successors[offset] = self._flow(item)
@@ -862,14 +1049,106 @@ class Program:
         for offset, pop in self.indirect_pops.items():
             self.instructions[offset].indirect_pop = pop
 
+    def _switches(self) -> dict[int, Switch]:
+        """Every table read of the code, each table's extent, and the tail's shape (check 1).
+
+        A table extends from its base to the next table's base or the
+        procedure's end.  A jump table is wholly 4-byte fields naming this
+        function's code; an index table holds no relocated field.  The tail
+        before the first table is alignment fill, and every relocated field
+        of the tail is an entry of some jump table.
+        """
+        internal = self.tail.internal
+        context = self.context
+        require(
+            not set(internal) & set(self.relocations),
+            f"{context}: a relocated field both names this function and another symbol",
+        )
+        for at, target in internal.items():
+            require(
+                at >= 0 and at + 4 <= self.end and 0 <= target < self.end,
+                f"{context}: the field at {at} names {target}, outside this function",
+            )
+        found: dict[int, tuple[str, int, int, int, int]] = {}
+        for offset, item in self.instructions.items():
+            fields = [at for at in range(offset, offset + item.length) if at in internal]
+            if not fields:
+                continue
+            at = fields[0]
+            form = _switch_form(item, at) if len(fields) == 1 else None
+            require(
+                form is not None,
+                f"{item.context}: the relocated field at {at} names this function's offset "
+                f"{internal[at]}, and only the base of a switch table (jmp [r*4 + table], "
+                "mov r8, [r + table]) is admitted there: a label address taken as data is "
+                "outside the closed set",
+            )
+            kind, register, destination = cast(tuple[str, int, int], form)
+            base = internal[at]
+            require(
+                self.code_end <= base < self.end,
+                f"{item.context}: the switch table at {base} does not lie in the data tail "
+                f"[{self.code_end}, {self.end})",
+            )
+            found[offset] = (kind, register, at, base, destination)
+        kinds: dict[int, str] = {}
+        for kind, _register, _at, base, _destination in found.values():
+            require(
+                kinds.setdefault(base, kind) == kind,
+                f"{context}: the table at {base} is read both as a jump table and as an "
+                "index table",
+            )
+        bases = sorted(kinds)
+        limits = dict(zip(bases, [*bases[1:], self.end], strict=False))
+        entries: set[int] = set()
+        switches = {}
+        for offset, (kind, register, at, base, destination) in found.items():
+            extent = limits[base] - base
+            if kind == SWITCH_JUMP:
+                require(
+                    extent % 4 == 0
+                    and all(base + 4 * k in internal for k in range(extent // 4))
+                    and all(internal[base + 4 * k] < self.code_end for k in range(extent // 4)),
+                    f"{context}: the jump table at {base} is not {extent // 4} relocated entries "
+                    "naming this function's code",
+                )
+                size = extent // 4
+                entries |= {base + 4 * k for k in range(size)}
+            else:
+                require(
+                    not any(base - 3 <= other < base + extent for other in internal),
+                    f"{context}: the index table at {base} holds a relocated field",
+                )
+                size = extent
+            switches[offset] = Switch(kind, register, at, base, size, destination)
+        stray = sorted(at for at in internal if at >= self.code_end and at not in entries)
+        require(
+            not stray,
+            f"{context}: the data tail's relocated fields at {stray} are no jump table's entries",
+        )
+        require(
+            not self.tail.data or bool(bases),
+            f"{context}: the code is followed by a data tail that no switch table reads",
+        )
+        first = bases[0] if bases else self.end
+        _require_alignment_fill(self.tail.data[: first - self.code_end], context)
+        return switches
+
     def is_return(self, item: _Instruction) -> bool:
         return item.opcode in (0xC3, 0xC2) and not item.operand16
+
+    def table(self, switch: Switch) -> list[int]:
+        """A jump table's targets, entry by entry."""
+        return [self.tail.internal[switch.base + 4 * k] for k in range(switch.size)]
 
     def _flow(self, item: _Instruction) -> tuple[int, ...]:
         end = item.offset + item.length
         op = item.opcode
         if self.is_return(item):
             return ()
+        switch = self.switches.get(item.offset)
+        if switch is not None and switch.kind == SWITCH_JUMP:
+            return tuple(dict.fromkeys(self.table(switch)))
         if 0x70 <= op <= 0x7F or 0x0F80 <= op <= 0x0F8F:
             size = 1 if op <= 0x7F else 4
             return (end, end + _displacement(item, size))
@@ -976,6 +1255,8 @@ def _stack_change(program: Program, item: _Instruction, eax: int | None) -> int:
     """
     if 0xD8 <= item.opcode <= 0xDF or item.opcode in _STRING_OPCODES:
         return 0  # x87 and string instructions do not touch ESP
+    if item.offset in program.switches:
+        return 0  # a table read writes an 8-bit register or jumps
     state = _scratch_state(eax)
     before = state.regs["esp"]
     _step(state, item, _Undefined(f"{program.side}-stack"), None, program.helpers)
@@ -1361,6 +1642,16 @@ def run_paths(
                 f"{context}: control reaches {offset}, which is not an instruction",
             )
             item = program.instructions[offset]
+            if offset in program.switches:
+                forks = _dispatch(program, offset, path, context)
+                for target, other in forks[1:]:
+                    pending.append((target, other, False))
+                require(
+                    len(results) + len(pending) + 1 <= MAX_PATHS,
+                    f"{context}: more than {MAX_PATHS} paths leave one cut point",
+                )
+                offset, path = forks[0]
+                continue
             if program.is_return(item):
                 pop = 4
                 if item.opcode == 0xC2:
@@ -1421,6 +1712,73 @@ def run_paths(
         )
         _summarise(end, frame, context)
     return results
+
+
+def _dispatch(
+    program: Program, offset: int, path: PathState, context: str
+) -> list[tuple[int, PathState]]:
+    """The paths a table read leaves on: one per index value the path allows (check 2).
+
+    The index register holds a term v.  When v is a constant, or a dispatch
+    earlier on the path fixed it (``("case", v, i)``), there is one path.
+    Otherwise the path's conditions must bound it (:func:`switch_bound`):
+    v <= N with N below the table's size; the read is then a multi-way
+    branch into N + 1 paths, path i holding the fact ``("case", v, i)``.
+    `region_simulation.contradictory` knows that two such facts for one v
+    and different constants contradict each other, so a pair of paths is
+    consistent exactly when their indexes may be equal.  A jump-table read
+    jumps to entry i's target; an index-table read writes byte i of the
+    table (an exact constant, the tail is read-only code) to its 8-bit
+    register and falls through.  Neither touches memory the proof compares
+    (the tables lie in this function's own code section).
+    """
+    item, switch = program.instructions[offset], program.switches[offset]
+    value = path.regs[_REGISTER_NAMES[switch.register]]
+    where = f"{context}: the switch at {item.offset}"
+    constant = const_of(value)
+    known = next(
+        (
+            atom[2]
+            for atom, holds in path.conditions
+            if holds and isinstance(atom, tuple) and len(atom) == 3 and atom[:2] == ("case", value)
+        ),
+        None,
+    )
+    choices: list[tuple[int, tuple[Term, bool] | None]]
+    if constant is not None or known is not None:
+        index = cast(int, constant if constant is not None else known)
+        require(
+            index < switch.size,
+            f"{where} reads entry {index} of a table of {switch.size}",
+        )
+        choices = [(index, None)]
+    else:
+        bound = switch_bound(path.conditions, value)
+        require(
+            bound is not None,
+            f"{where} is not guarded by a bound check: no condition of the path bounds its "
+            "index (cmp index, N; ja default)",
+        )
+        require(
+            cast(int, bound) < switch.size,
+            f"{where} admits indexes up to {bound}, beyond its table of {switch.size}",
+        )
+        choices = [(i, (("case", value, i), True)) for i in range(cast(int, bound) + 1)]
+    item.consumed.add(switch.field)
+    forks = []
+    for number, (index, fact) in enumerate(choices):
+        state = path if number == len(choices) - 1 else path.fork()
+        if fact is not None:
+            state.conditions.append(fact)
+        if switch.kind == SWITCH_JUMP:
+            entry = switch.base + 4 * index
+            program.entries_read.add(entry)
+            forks.append((program.tail.internal[entry], state))
+        else:
+            byte = program.tail.data[switch.base - program.code_end + index]
+            _set(state, switch.destination, 8, _small(8, byte))
+            forks.append((item.offset + item.length, state))
+    return forks
 
 
 def _summarise(end: PathEnd, frame: FrameFacts, context: str) -> None:
@@ -1593,6 +1951,7 @@ class ValidationProof:
     path_counts: tuple[int, int]
     path_pairs: int
     returns: int
+    switches: tuple[int, int] = (0, 0)
 
 
 def validate_function(
@@ -1706,10 +2065,10 @@ def validate_function(
                 f"relation there: {why}",
             )
     for program in (donor, image):
-        consumed: set[int] = set()
+        consumed: set[int] = set(program.entries_read)
         for item in program.instructions.values():
             consumed |= item.consumed
-        unread = sorted(set(program.relocations) - consumed)
+        unread = sorted((set(program.relocations) | set(program.tail.internal)) - consumed)
         require(
             not unread,
             f"{context}: the {program.side} relocated fields at {unread} are not read on any path",
@@ -1721,6 +2080,7 @@ def validate_function(
         (donor_paths, image_paths),
         path_pairs,
         returns,
+        (len(donor.switches), len(image.switches)),
     )
 
 
@@ -1776,15 +2136,26 @@ def prove_function(
     *,
     private_frame: FrameFacts | None = None,
     helpers: Mapping[str, HelperCode] | None = None,
+    donor_tail: Tail | None = None,
+    image_tail: Tail | None = None,
 ) -> ValidationProof:
     """Checks 2 and 4-7: a private frame when one is given and no stack address escapes.
 
     A refusal of the private frame because a stack address escapes falls back
     to the shared frame; any other refusal stands.  ``helpers`` maps every
-    compiler helper either version calls to its verified body.
+    compiler helper either version calls to its verified body; each tail is
+    that version's data tail and the fields naming its own offsets.
     """
-    donor = Program(donor_code, donor_relocations, "D", f"{context} donor", helpers)
-    image = Program(image_code, image_relocations, "P", f"{context} replacement", helpers)
+
+    def programs() -> tuple[Program, Program]:
+        return (
+            Program(donor_code, donor_relocations, "D", f"{context} donor", helpers, donor_tail),
+            Program(
+                image_code, image_relocations, "P", f"{context} replacement", helpers, image_tail
+            ),
+        )
+
+    donor, image = programs()
     shared = FrameFacts(False, params_end=4 if private_frame is None else private_frame.params_end)
     if private_frame is not None and locals_block_first(donor, private_frame.base):
         try:
@@ -1792,14 +2163,13 @@ def prove_function(
                 donor, image, private_frame, x87_returns, f"{context} (private frame)"
             )
         except EscapeRefusal:
-            donor = Program(donor_code, donor_relocations, "D", f"{context} donor", helpers)
-            image = Program(image_code, image_relocations, "P", f"{context} replacement", helpers)
+            donor, image = programs()
     return validate_function(donor, image, shared, x87_returns, f"{context} (shared frame)")
 
 
 def proof_summary(proof: ValidationProof) -> dict[str, Any]:
     """The pinned measurements of a proof (check 8)."""
-    return {
+    summary: dict[str, Any] = {
         "frame": "private" if proof.frame.private else "shared",
         "frame_base": proof.frame.base if proof.frame.private else None,
         "params_end": proof.frame.params_end,
@@ -1812,6 +2182,10 @@ def proof_summary(proof: ValidationProof) -> dict[str, Any]:
             len(cls.members) for relation in proof.relations.values() for cls in relation.classes
         ),
     }
+    if proof.switches != (0, 0):
+        # Only a proof through switch tables pins them, so earlier records keep their pins.
+        summary["switch_reads"] = list(proof.switches)
+    return summary
 
 
 # --- the record, the image and its installation (checks 1, 3, 8, 9) -------------------
@@ -1849,8 +2223,13 @@ _SPEC_FIELDS = frozenset(
         "expected_procedure_range",
         "expected_collapsed_line_rows",
         "expected_helper_callees",
+        "donor_code_end",
+        "replacement_tail",
+        "replacement_labels",
     }
 )
+_SECREL = 0x000B
+_SECTION = 0x000A
 
 
 def donor_relocation_targets(
@@ -1873,10 +2252,132 @@ def donor_relocation_targets(
     return targets
 
 
+def donor_fields(
+    rows: list[dict[str, Any]],
+    section_number: int,
+    mangled: str,
+    limit: int,
+    body: bytes,
+    context: str,
+) -> tuple[dict[int, RelocationTarget], dict[int, int]]:
+    """Check 3 on the donor: its symbol fields, and the fields naming its own offsets.
+
+    Each record is an external DIR32 field, a call's REL32 field naming a
+    symbol outside the function's section or the function itself (a
+    recursive call), or a DIR32 field naming an offset of the function (a
+    switch table's base or entry), which the second map resolves to that
+    offset: the symbol's place plus the field's inline addend.
+    """
+    targets: dict[int, RelocationTarget] = {}
+    internal: dict[int, int] = {}
+    for row in rows:
+        offset = row["offset"]
+        own = row["target_section"] == section_number
+        require(
+            row["type"] in (_DIR32, _REL32) and row["width"] == 4 and offset + 4 <= limit,
+            f"{context}: the relocation at {offset} is neither a DIR32 field nor a call's "
+            "REL32 field",
+        )
+        if row["type"] == _REL32:
+            require(
+                not own or (row["target"] == mangled and row["target_value"] == 0),
+                f"{context}: the PC-relative field at {offset} names this function's offset "
+                f"{row['target_value']}, not the function itself",
+            )
+            targets[offset] = ("rel32", row["target"])
+        elif own:
+            addend = int.from_bytes(body[offset : offset + 4], "little", signed=True)
+            internal[offset] = row["target_value"] + addend
+        else:
+            targets[offset] = row["target"]
+    return targets, internal
+
+
+def declared_labels(spec: dict[str, Any], context: str) -> dict[int, int]:
+    """The declared place in the replacement of each label of the donor's section."""
+    pairs = spec.get("replacement_labels", [])
+    require(
+        isinstance(pairs, list)
+        and all(
+            isinstance(pair, list)
+            and len(pair) == 2
+            and all(type(value) is int and value > 0 for value in pair)
+            for pair in pairs
+        )
+        and [pair[0] for pair in pairs] == sorted({pair[0] for pair in pairs}),
+        f"{context}: the replacement labels are not sorted pairs of positive offsets",
+    )
+    return {donor: image for donor, image in pairs}
+
+
+def section_label_values(donor: CoffObject, primary: dict[str, Any]) -> frozenset[int]:
+    """The interior places the symbols of the function's section name (its labels)."""
+    return frozenset(
+        item["value"]
+        for item in donor.symbols.values()
+        if item["section"] == primary["number"]
+        and item["name"] not in (".bf", ".lf", ".ef")
+        and item["value"] != 0
+    )
+
+
+def debug_label_values(donor: CoffObject, primary: dict[str, Any], context: str) -> frozenset[int]:
+    """Check 1: every closure record naming an interior offset is a CodeView label's.
+
+    A C ``goto`` label is a symbol of the function's section named by one
+    S_LABEL32 record of its ``.debug$S``, and MSVC 5.0 names each switch
+    table by a nameless S_LDATA32_ST record: the record's offset field
+    (SECREL) and segment field (SECTION) relocate to the label.  That is
+    debug metadata, not an entry: no code or table transfers control through
+    it.  Any other closure record naming an interior offset (an EH funclet
+    head in ``.xdata$x``, say) is an external entry and is refused.
+    """
+    number = primary["number"]
+    found: set[int] = set()
+    for child_name in _comdat_child_closure(donor, primary)[1]:
+        child = _comdat_child(donor, primary, child_name)
+        rows = [
+            row
+            for row in detailed_relocations(donor, child)
+            if row["target_section"] == number and row["target_value"] != 0
+        ]
+        if not rows:
+            continue
+        require(
+            child_name == ".debug$S",
+            f"{context}: the donor has an external entry besides its own: its {child_name} "
+            f"names the offsets {sorted({row['target_value'] for row in rows})}",
+        )
+        raw = bytes(coff_body(donor, child))
+        fields = {
+            record["offset"] + CARRIED_DEBUG_RECORDS[record["type"]]: _SECREL
+            for record in parse_codeview_symbol_stream(raw, f"{context} debug$S")
+            if record["type"] in CARRIED_DEBUG_RECORDS
+        }
+        fields |= {at + 4: _SECTION for at in list(fields)}
+        for row in rows:
+            require(
+                fields.get(row["offset"]) == row["type"],
+                f"{context}: the donor has an external entry besides its own: its .debug$S "
+                f"names {row['target_value']} outside a CodeView label or switch-table record",
+            )
+            found.add(row["target_value"])
+    return frozenset(found)
+
+
 def validate_replacement(
-    spec: dict[str, Any], rows: list[dict[str, Any]], context: str
+    spec: dict[str, Any],
+    rows: list[dict[str, Any]],
+    context: str,
+    *,
+    section_number: int | None = None,
 ) -> tuple[bytes, list[int], dict[int, RelocationTarget], list[list[int]], int]:
-    """The declared replacement: its code, boundaries, relocation map, reseat and debug end."""
+    """The declared replacement: its code, boundaries, relocation map, reseat and debug end.
+
+    The replacement's relocated fields may lie in its declared tail
+    (``replacement_tail``); a record naming the function's own section
+    (``section_number``) is resolved by :func:`replacement_internal`, not here.
+    """
     require_payload_free_declaration(spec, f"{context} declaration")
     encodings = spec["replacement_instructions"]
     require(
@@ -1886,6 +2387,7 @@ def validate_replacement(
     pieces = [_hex_instruction(text, context) for text in encodings]
     code = b"".join(pieces)
     boundaries = [sum(len(piece) for piece in pieces[:k]) for k in range(len(pieces))]
+    full = code + replacement_tail(spec, context)
     pairs = spec["replacement_relocations"]
     require(
         isinstance(pairs, list)
@@ -1902,7 +2404,7 @@ def validate_replacement(
     donors = [pair[1] for pair in pairs]
     require(
         locals_ == sorted(set(locals_))
-        and all(local + 4 <= len(code) for local in locals_)
+        and all(local + 4 <= len(full) for local in locals_)
         and sorted(donors) == sorted(by_offset)
         and len(set(donors)) == len(donors),
         f"{context}: the replacement's relocations are not a sorted bijection onto the donor's",
@@ -1911,7 +2413,10 @@ def validate_replacement(
     reseat = []
     for local, donor in pairs:
         row = by_offset[donor]
-        targets[local] = ("rel32", row["target"]) if row["type"] == _REL32 else row["target"]
+        if row["type"] == _DIR32 and row["target_section"] == section_number:
+            pass  # a field naming the function's own offset (replacement_internal)
+        else:
+            targets[local] = ("rel32", row["target"]) if row["type"] == _REL32 else row["target"]
         if local != donor:
             reseat.append([donor, local])
     debug_end = spec["replacement_debug_end"]
@@ -1920,6 +2425,51 @@ def validate_replacement(
         f"{context}: the declared debug end lies outside the replacement",
     )
     return code, boundaries, targets, sorted(reseat), debug_end
+
+
+def replacement_tail(spec: dict[str, Any], context: str) -> bytes:
+    """The declared data tail after the replacement's code (empty when none is declared)."""
+    text = spec.get("replacement_tail", "")
+    require(
+        isinstance(text, str)
+        and len(text) % 2 == 0
+        and len(text) <= 2 * 65536
+        and all(char in "0123456789abcdef" for char in text),
+        f"{context}: the replacement tail is not lowercase hex",
+    )
+    return bytes.fromhex(text)
+
+
+def replacement_internal(
+    spec: dict[str, Any],
+    rows: list[dict[str, Any]],
+    full: bytes,
+    section_number: int,
+    labels: Mapping[int, int],
+    context: str,
+) -> dict[int, int]:
+    """Each replacement field naming the function's own offset, resolved as installed.
+
+    The installed object keeps the donor's records, each label symbol moved
+    to its declared place (``labels``), and the replacement's bytes as the
+    inline addends; so a field taking a record of the label at donor place
+    x names labels[x] plus its own inline addend.
+    """
+    by_offset = {row["offset"]: row for row in rows}
+    internal = {}
+    for local, donor in spec["replacement_relocations"]:
+        row = by_offset[donor]
+        if not (row["type"] == _DIR32 and row["target_section"] == section_number):
+            continue
+        place = row["target_value"]
+        require(
+            place in labels,
+            f"{context}: the replacement field at {local} takes the label at {place}, which "
+            "has no declared place in the replacement",
+        )
+        addend = int.from_bytes(full[local : local + 4], "little", signed=True)
+        internal[local] = labels[place] + addend
+    return internal
 
 
 @dataclass
@@ -1962,24 +2512,33 @@ def measure_function_validation(
         f"{label} procedure size or fill alignment differs from the donor",
     )
     rows = detailed_relocations(donor, dp)
-    # Check 1: one entry, no data tail, nothing naming an interior offset.
+    code_end = spec.get("donor_code_end", proc)
     require(
-        not internal_relocation_targets(rows, dp["number"]),
-        f"{label}: the donor relocates into its own section (a switch table or a label)",
+        type(code_end) is int and 0 < code_end <= proc,
+        f"{label}: the donor's declared code end lies outside its procedure",
     )
+    # Check 1: one entry; a data tail holds switch tables; nothing else names
+    # an interior offset but a label the install carries to its declared place.
+    labels = declared_labels(spec, label)
+    required_labels = section_label_values(donor, dp)
     require(
-        not relational_form_external_entries(donor, dp, f"{label} external entries"),
-        f"{label}: the donor has an external entry besides its own",
+        set(labels) == required_labels,
+        f"{label}: the declared labels {sorted(labels)} are not the donor section's labels "
+        f"{sorted(required_labels)}",
     )
+    require(proc not in labels, f"{label}: a label lies at the donor's procedure end")
+    debug_labels = debug_label_values(donor, dp, label)
     debug_start, debug_end_donor = _debug_range(donor, dp, label)
     require(debug_start == 0, f"{label}: the donor's debug range does not start at its entry")
     named = sorted(
         offset
         for offset in protected_code_offsets(donor, dp, label)
-        if offset not in (0, proc, debug_end_donor)
+        if offset not in (0, proc, debug_end_donor) and offset not in labels
     )
     require(not named, f"{label}: a symbol or closure record names the donor's offsets {named}")
-    donor_targets = donor_relocation_targets(rows, dp["number"], proc, label)
+    donor_targets, donor_internal = donor_fields(
+        rows, dp["number"], mangled, proc, donor_body, label
+    )
     helper_symbols = sorted(
         {row["target"] for row in rows if row["type"] == _REL32 and compiler_helper(row["target"])}
     )
@@ -1992,11 +2551,31 @@ def measure_function_validation(
         )
         bodies = cast(HelperLibrary, helper_library).helpers(helper_symbols)
     helpers = {symbol: body.code for symbol, body in bodies.items()}
-    code, boundaries, image_targets, reseat, debug_end = validate_replacement(spec, rows, label)
+    code, boundaries, image_targets, reseat, debug_end = validate_replacement(
+        spec, rows, label, section_number=dp["number"]
+    )
+    tail = replacement_tail(spec, label)
+    image_proc = len(code) + len(tail)
+    image_internal = replacement_internal(spec, rows, code + tail, dp["number"], labels, label)
+    for donor_place, image_place in labels.items():
+        # A label only anchors the fields that name it: each such field is
+        # resolved as installed (replacement_internal), and the proof runs on
+        # those resolved targets, so a label's own place need only lie inside
+        # the procedure (a reference may keep a label's place and move its
+        # target by the field's addend).
+        require(
+            0 < image_place < image_proc,
+            f"{label}: the label at {donor_place} is declared at {image_place}, outside the "
+            "replacement's procedure",
+        )
+    donor_tail = Tail(donor_body[code_end:proc], donor_internal)
+    image_tail = Tail(tail, image_internal)
     require(
-        sorted(Program(code, image_targets, "P", label, helpers).instructions) == boundaries,
+        sorted(Program(code, image_targets, "P", label, helpers, image_tail).instructions)
+        == boundaries,
         f"{label}: the replacement does not decode on its declared boundaries",
     )
+    donor_program = Program(donor_body[:code_end], donor_targets, "D", label, helpers, donor_tail)
     private_frame = None
     if ".debug$F" in closure:
         fpo = parse_fpo_data(
@@ -2008,13 +2587,26 @@ def measure_function_validation(
         if fpo["cbFrame"] == 0 and not fpo["fHasSEH"]:
             private_frame = FrameFacts(True, -4 * fpo["cdwLocals"], 4 + 4 * fpo["cdwParams"])
     view = relocation_symbol_map(rows)
-    items, successors, entries = ia32_relational_flow_walk(
-        donor_body[:proc], view, f"{label} donor flow", None, frozenset()
+    case_targets = frozenset(
+        target
+        for switch in donor_program.switches.values()
+        if switch.kind == SWITCH_JUMP
+        for target in donor_program.table(switch)
     )
+    items, successors, entries = ia32_relational_flow_walk(
+        donor_body[:proc], view, f"{label} donor flow", code_end, case_targets
+    )
+    # A computed jump's walk edges reach every case target; each switch reaches its own.
+    index_of = {item["offset"]: index for index, item in enumerate(items)}
+    for offset, switch in donor_program.switches.items():
+        if switch.kind == SWITCH_JUMP:
+            successors[index_of[offset]] = sorted(
+                {index_of[target] for target in donor_program.table(switch)}
+            )
     solution = x87_stack_solution(items, successors, entries, donor_body[:proc], view)
     x87_returns = {} if solution is None else solution[1]
     proof = prove_function(
-        donor_body[:proc],
+        donor_body[:code_end],
         donor_targets,
         code,
         image_targets,
@@ -2022,9 +2614,21 @@ def measure_function_validation(
         f"{label} proof",
         private_frame=private_frame,
         helpers=helpers,
+        donor_tail=donor_tail,
+        image_tail=image_tail,
     )
-    image = code + bytes([MSVC50_FUNCTION_FILL_BYTE]) * (
-        _padded_length(len(code), fill_alignment) - len(code)
+    for place in sorted(debug_labels):
+        paired = proof.pairs.get(place)
+        require(
+            paired is None or paired == labels[place],
+            f"{label}: the CodeView label at {place} is declared at {labels[place]}, but the "
+            f"proof pairs its join with {paired}",
+        )
+    image = (
+        code
+        + tail
+        + bytes([MSVC50_FUNCTION_FILL_BYTE])
+        * (_padded_length(image_proc, fill_alignment) - image_proc)
     )
     require(image != donor_body, f"{label} image does not move the donor body")
     derived, derived_detail = resized_donor_object(
@@ -2032,14 +2636,16 @@ def measure_function_validation(
         mangled,
         image,
         {
-            "offset_map": {0: 0, proc: len(code)},
+            "offset_map": {0: 0, proc: image_proc},
+            "symbol_map": labels,
             "interiors": [[0, proc, 0]],
             "proc_size": proc,
-            "image_proc_size": len(code),
+            "image_proc_size": image_proc,
             "relocation_reseat": reseat,
         },
         f"{label} derived donor",
         debug_range=(0, debug_end),
+        carried_labels=True,
     )
     moved = {old: new for old, new in reseat}
     pins: dict[str, Any] = {
@@ -2051,13 +2657,16 @@ def measure_function_validation(
     }
     if bodies:
         pins["expected_helper_callees"] = [body.pin() for body in bodies.values()]
-    return FunctionValidationMeasure(
-        image,
-        derived,
-        [{**row, "offset": moved.get(row["offset"], row["offset"])} for row in rows],
-        reseat,
-        pins,
-    )
+    installed = []
+    for row in rows:
+        moved_row = {**row, "offset": moved.get(row["offset"], row["offset"])}
+        if row["target_section"] == dp["number"] and row["type"] == _DIR32:
+            # The label symbol now lies at its declared place, the addend is the image's.
+            at = moved_row["offset"]
+            moved_row["target_value"] = labels.get(row["target_value"], row["target_value"])
+            moved_row["addend"] = int.from_bytes(image[at : at + 4], "little", signed=True)
+        installed.append(moved_row)
+    return FunctionValidationMeasure(image, derived, installed, reseat, pins)
 
 
 def produce_function_validation_candidate(
