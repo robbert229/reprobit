@@ -57,6 +57,7 @@ class ClassicRecipeFamily(StrEnum):
     RETAIL_EXACT_CROSS_TU_COMPLETE_TARGET_RESIZE = "retail_exact_cross_tu_complete_target_resize"
     RETAIL_EXACT_REGISTER_BIJECTION_REENCODING = "retail_exact_register_bijection_reencoding"
     RETAIL_EXACT_REGION_RESIZE_REWRITING = "retail_exact_region_resize_rewriting"
+    RETAIL_EXACT_FUNCTION_TRANSLATION_VALIDATION = "retail_exact_function_translation_validation"
     RETAIL_EXACT_SAME_TU_INSTRUCTION_HYBRID_RESIZE = (
         "retail_exact_same_tu_instruction_hybrid_resize"
     )
@@ -198,6 +199,9 @@ CLASSIC_RECIPE_METADATA: Mapping[ClassicRecipeFamily, ClassicRecipeMetadata] = M
             ClassicRecipeRole.FUNCTION, CostClass.SEMANTIC_REWRITE, _FUNCTION_COVERAGE
         ),
         ClassicRecipeFamily.RETAIL_EXACT_REGION_RESIZE_REWRITING: ClassicRecipeMetadata(
+            ClassicRecipeRole.FUNCTION, CostClass.SEMANTIC_REWRITE, _FUNCTION_COVERAGE
+        ),
+        ClassicRecipeFamily.RETAIL_EXACT_FUNCTION_TRANSLATION_VALIDATION: ClassicRecipeMetadata(
             ClassicRecipeRole.FUNCTION, CostClass.SEMANTIC_REWRITE, _FUNCTION_COVERAGE
         ),
         ClassicRecipeFamily.RETAIL_EXACT_SAME_TU_INSTRUCTION_HYBRID_RESIZE: ClassicRecipeMetadata(

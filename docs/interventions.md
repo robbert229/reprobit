@@ -119,6 +119,7 @@ Contract `classic.binary-transform.<family>.v1`; obligations
 | `retail_exact_register_bijection` | Fixed-width register renaming of a fresh donor body, proved sound against its control flow (see `classic.register_candidates.produce_register_bijection_candidate`). |
 | `retail_exact_register_bijection_reencoding` | Length-changing register renaming with EBP admitted (see `classic.register_candidates.produce_register_bijection_reencoding_candidate`). |
 | `retail_exact_region_resize_rewriting` | Replaces single-entry, single-exit regions of a fresh donor body with declared instructions of any length, proved equal by a strict path simulator, then lays the function out at its new length and installs it through the same-slot resize delegate (see `classic.rewriting_region_resize.produce_region_resize_rewriting_candidate`). |
+| `retail_exact_function_translation_validation` | Replaces the whole code of a fresh donor body with declared instructions (the original's), proved equivalent by translation validation: paired joins, inferred register, stack-slot and x87 correspondences, every pair of paths between joins proved by the region simulator; installed at the replacement's length through the same-slot resize delegate (see `classic.function_validation.produce_function_validation_candidate`). |
 | `retail_exact_web_recolour` | Recolours a def-use web of the seed's own body; the donor is a provenance witness only (see `classic.scheduling.produce_web_recolour_candidate`). |
 | `retail_exact_instruction_mosaic` | Draws same-offset complete instructions from several declaration-carrier compiles of the same translation unit (see `classic.composition.produce_instruction_mosaic_candidate`). |
 | `retail_exact_same_tu_instruction_hybrid_resize` | Composes two source-identical, declaration-carrier same-TU donors (see `classic.composition.produce_same_tu_instruction_hybrid_resize_candidate`). |
@@ -171,6 +172,30 @@ result, NaN payload, flags and signed zero); no other algebraic identity is
 made. The module docstring of
 `reprobit.classic.rewriting_region_resize` states the theorem and its ten
 checks.
+
+`retail_exact_function_translation_validation` proves a whole function at
+once, for differences the region rewrite sees only in pieces: a register
+swapped from the prologue to the epilogue, a value kept in a register on one
+side and reloaded or spilled on the other across a join or a loop. Its record
+carries the original's whole code as instruction encodings and pairs its
+relocated fields with the donor's records. The producer finds both versions'
+cut points (the entry, every join that is not a forwarding `jmp` or a
+straight returning tail, and every loop header), pairs them from the entry
+outwards (the control-flow graphs must be isomorphic up to straight-line
+code), and infers at every pair a relation -- which locations of the two
+versions (registers, stack slots, x87 registers) hold one value, which hold
+a constant -- as the meet of what every pair of consistent paths reaching it
+establishes, to a fixpoint over loops. Every pair of paths between cut points
+is then proved with the region simulator under that relation: the same calls
+with the same arguments, the same memory and footprint, and at a return the
+same EAX, callee-saved registers, ESP, return address and x87 stack. When no
+stack address escapes, the frame is private: stack slots are related like
+registers, a slot is disjoint from every pointer, and a call names the
+argument words below the first saved register; otherwise the whole frame is
+ordinary memory. The module docstring of `reprobit.classic.function_validation`
+states the theorem, its nine checks and its three assumptions beyond the
+region kinds' (a callee owns its argument words; the donor's call arguments
+lie below its saved registers and locals; own-frame accesses do not fault).
 
 #### Project-level families (role `project`)
 
