@@ -1,0 +1,13 @@
+     12 9b db e3	finit
+      2 d8 c1	fadd   st,st(1)
+      2 d8 c9	fmul   st,st(1)
+     12 d9 2d 00 00 00 00	fldcw  WORD PTR ds:0x0
+     24 db 2d 00 00 00 00	fld    TBYTE PTR ds:0x0
+     12 db 3d 00 00 00 00	fstp   TBYTE PTR ds:0x0
+     12 db e2	fnclex
+      2 dc c1	fadd   st(1),st
+      2 dc c9	fmul   st(1),st
+      4 dd d8	fstp   st(0)
+      2 de c1	faddp  st(1),st
+      2 de c9	fmulp  st(1),st
+     12 df e0	fnstsw ax
