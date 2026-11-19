@@ -52,9 +52,12 @@ from reprobit.project_execution import (
 from reprobit.project_loader import load_project_tree
 from reprobit.state import KeepWorkspace
 from reprobit.strict_json import canonical_json
+from reprobit.toolchain_helper_library import load_helper_library
 from reprobit.transactions import CASTransaction
+from reprobit.user_config import resolve_toolchain_root
 
 if TYPE_CHECKING:
+    from reprobit.classic.toolchain_helpers import HelperLibrary
     from reprobit.classic_runtime_preparation import ClassicProducerGraphPreparedRun
     from reprobit.schema import ProjectBundle
 
@@ -240,6 +243,27 @@ def _cold_trial(
     return ColdTrialEvidence(accepted=verified.accepted, report=verified.engine.report)
 
 
+def _helper_library_loader(
+    options: ProjectExecutionOptions,
+) -> Callable[[str], HelperLibrary | None]:
+    """Each profile's authenticated toolchain library, read once per grind.
+
+    The root is the one the probes compile with
+    (`resolve_classic_execution_inputs`), so the records pin the library the
+    producer reads when it builds them.
+    """
+
+    loaded: dict[str, HelperLibrary | None] = {}
+
+    def load(profile: str) -> HelperLibrary | None:
+        if profile not in loaded:
+            root = resolve_toolchain_root(profile, options.toolchain_root)
+            loaded[profile] = load_helper_library(root, profile)
+        return loaded[profile]
+
+    return load
+
+
 def _grind_callbacks(
     options: ProjectExecutionOptions,
 ) -> ProjectGrindCallbacks:
@@ -259,6 +283,7 @@ def _grind_callbacks(
             options,
             staged_root=staged,
         ),
+        helper_library=_helper_library_loader(options),
     )
 
 
