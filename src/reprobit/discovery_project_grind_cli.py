@@ -17,6 +17,7 @@ from reprobit.cli_paths import (
     safe_project_path,
 )
 from reprobit.discovery_grind import (
+    DonorCompileProduct,
     DonorProgress,
     ProjectGrindCallbacks,
     ProjectGrindResult,
@@ -79,7 +80,7 @@ def _campaign_callbacks(
         return callbacks
 
     seed_cache: dict[str, bytes] = {}
-    donor_cache: dict[frozenset[str], dict[str, bytes]] = {}
+    donor_cache: dict[frozenset[str], dict[str, DonorCompileProduct]] = {}
 
     def probe_seed(staged_root: Path, node_id: str) -> bytes:
         payload = seed_cache.get(node_id)
@@ -92,7 +93,7 @@ def _campaign_callbacks(
         staged_root: Path,
         donor_ids: tuple[str, ...],
         progress: DonorProgress | None,
-    ) -> dict[str, bytes]:
+    ) -> dict[str, DonorCompileProduct]:
         key = frozenset(donor_ids)
         cached = donor_cache.get(key)
         if cached is None:

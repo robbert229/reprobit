@@ -1247,9 +1247,28 @@ class _ClassicEvidenceAssembler:
                 captured=True,
                 logical_path=f".reprobit/private-donors/{donor.intervention_id}.obj",
             )
+            artifact_ids = [artifact_id]
+            if (donor.type_server_digest is None) != (donor.type_server_size is None):
+                raise ClassicProjectError("private donor type-server receipt is incomplete")
+            if donor.type_server_digest is not None and donor.type_server_size is not None:
+                # The PDB the same compile wrote: a frame-objects consumer
+                # names it as an input (a14 of `function_validation`).
+                artifact_ids.append(
+                    self._add_produced_artifact(
+                        node=node,
+                        reference=f"build/private-donors/{donor.intervention_id}.pdb",
+                        digest=donor.type_server_digest,
+                        size=donor.type_server_size,
+                        step_id=donor.step_id,
+                        inputs=inputs,
+                        captured=True,
+                        logical_path=f".reprobit/private-donors/{donor.intervention_id}.pdb",
+                    )
+                )
             witness = self.witnesses[donor.intervention_id]
-            certificate_id = self._add_certificate(witness, (artifact_id,))
-            self._attach_certificate(artifact_id, certificate_id)
+            certificate_id = self._add_certificate(witness, tuple(artifact_ids))
+            for item in artifact_ids:
+                self._attach_certificate(item, certificate_id)
 
     def _stage_artifact(
         self,

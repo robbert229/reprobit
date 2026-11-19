@@ -23,6 +23,7 @@ from reprobit.discovery_contracts import (
     DeclarationState,
 )
 from reprobit.discovery_grind import (
+    DonorCompileProduct,
     DonorProgress,
     GrindSolution,
     ProjectGrindCallbacks,
@@ -53,6 +54,10 @@ from reprobit.schema import (
     ProofDocument,
 )
 from reprobit.strict_json import canonical_json
+
+
+def _product(donor_id: str) -> DonorCompileProduct:
+    return DonorCompileProduct(donor_id.encode(), f"{donor_id}.pdb".encode())
 
 
 def _unit(identifier: str, source: str) -> ClassicTranslationUnitPlan:
@@ -200,12 +205,12 @@ def test_campaign_probe_cache_replays_progress_without_recompiling(
         root: Path,
         donor_ids: tuple[str, ...],
         progress: DonorProgress | None,
-    ) -> dict[str, bytes]:
+    ) -> dict[str, DonorCompileProduct]:
         donor_calls.append((root, donor_ids))
         if progress is not None:
             for completed, donor_id in enumerate(donor_ids, start=1):
                 progress(completed, len(donor_ids), donor_id)
-        return {donor_id: donor_id.encode() for donor_id in donor_ids}
+        return {donor_id: _product(donor_id) for donor_id in donor_ids}
 
     callbacks = project_grind_cli._campaign_callbacks(
         ProjectGrindCallbacks(
@@ -225,12 +230,12 @@ def test_campaign_probe_cache_replays_progress_without_recompiling(
         first,
         ("donor.b", "donor.a"),
         lambda *event: progress.append(event),
-    ) == {"donor.a": b"donor.a", "donor.b": b"donor.b"}
+    ) == {"donor.a": _product("donor.a"), "donor.b": _product("donor.b")}
     assert callbacks.probe_donors(
         second,
         ("donor.a", "donor.b"),
         lambda *event: progress.append(event),
-    ) == {"donor.a": b"donor.a", "donor.b": b"donor.b"}
+    ) == {"donor.a": _product("donor.a"), "donor.b": _product("donor.b")}
 
     assert seed_calls == [(first, "compiler.tu")]
     assert donor_calls == [(first, ("donor.b", "donor.a"))]

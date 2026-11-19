@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
@@ -239,13 +240,16 @@ def _install_grind_fixture(
         root: Path,
         donor_ids: tuple[str, ...],
         progress: grind.DonorProgress | None,
-    ) -> dict[str, bytes]:
+    ) -> dict[str, grind.DonorCompileProduct]:
         trace.donor_calls.append((root, donor_ids))
         assert progress is not None
         for index, donor_id in enumerate(donor_ids, start=1):
             progress(index, len(donor_ids), donor_id)
         return {
-            donor_id: f"donor object {donor_id.removeprefix('donor.')}".encode()
+            donor_id: grind.DonorCompileProduct(
+                f"donor object {donor_id.removeprefix('donor.')}".encode(),
+                f"donor pdb {donor_id.removeprefix('donor.')}".encode(),
+            )
             for donor_id in donor_ids
         }
 
@@ -948,3 +952,107 @@ def test_an_unreviewed_toolchain_library_supplies_none(
 
     assert result.solution is None
     assert received == [None]
+
+
+def test_each_donor_s_own_compile_pdb_reaches_its_rewriting(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from reprobit.discovery_authoring import DiscoveryAuthoringError
+
+    live_root, _staged_root, _trace, callbacks = _install_grind_fixture(
+        monkeypatch,
+        tmp_path,
+        live_states=(_state(1, 1), _state(2, 2)),
+        qualification_rejections=frozenset({(1, 1), (2, 2)}),
+    )
+    received: list[tuple[object, object]] = []
+
+    def rewriting(
+        *_args: object,
+        donor_object: object = None,
+        donor_type_server: object = None,
+        **_kwargs: object,
+    ) -> None:
+        received.append((donor_object, donor_type_server))
+        raise DiscoveryAuthoringError("fixture rewriting refusal")
+
+    monkeypatch.setattr(grind, "_state_rewriting", rewriting)
+
+    result = run_project_grind(live_root, callbacks=callbacks)
+
+    assert result.solution is None
+    # The object and the PDB come from the one compile: never another donor's.
+    assert received == [
+        (b"donor object 1.1", b"donor pdb 1.1"),
+        (b"donor object 2.2", b"donor pdb 2.2"),
+    ]
+
+
+@pytest.mark.parametrize("type_server", [b"", None])
+def test_a_donor_probe_without_its_compile_s_pdb_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    type_server: bytes | None,
+) -> None:
+    live_root, _staged_root, _trace, callbacks = _install_grind_fixture(
+        monkeypatch,
+        tmp_path,
+        live_states=(_state(1, 1),),
+    )
+
+    def donors(
+        root: Path, donor_ids: tuple[str, ...], progress: grind.DonorProgress | None
+    ) -> dict[str, grind.DonorCompileProduct]:
+        products = callbacks.probe_donors(root, donor_ids, progress)
+        return {
+            donor_id: grind.DonorCompileProduct(product.object_payload, cast(bytes, type_server))
+            for donor_id, product in products.items()
+        }
+
+    with pytest.raises(grind.GrindError, match="incomplete compiler result set"):
+        run_project_grind(
+            live_root,
+            callbacks=ProjectGrindCallbacks(callbacks.probe_seed, donors, callbacks.cold_verify),
+        )
+
+
+def test_the_cli_donor_probe_returns_each_compile_s_object_and_pdb(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import reprobit.discovery_grind_cli as grind_cli
+
+    closed: list[bool] = []
+
+    class Probes:
+        def probe_donor_compilers(
+            self, donor_ids: tuple[str, ...], *, progress: object
+        ) -> tuple[object, ...]:
+            del progress
+            return tuple(
+                SimpleNamespace(
+                    donor_id=donor_id,
+                    object_payload=f"{donor_id}.obj".encode(),
+                    pdb_payload=f"{donor_id}.pdb".encode(),
+                )
+                for donor_id in donor_ids
+            )
+
+    prepared = SimpleNamespace(probes=Probes(), close=lambda: closed.append(True))
+    session = tmp_path / "session"
+    session.mkdir()
+    monkeypatch.setattr(grind_cli, "_prepare_probe", lambda *_args, **_kwargs: (prepared, session))
+
+    products = grind_cli._probe_donors(
+        cast(Any, None),
+        staged_root=tmp_path,
+        donor_ids=("donor.a", "donor.b"),
+        progress=None,
+    )
+
+    assert products == {
+        "donor.a": grind.DonorCompileProduct(b"donor.a.obj", b"donor.a.pdb"),
+        "donor.b": grind.DonorCompileProduct(b"donor.b.obj", b"donor.b.pdb"),
+    }
+    assert closed == [True] and not session.exists()

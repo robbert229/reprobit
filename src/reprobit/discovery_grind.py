@@ -87,9 +87,26 @@ class ColdTrialEvidence:
     report: Report
 
 
+@dataclass(frozen=True, slots=True)
+class DonorCompileProduct:
+    """The two outputs one donor compile writes: its object and its type-server PDB.
+
+    MSVC 5.0 ``/Zi`` writes a donor's types to the PDB its ``/Fd`` names, and
+    the object's ``.debug$T`` holds only an ``LF_TYPESERVER`` record naming
+    that PDB's signature and age.  The frame-objects pass (a14 of
+    `classic.function_validation`) reads local sizes from it, so the PDB is
+    taken from the same compile as the object, never from another build.
+    """
+
+    object_payload: bytes
+    type_server: bytes
+
+
 SeedProbe = Callable[[Path, str], bytes]
 DonorProgress = Callable[[int, int, str], None]
-DonorProbe = Callable[[Path, tuple[str, ...], DonorProgress | None], Mapping[str, bytes]]
+DonorProbe = Callable[
+    [Path, tuple[str, ...], DonorProgress | None], Mapping[str, DonorCompileProduct]
+]
 ColdVerifier = Callable[[Path], ColdTrialEvidence]
 HelperLibraryLoader = Callable[[str], HelperLibrary | None]
 GrindProgress = Callable[
@@ -379,6 +396,7 @@ def _state_rewriting(
     donor_object: bytes,
     reference_object: bytes,
     helper_library: HelperLibrary | None = None,
+    donor_type_server: bytes | None = None,
 ) -> DeclarationShapeEqualBodyAuthoring:
     """Author the state's extern-run donor and a donor rewriting reaching the reference.
 
@@ -387,6 +405,9 @@ def _state_rewriting(
     no region replacement proves, a whole-function translation validation.
     ``helper_library`` is the authenticated toolchain library both proofs
     simulate compiler helpers from; without it they refuse helper calls.
+    ``donor_type_server`` is the PDB the donor's own compile wrote
+    (`DonorCompileProduct`), read only by the function validation's
+    frame-objects pass (a14).
     """
 
     _require_grind_family(state)
@@ -448,6 +469,7 @@ def _state_rewriting(
                 donor_object=donor_object,
                 reference_object=reference_object,
                 helper_library=helper_library,
+                donor_type_server=donor_type_server,
             )
         except DiscoveryAuthoringError as validation_error:
             raise DiscoveryAuthoringError(
@@ -516,6 +538,7 @@ def qualify_state(
     reference_object: bytes,
     seed_body: bool = False,
     helper_library: HelperLibrary | None = None,
+    donor_type_server: bytes | None = None,
 ) -> DeclarationShapeEqualBodyAuthoring:
     """Author one state's records and check the candidate against the reference object.
 
@@ -523,8 +546,8 @@ def qualify_state(
     (a reorder, then a region resize).  A donor that compiles the seed's own
     body (``seed_body``) can only be rewritten -- an equal-body family has
     nothing to splice -- so it goes straight to the rewriting.
-    ``helper_library`` is passed to the rewriting's proofs
-    (:func:`_state_rewriting`).
+    ``helper_library`` and ``donor_type_server`` are passed to the
+    rewriting's proofs (:func:`_state_rewriting`).
     """
 
     if seed_body:
@@ -536,6 +559,7 @@ def qualify_state(
                 donor_object=donor_object,
                 reference_object=reference_object,
                 helper_library=helper_library,
+                donor_type_server=donor_type_server,
             )
         except DiscoveryAuthoringError as rewriting_error:
             raise DiscoveryAuthoringError(
@@ -570,6 +594,7 @@ def qualify_state(
                 donor_object=donor_object,
                 reference_object=reference_object,
                 helper_library=helper_library,
+                donor_type_server=donor_type_server,
             )
         except DiscoveryAuthoringError as rewriting_error:
             raise DiscoveryAuthoringError(f"{splice_error}; rewriting: {rewriting_error}") from None
@@ -934,17 +959,25 @@ def run_project_grind(
             completed += 1
             _advance(progress, completed, total, "grind-donors", donor_id)
 
-        donor_objects = (
+        donor_products = (
             dict(callbacks.probe_donors(staged_root, donor_ids, donor_progress))
             if donor_ids
             else {}
         )
         if donor_completed != len(donor_ids):
             raise GrindError("donor compiler probe omitted completion progress")
-        if set(donor_objects) != set(donor_ids) or any(
-            type(payload) is not bytes or not payload for payload in donor_objects.values()
+        if set(donor_products) != set(donor_ids) or any(
+            type(product) is not DonorCompileProduct
+            or type(product.object_payload) is not bytes
+            or not product.object_payload
+            or type(product.type_server) is not bytes
+            or not product.type_server
+            for product in donor_products.values()
         ):
             raise GrindError("donor probe returned an incomplete compiler result set")
+        donor_objects = {
+            donor_id: product.object_payload for donor_id, product in donor_products.items()
+        }
         reference_object = context.reference_path.read_bytes()
         qualified: list[_QualifiedCandidate] = []
         original_ids = {item.id for item in context.intervention_document.interventions}
@@ -988,6 +1021,9 @@ def run_project_grind(
                     reference_object=reference_object,
                     seed_body=seed_body,
                     helper_library=helper_library(),
+                    donor_type_server=donor_products[
+                        provisional_record.intervention.id
+                    ].type_server,
                 )
                 if authored.donor.intervention.id != provisional_record.intervention.id:
                     raise GrindError("final donor identity differs from its compiler probe")
@@ -1189,6 +1225,7 @@ def run_project_grind(
 
 __all__ = [
     "ColdTrialEvidence",
+    "DonorCompileProduct",
     "GrindError",
     "GrindRejection",
     "GrindSolution",
