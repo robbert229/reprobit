@@ -78,7 +78,7 @@ def _output_payload_bytes(output: ClassicDonorProbeOutput) -> int:
     return (
         sum(len(item.payload) for item in output.rendered_inputs)
         + len(output.object_payload)
-        + len(output.pdb_payload)
+        + len(output.pdb_payload or b"")
     )
 
 
@@ -124,7 +124,11 @@ def _entry_name(epoch: str, key: ProbeSeatKey) -> str:
 
 def _encode_output(epoch: str, key: ProbeSeatKey, output: ClassicDonorProbeOutput) -> bytes | None:
     payloads = [item.payload for item in output.rendered_inputs]
-    payloads.extend((output.object_payload, output.pdb_payload))
+    payloads.append(output.object_payload)
+    if output.pdb_payload is not None:
+        payloads.append(output.pdb_payload)
+    if (output.pdb_payload is None) != (output.pdb_digest is None):
+        return None
     if _output_payload_bytes(output) > _MAX_PROBE_PAYLOAD_BYTES:
         return None
     header = {
@@ -134,8 +138,9 @@ def _encode_output(epoch: str, key: ProbeSeatKey, output: ClassicDonorProbeOutpu
         "key": list(key),
         "object_digest": output.object_digest.value,
         "object_length": len(output.object_payload),
-        "pdb_digest": output.pdb_digest.value,
-        "pdb_length": len(output.pdb_payload),
+        # Both null for a donor lane without /Zi, which writes no PDB.
+        "pdb_digest": None if output.pdb_digest is None else output.pdb_digest.value,
+        "pdb_length": None if output.pdb_payload is None else len(output.pdb_payload),
         "producer_node_id": output.producer_node_id,
         "rendered_inputs": [
             {
@@ -178,7 +183,7 @@ def _stored_length(value: object) -> int:
 
 def _payload_lengths(
     header: Mapping[str, object],
-) -> tuple[list[tuple[Mapping[str, object], int]], int, int] | None:
+) -> tuple[list[tuple[Mapping[str, object], int]], int, int | None] | None:
     rendered_value = header.get("rendered_inputs")
     if not isinstance(rendered_value, list):
         return None
@@ -198,6 +203,11 @@ def _payload_lengths(
         if object_length > _MAX_PROBE_PAYLOAD_BYTES - total:
             return None
         total += object_length
+        if header.get("pdb_length") is None:
+            # A donor lane without /Zi stores no PDB, and says so with both nulls.
+            if "pdb_length" not in header or header.get("pdb_digest", "") is not None:
+                return None
+            return rendered, object_length, None
         pdb_length = _stored_length(header.get("pdb_length"))
         if pdb_length > _MAX_PROBE_PAYLOAD_BYTES - total:
             return None
@@ -250,7 +260,7 @@ def _decode_output(
         return None
     rendered_headers, object_length, pdb_length = lengths
     expected_length = sum(length for _item, length in rendered_headers)
-    expected_length += object_length + pdb_length
+    expected_length += object_length + (pdb_length or 0)
     body = _decompress_payload(data[newline + 1 :], expected_length)
     if body is None:
         return None
@@ -272,15 +282,17 @@ def _decode_output(
             )
         object_payload = body[offset : offset + object_length]
         offset += object_length
-        pdb_payload = body[offset : offset + pdb_length]
-        offset += pdb_length
+        pdb_payload: bytes | None = None
+        pdb_digest: Digest | None = None
+        if pdb_length is not None:
+            pdb_payload = body[offset : offset + pdb_length]
+            offset += pdb_length
+            pdb_digest = Digest(value=str(header["pdb_digest"]))
         if offset != len(body):
             return None
         object_digest = Digest(value=str(header["object_digest"]))
-        pdb_digest = Digest(value=str(header["pdb_digest"]))
-        if (
-            Digest.from_bytes(object_payload) != object_digest
-            or Digest.from_bytes(pdb_payload) != pdb_digest
+        if Digest.from_bytes(object_payload) != object_digest or (
+            pdb_payload is not None and Digest.from_bytes(pdb_payload) != pdb_digest
         ):
             return None
         step = header["step"]

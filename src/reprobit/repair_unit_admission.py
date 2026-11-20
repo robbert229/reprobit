@@ -16,7 +16,11 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path, PurePosixPath
 
 from reprobit.authority_snapshot import AuthoritySnapshotError, json_authority_members
+from reprobit.classic.arguments import compile_writes_pdb
+from reprobit.classic_orchestration import compiler_source
+from reprobit.classic_project import ClassicProjectError
 from reprobit.model import Digest
+from reprobit.producer_graph import ProducerRole
 from reprobit.repair_census import RepairCensusEntry
 from reprobit.schema import (
     BuildPlanDocument,
@@ -28,6 +32,7 @@ from reprobit.schema import (
 )
 from reprobit.strict_json import canonical_json
 from reprobit.transactions import CASTransaction
+from reprobit.translation_unit_identity import translation_unit_id
 
 _SOURCE_OVERLAY_FAMILY = "source_overlay_graph"
 _SHARD_SUBDIRECTORY = "tus"
@@ -87,6 +92,22 @@ def plan_translation_unit_admissions(
     existing_units = {
         (unit.build_target.casefold(), _normalized(unit.source)) for unit in plan.translation_units
     }
+    # The debug format of each (build target, source) compile lane, which is
+    # part of a unit's identity.  A unit without a unique lane keeps the /Zi
+    # identity; the compiler-lane binding then refuses it if the lane differs.
+    lanes: dict[tuple[str, str], list[bool]] = {}
+    graph = bundle.producer_graph
+    for node in graph.nodes if graph is not None else ():
+        if node.role is not ProducerRole.COMPILER:
+            continue
+        try:
+            source = compiler_source(node)
+        except ClassicProjectError:
+            continue
+        lanes.setdefault((node.owner.casefold(), _normalized(source)), []).append(
+            compile_writes_pdb(node.arguments)
+        )
+    debug_information = {key: modes[0] for key, modes in lanes.items() if len(modes) == 1}
     admitted: dict[tuple[str, str], ClassicTranslationUnitPlan] = {}
     for entry in entries:
         if not entry.target_id or not entry.build_target:
@@ -105,17 +126,12 @@ def plan_translation_unit_admissions(
             raise TranslationUnitAdmissionError(
                 f"{entry.source} is not in the locked source manifest"
             )
-        identity = Digest.from_bytes(
-            canonical_json(
-                {
-                    "schema": 1,
-                    "target": entry.target_id,
-                    "build_target": entry.build_target,
-                    "source": manifest_entry.path,
-                }
-            )
-        ).value
-        unit_id = f"tu.{identity[:24]}"
+        unit_id = translation_unit_id(
+            target_id=entry.target_id,
+            build_target=entry.build_target,
+            source=manifest_entry.path,
+            debug_information=debug_information.get(key, True),
+        )
         if unit_id.casefold() in existing_ids:
             raise TranslationUnitAdmissionError(
                 f"admitted translation-unit identity {unit_id!r} collides with the plan"

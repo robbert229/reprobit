@@ -13,7 +13,10 @@ from reprobit.authority_snapshot import resolve_project_path
 from reprobit.cli_paths import CLIError, real_directory, relative_output, safe_project_path
 from reprobit.cmake import CMakeExportPlan
 from reprobit.cmake_configure import cmake_define_arguments, effective_source_digest
-from reprobit.cmake_import import imported_translation_unit_authority
+from reprobit.cmake_import import (
+    imported_translation_unit_authority,
+    reconciled_debug_format_units,
+)
 from reprobit.model import Digest
 from reprobit.producer_graph import (
     CMakeImportRecipe,
@@ -339,12 +342,17 @@ def record_cmake_graph(
     snapshot = _validation_snapshot(root, spec, graph_data)
     base_bundle = validate_project_files(snapshot.files)
     translation_units = None
-    if derive_translation_units:
-        from reprobit.classic_orchestration import (
-            classic_compiler_translation_unit_authority,
-        )
+    from reprobit.classic_orchestration import (
+        classic_compiler_translation_unit_authority,
+    )
 
+    if derive_translation_units:
         translation_units = imported_translation_unit_authority(root, base_bundle, graph)
+    else:
+        # A re-import keeps the plan's units, except those whose compile
+        # gained or dropped /Zi: they take their new identity, or the import
+        # refuses them if they hold records.
+        translation_units = reconciled_debug_format_units(root, base_bundle, graph)
     validation_files = dict(snapshot.files)
     preimages = dict(snapshot.preimages)
     replacement_files = {} if translation_units is None else translation_units.files
@@ -368,7 +376,10 @@ def record_cmake_graph(
                 preimages[transaction_relative] = path.read_bytes()
             else:
                 preimages[transaction_relative] = None
-        validation_files[replacement_relative] = data
+        if data is None:
+            validation_files.pop(replacement_relative, None)
+        else:
+            validation_files[replacement_relative] = data
     validated_bundle = validate_project_files(validation_files)
     if translation_units is not None:
         classic_compiler_translation_unit_authority(validated_bundle, graph)
@@ -400,6 +411,13 @@ def record_cmake_graph(
             )
     for output_relative, data in sorted(writes.items(), key=lambda item: item[0].as_posix()):
         preimage = preimages[output_relative]
+        if data is None:
+            if preimage is None:
+                raise CMakeGraphError(
+                    f"graph-validation removal has no preimage: {output_relative}"
+                )
+            transaction.delete(output_relative, expected_sha256=Digest.from_bytes(preimage).value)
+            continue
         transaction.write(
             output_relative,
             data,
@@ -420,7 +438,10 @@ def record_cmake_graph(
                 writes.items(), key=lambda item: item[0].as_posix()
             ):
                 old_data = previous[rollback_relative]
-                if old_data is None:
+                if data is None:
+                    if old_data is not None:
+                        rollback.write(rollback_relative, old_data, expected_sha256=None)
+                elif old_data is None:
                     rollback.delete(
                         rollback_relative,
                         expected_sha256=Digest.from_bytes(data).value,

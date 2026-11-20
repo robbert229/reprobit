@@ -979,7 +979,7 @@ def test_cold_rdata_authority_rejects_before_runtime_setup(
     ("variant", "message"),
     (
         ("case-drift", "must use the graph's exact object spelling"),
-        ("multiple-objects", "must publish exactly one object and one PDB"),
+        ("multiple-objects", "must publish exactly one object, and one PDB exactly when"),
         ("dependency-only", "which target 'app' does not consume"),
     ),
 )
@@ -5284,7 +5284,7 @@ def test_exact_compiler_probe_returns_raw_outputs_and_closes_runtime(
         id="compiler.program.0000",
         role=ProducerRole.COMPILER,
         owner="program",
-        arguments=("/c", "${SOURCE}/unit.cpp"),
+        arguments=("/c", "/Zi", "${SOURCE}/unit.cpp"),
         inputs=("source/unit.cpp",),
         outputs=("build/unit.obj", "build/unit.pdb"),
     )
@@ -5386,7 +5386,7 @@ def _source_epoch_probe_executor(
         id="compiler.program.0000",
         role=ProducerRole.COMPILER,
         owner="program",
-        arguments=("/c", "${SOURCE}/unit.cpp"),
+        arguments=("/c", "/Zi", "${SOURCE}/unit.cpp"),
         inputs=("source/unit.cpp",),
         outputs=("build/unit.obj", "build/unit.pdb"),
     )

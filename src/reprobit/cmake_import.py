@@ -8,10 +8,11 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
+from reprobit.classic.arguments import compile_writes_pdb
 from reprobit.cli_output import human_command
 from reprobit.cli_paths import CLIError, relative_output, safe_project_path
 from reprobit.model import Digest
-from reprobit.producer_graph import ProducerGraphDocument, ProducerRole
+from reprobit.producer_graph import ProducerGraphDocument, ProducerNode, ProducerRole
 from reprobit.schema import (
     BuildPlanDocument,
     ClassicTargetGate,
@@ -28,6 +29,7 @@ from reprobit.schema import (
 from reprobit.secure_paths import digest_relative_file, read_relative_file
 from reprobit.strict_json import canonical_json
 from reprobit.transactions import CASTransaction
+from reprobit.translation_unit_identity import translation_unit_id
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,9 +42,13 @@ class CMakeScaffold:
 
 @dataclass(frozen=True, slots=True)
 class ImportedTranslationUnits:
-    """Candidate authority derived from unambiguous compiler graph lanes."""
+    """Candidate authority derived from unambiguous compiler graph lanes.
 
-    files: dict[PurePosixPath, bytes]
+    ``files`` maps each project-relative path to its new bytes, or to None
+    for a shard the import removes (`reconciled_debug_format_units`).
+    """
+
+    files: dict[PurePosixPath, bytes | None]
     planned: int
     skipped: int
 
@@ -318,19 +324,14 @@ def imported_translation_unit_authority(
             skipped += 1
             continue
         target_id = next(iter(targets))
-        identity_digest = Digest.from_bytes(
-            canonical_json(
-                {
-                    "schema": 1,
-                    "target": target_id,
-                    "build_target": node.owner,
-                    "source": entry.path,
-                }
-            )
-        ).value
         units.append(
             ClassicTranslationUnitPlan(
-                id=f"tu.{identity_digest[:24]}",
+                id=translation_unit_id(
+                    target_id=target_id,
+                    build_target=node.owner,
+                    source=entry.path,
+                    debug_information=compile_writes_pdb(node.arguments),
+                ),
                 target_id=target_id,
                 build_target=node.owner,
                 source=entry.path,
@@ -345,7 +346,7 @@ def imported_translation_unit_authority(
     plan_data["translation_units"] = tuple(units)
     updated_plan = BuildPlanDocument.model_validate(plan_data)
     plan_relative = PurePosixPath(bundle.spec.layout.build_plan.replace("\\", "/"))
-    files: dict[PurePosixPath, bytes] = {plan_relative: canonical_json(updated_plan)}
+    files: dict[PurePosixPath, bytes | None] = {plan_relative: canonical_json(updated_plan)}
     for unit in units:
         intervention = PurePosixPath(bundle.spec.layout.interventions) / f"{unit.id}.json"
         proof = PurePosixPath(bundle.spec.layout.proofs) / f"{unit.id}.json"
@@ -376,11 +377,141 @@ def imported_translation_unit_authority(
     return ImportedTranslationUnits(files, len(units), skipped)
 
 
+def reconciled_debug_format_units(
+    root: Path,
+    bundle: ProjectBundle,
+    graph: ProducerGraphDocument,
+) -> ImportedTranslationUnits | None:
+    """Re-key planned units whose compile gained or dropped ``/Zi``.
+
+    The debug format is part of a unit's identity (`translation_unit_id`):
+    records made by observing a ``/Zi`` compile describe objects a compile
+    without it never writes, and the reverse.  A re-import that changes a
+    unit's debug format therefore gives the unit its new identity.  A unit
+    with no records -- an empty intervention shard and an empty proof shard
+    -- is re-keyed: its plan entry and both shards move to the new id.  A
+    unit that holds records is refused, naming each one, so its records are
+    re-derived for the new compile and never silently reused.  None when no
+    planned unit changed its debug format.
+    """
+
+    from reprobit.classic_orchestration import (
+        compiler_source,
+        translation_unit_debug_format_mismatch,
+    )
+    from reprobit.classic_project import ClassicProjectError
+
+    plan = bundle.build_plan
+    if plan is None or not plan.translation_units:
+        return None
+    lanes: dict[tuple[str, str], list[ProducerNode]] = {}
+    for node in graph.nodes:
+        if node.role is not ProducerRole.COMPILER:
+            continue
+        try:
+            source = compiler_source(node)
+        except ClassicProjectError:
+            continue
+        lanes.setdefault((node.owner.casefold(), source.casefold()), []).append(node)
+    changed: dict[str, tuple[ClassicTranslationUnitPlan, str]] = {}
+    for unit in plan.translation_units:
+        matches = lanes.get((unit.build_target.casefold(), unit.source.casefold()), [])
+        # A unit without one lane is the compiler-lane binding's to refuse.
+        if len(matches) != 1 or not translation_unit_debug_format_mismatch(unit, matches[0]):
+            continue
+        debug_information = compile_writes_pdb(matches[0].arguments)
+        new_id = translation_unit_id(
+            target_id=unit.target_id,
+            build_target=unit.build_target,
+            source=unit.source,
+            debug_information=debug_information,
+        )
+        changed[unit.id] = (unit, new_id)
+    if not changed:
+        return None
+
+    shards: dict[str, dict[str, tuple[PurePosixPath, bytes]]] = {}
+    for kind, directory in (
+        ("intervention", bundle.spec.layout.interventions),
+        ("proof", bundle.spec.layout.proofs),
+    ):
+        for path in json_authority_paths(root, directory):
+            payload = path.read_bytes()
+            document = (
+                InterventionDocument if kind == "intervention" else ProofDocument
+            ).model_validate_json(payload)
+            unit_id = document.translation_unit_id
+            if unit_id in changed:
+                relative = PurePosixPath(path.relative_to(root).as_posix())
+                if kind in shards.setdefault(unit_id, {}):
+                    raise CLIError(f"translation unit {unit_id!r} has two {kind} shards")
+                shards[unit_id][kind] = (relative, payload)
+
+    held: list[str] = []
+    for unit_id, (unit, _new_id) in sorted(changed.items()):
+        found = shards.get(unit_id, {})
+        if set(found) != {"intervention", "proof"}:
+            raise CLIError(f"translation unit {unit_id!r} lacks its intervention or proof shard")
+        intervention = InterventionDocument.model_validate_json(found["intervention"][1])
+        proof = ProofDocument.model_validate_json(found["proof"][1])
+        if intervention.interventions or proof.expected_observations:
+            held.append(f"{unit_id} ({unit.build_target}/{unit.source})")
+    if held:
+        raise CLIError(
+            "the imported compile commands change the debug format (/Zi) of translation "
+            "units that hold records, and records made for one debug format are never "
+            "reused for the other: " + ", ".join(held) + ".  Clear these units' records "
+            "(their interventions and expected observations), import again, and re-derive "
+            "them for the new compile"
+        )
+
+    known = {item.id.casefold() for item in plan.translation_units} - {
+        item.casefold() for item in changed
+    }
+    files: dict[PurePosixPath, bytes | None] = {}
+    for unit_id, (_unit, new_id) in sorted(changed.items()):
+        if new_id.casefold() in known:
+            raise CLIError(f"re-keyed translation-unit identity {new_id!r} collides with the plan")
+        known.add(new_id.casefold())
+        for kind, (relative, payload) in sorted(shards[unit_id].items()):
+            if unit_id not in relative.name:
+                raise CLIError(f"{kind} shard {relative.as_posix()!r} is not named by its unit")
+            new_relative = relative.with_name(relative.name.replace(unit_id, new_id))
+            if os.path.lexists(safe_project_path(root, new_relative.as_posix())):
+                raise CLIError(
+                    "CMake import will not replace an existing TU authority file: "
+                    f"{new_relative.as_posix()}"
+                )
+            document = (
+                InterventionDocument if kind == "intervention" else ProofDocument
+            ).model_validate_json(payload)
+            files[relative] = None
+            files[new_relative] = canonical_json(
+                document.model_copy(update={"translation_unit_id": new_id})
+            )
+    units = tuple(
+        sorted(
+            (
+                unit.model_copy(update={"id": changed[unit.id][1]}) if unit.id in changed else unit
+                for unit in plan.translation_units
+            ),
+            key=lambda item: (item.id.casefold(), item.id),
+        )
+    )
+    plan_data = plan.model_dump(mode="python")
+    plan_data["translation_units"] = units
+    updated_plan = BuildPlanDocument.model_validate(plan_data)
+    plan_relative = PurePosixPath(bundle.spec.layout.build_plan.replace("\\", "/"))
+    files[plan_relative] = canonical_json(updated_plan)
+    return ImportedTranslationUnits(files, len(units), 0)
+
+
 __all__ = [
     "CMakeScaffold",
     "ImportedTranslationUnits",
     "imported_translation_unit_authority",
     "json_authority_paths",
+    "reconciled_debug_format_units",
     "rollback_cmake_scaffold",
     "scaffold_cmake_authority",
 ]

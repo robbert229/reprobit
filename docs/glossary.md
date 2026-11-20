@@ -66,8 +66,13 @@ narrative and [cli.md](cli.md) for the commands.
   is compared with the reference; the last node of the producer graph.
   (see [project-format.md](project-format.md), `reprobit.model.Artifact`)
 - **translation unit**: one compiler invocation on one source file. Records
-  address translation units by a stable `tu.<hash>` identifier. (see
-  [cli.md](cli.md#rbit-repair), `reprobit.schema`)
+  address translation units by a stable `tu.<hash>` identifier. The hash
+  covers the target, the CMake target, the source and whether the compile has
+  debug information (`/Zi`). A compile without `/Zi` writes no PDB and no
+  CodeView sections, so records made for one debug format are never reused for
+  the other. A re-import gives a unit whose compile gained or dropped `/Zi` its
+  new identity, or refuses the unit if it holds records. (see
+  [cli.md](cli.md#rbit-repair), `reprobit.translation_unit_identity`)
 
 ## Interventions and proofs
 
