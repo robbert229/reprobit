@@ -18,7 +18,14 @@ from reprobit.authority_snapshot import (
     JsonAuthorityDirectorySnapshot,
     assert_json_authority_unchanged,
 )
-from reprobit.classic_donors import generate_declaration_shape, generate_extern_run
+from reprobit.classic_donors import (
+    EXTERN_SUFFIX_PLACEMENT,
+    DonorSourceError,
+    generate_declaration_shape,
+    generate_extern_run,
+    merge_candidate_constraints,
+    validate_donor_recipe,
+)
 from reprobit.costs import calculate_cost
 from reprobit.discovery_authoring import (
     AuthoredClassicRecord,
@@ -62,6 +69,11 @@ from reprobit.schema import (
 )
 from reprobit.staged_project import ProjectFileSnapshot
 from reprobit.strict_json import canonical_json
+from reprobit.suffix_run_effect import (
+    SuffixRunEffectError,
+    require_suffix_run_effect,
+    suffix_run_changed_functions,
+)
 from reprobit.transactions import CASTransaction
 
 
@@ -245,8 +257,75 @@ def _state_digest(state: DeclarationState, context: ProjectGrindContext) -> tupl
     return Digest.from_bytes(generated).value, _header_placement(context)
 
 
-def _state_donor(state: DeclarationState, context: ProjectGrindContext) -> AuthoredClassicRecord:
-    """The payload-free donor record one grind state compiles."""
+def _suffix_placement(context: ProjectGrindContext) -> bool:
+    return _header_placement(context) == EXTERN_SUFFIX_PLACEMENT
+
+
+def _stated_changes(
+    context: ProjectGrindContext, changed_functions: tuple[str, ...] | None
+) -> tuple[str, ...] | None:
+    """The changed functions a state's donor states: a suffix run's, else none.
+
+    A suffix run's probe donor states none changed until its compile is
+    measured (:func:`measured_changed_functions`).
+    """
+
+    if not _suffix_placement(context):
+        if changed_functions is not None:
+            raise GrindError("only a suffix extern run states the functions it changes")
+        return None
+    return () if changed_functions is None else changed_functions
+
+
+def measured_changed_functions(
+    record: AuthoredClassicRecord, *, seed_object: bytes, donor_object: bytes
+) -> tuple[str, ...]:
+    """The functions a suffix run's fresh donor compiles differently from the seed.
+
+    The donor's run must name no symbol of its object (it adds no code or
+    data); an object that cannot be read function by function is refused
+    (`reprobit.suffix_run_effect`).
+    """
+
+    try:
+        validation = validate_donor_recipe(
+            record.intervention, merge_candidate_constraints(record.intervention, record.receipt)
+        )
+        changed = suffix_run_changed_functions(seed_object, donor_object)
+        require_suffix_run_effect(
+            seed_object,
+            donor_object,
+            changed_functions=changed,
+            carrier_identifiers=validation.carrier_identifiers,
+        )
+    except (DonorSourceError, SuffixRunEffectError) as exc:
+        raise DiscoveryAuthoringError(f"the suffix run's effect cannot be stated: {exc}") from exc
+    return changed
+
+
+def _compiler_seat(record: AuthoredClassicRecord) -> str:
+    """The compiler seat a donor record compiles in, from the orchestrator's validator."""
+
+    try:
+        validation = validate_donor_recipe(
+            record.intervention, merge_candidate_constraints(record.intervention, record.receipt)
+        )
+    except DonorSourceError as exc:
+        raise DiscoveryAuthoringError(f"invalid donor {record.intervention.id!r}: {exc}") from exc
+    return validation.compiler_seat.casefold()
+
+
+def _state_donor(
+    state: DeclarationState,
+    context: ProjectGrindContext,
+    *,
+    changed_functions: tuple[str, ...] | None = None,
+) -> AuthoredClassicRecord:
+    """The payload-free donor record one grind state compiles.
+
+    ``changed_functions`` is a suffix run's statement (none before its
+    compile is measured).
+    """
 
     _require_grind_family(state)
     unit = context.unit
@@ -270,6 +349,7 @@ def _state_donor(state: DeclarationState, context: ProjectGrindContext) -> Autho
         seat_count=run.seat_count,
         width=run.width,
         header_placement=_header_placement(context),
+        changed_functions=_stated_changes(context, changed_functions),
     )
 
 
@@ -279,8 +359,13 @@ def _state_equal_body(
     *,
     seed_object: bytes,
     donor_object: bytes,
+    changed_functions: tuple[str, ...] | None = None,
 ) -> DeclarationShapeEqualBodyAuthoring:
-    """Author the state's donor, naming the symbol, and its strict equal-body consumer."""
+    """Author the state's donor, naming the symbol, and its strict equal-body consumer.
+
+    ``changed_functions`` is a suffix run's measured statement
+    (:func:`measured_changed_functions`).
+    """
 
     _require_grind_family(state)
     unit = context.unit
@@ -308,6 +393,7 @@ def _state_equal_body(
         width=run.width,
         beneficiary_symbols=(context.symbol,),
         header_placement=_header_placement(context),
+        changed_functions=_stated_changes(context, changed_functions),
     )
     try:
         return build_donor_equal_body(
@@ -636,13 +722,27 @@ def run_project_grind(
             state_id = declaration_state_id(state)
             rejected = False
             try:
+                donor_object = donor_objects[provisional_record.intervention.id]
+                # A suffix run states the functions its compile changes; the
+                # final donor is the probe's with that measured statement.
+                changed_functions: tuple[str, ...] | None = None
+                expected_donor_id = provisional_record.intervention.id
+                if state.family is DeclarationFamily.EXTERN_RUN_PAIR and _suffix_placement(context):
+                    changed_functions = measured_changed_functions(
+                        provisional_record, seed_object=seed_object, donor_object=donor_object
+                    )
+                    measured = _state_donor(state, context, changed_functions=changed_functions)
+                    if _compiler_seat(measured) != _compiler_seat(provisional_record):
+                        raise GrindError("a suffix run's statement moved its compiler seat")
+                    expected_donor_id = measured.intervention.id
                 authored = _state_equal_body(
                     state,
                     context,
                     seed_object=seed_object,
-                    donor_object=donor_objects[provisional_record.intervention.id],
+                    donor_object=donor_object,
+                    changed_functions=changed_functions,
                 )
-                if authored.donor.intervention.id != provisional_record.intervention.id:
+                if authored.donor.intervention.id != expected_donor_id:
                     raise GrindError("final donor identity differs from its compiler probe")
                 qualify_msvc_reference_object(
                     reference_object=reference_object,

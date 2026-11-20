@@ -230,19 +230,23 @@ def test_grind_plan_names_exactly_one_search(search: dict[str, object]) -> None:
         ProjectGrindPlan.model_validate(_grind_plan_fields(**search))
 
 
-def test_grind_plan_extern_runs_default_after_includes_and_admit_prefix() -> None:
+def test_grind_plan_extern_runs_default_after_includes_and_admit_prefix_and_suffix() -> None:
     default = ProjectGrindPlan.model_validate(
         _grind_plan_fields(extern_runs={"counts": {"start": 1, "stop": 2}})
     )
     prefix = ProjectGrindPlan.model_validate(
         _grind_plan_fields(extern_runs={"counts": {"start": 1, "stop": 2}, "placement": "prefix"})
     )
+    suffix = ProjectGrindPlan.model_validate(
+        _grind_plan_fields(extern_runs={"counts": {"start": 1, "stop": 2}, "placement": "suffix"})
+    )
 
     assert default.extern_runs is not None and default.extern_runs.placement == "after_includes"
     assert prefix.extern_runs is not None and prefix.extern_runs.placement == "prefix"
+    assert suffix.extern_runs is not None and suffix.extern_runs.placement == "suffix"
     with pytest.raises(ValidationError):
         ProjectGrindPlan.model_validate(
             _grind_plan_fields(
-                extern_runs={"counts": {"start": 1, "stop": 2}, "placement": "suffix"}
+                extern_runs={"counts": {"start": 1, "stop": 2}, "placement": "force_include"}
             )
         )

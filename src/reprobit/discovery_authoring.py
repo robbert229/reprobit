@@ -406,14 +406,19 @@ def build_extern_run_donor(
     width: int,
     beneficiary_symbols: tuple[str, ...] = (),
     header_placement: str = "after_includes",
+    changed_functions: tuple[str, ...] | None = None,
 ) -> AuthoredClassicRecord:
     """Build one deterministic, payload-free extern-run donor record without a role policy.
 
-    The header run is seated after the translation unit's final include, or
-    at the unit's start with ``header_placement="prefix"`` (for a unit that
-    includes again after the functions it targets), and the seat run at
-    physical EOF; either count may be zero but not both.  The record carries
-    no ``role_policy``, so any equal-body consumer may host on it.  The default
+    The header run is seated after the translation unit's final include, at
+    the unit's start with ``header_placement="prefix"`` (for a unit that
+    includes again after the functions it targets), or after the unit's final
+    line with ``header_placement="suffix"``, and the seat run at physical EOF;
+    either count may be zero but not both.  A suffix run states the functions
+    whose code it changes (``changed_functions``, required with it and only
+    with it); the build checks every other function of the unit compiles as
+    without the run (`reprobit.suffix_run_effect`).  The record carries no
+    ``role_policy``, so any equal-body consumer may host on it.  The default
     placement is left out of the parameters, so existing records keep their ids.
     """
 
@@ -439,6 +444,12 @@ def build_extern_run_donor(
         }
         if header_placement != "after_includes":
             parameters["header_placement"] = header_placement
+        if (changed_functions is not None) != (header_placement == "suffix"):
+            raise DiscoveryAuthoringError(
+                "an extern run states changed_functions exactly when its header run is a suffix"
+            )
+        if changed_functions is not None:
+            parameters["changed_functions"] = list[JsonValue](sorted(set(changed_functions)))
         intervention_id = _stable_id(
             "donor",
             {
