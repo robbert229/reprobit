@@ -381,6 +381,46 @@ obeys the same rule whenever it uses it.  The replacement's accesses that
 are not at a constant offset from ESP0 are the donor's (5c compares the
 footprints path by path), and its constant-offset accesses are classified
 by the same extents, so the two versions agree on which bytes are memory.
+(a15) Moved frame objects, for the moved-objects pass only (below): when the
+address of a frame object escapes, the function and every callee use it only
+to reach the object's bytes -- they dereference it, add to it an offset that
+stays within the object (or one past its end), and pass it on or store it
+where a callee may read it -- and never observe its numeric value: no code
+compares it with another pointer or an integer, subtracts it from a pointer
+into another object, converts it to an integer that reaches arithmetic, a
+branch or output (``printf``'s ``%p``), hashes it, or uses a copy of it after
+the object's lifetime ends; and no code's behaviour depends on a byte of the
+object that nothing has written since its lifetime began.  Then two versions
+that keep corresponding objects at different offsets of their frames, with
+equal extents, and hand out addresses at equal offsets into them, behave the
+same provided the objects' contents correspond: every access through such an
+address, a callee's included, is the same access relative to the object's
+start (a14 bounds it to the object), so it reads and writes corresponding
+bytes, and nothing else about the address can reach a result.  Most of this
+is ISO C's: on a pointer into an object, dereference, adding an integer
+within it, subtracting or relationally comparing two pointers into it, and
+an equality test with a null pointer give results that do not depend on
+where the object lies (C90 6.3.6, 6.3.8, 6.3.9; C99 6.5.6, 6.5.8, 6.5.9);
+subtracting or relationally comparing pointers into different objects is
+undefined (C99 6.5.6p9, 6.5.8p5); a pointer to an object whose lifetime has
+ended is indeterminate (C99 6.2.4p2); and using an automatic object's value
+while it is indeterminate is undefined (C90 6.5.7, C99 6.7.8p10 and J.2).
+The donor is compiled C, and the replacement's operations are the donor's
+(the proof shows they compute equal terms).  What a15 adds to C is: no
+conversion of the address to an integer (implementation-defined, C99
+6.3.2.3p6) reaches anything observable; no equality test meets a pointer one
+past an object's end with a pointer to an object that happens to follow it
+(C99 6.5.9p6; the pass refuses a pointer at such a boundary unless the
+replacement keeps the two objects together); and no character-typed read of
+bytes never written (a struct's padding, the unused tail of a buffer, copied
+whole -- unspecified in C, not undefined) reaches output.  On the callee's
+side it is an assumption about callees, as the calling convention every
+call event relies on is: the proof never sees a callee's code, only that
+both versions pass it equal terms.  On the function's side the proof checks
+every use it can see (the moved-objects pass, below); a copy of the address
+that comes back through a callee's result or through memory a callee wrote
+is a value the proof cannot follow, and what the function does with it is
+covered by a15 as a statement about the donor's C.
 No other assumption is made: the relation is inferred, nothing about the
 replacement is believed, and the simulator's term model is exact.
 
@@ -462,7 +502,77 @@ private frame whose escaping objects are memory.
 
 A record this pass made pins ``frame_objects`` (the escaping objects'
 starts and sizes) and ``assumptions: ["a14"]``; records of the earlier
-passes pin neither.  The build re-derives the extents from the donor it
+passes pin neither.
+
+The moved-objects pass (a15).  Only when the frame-objects pass refuses, the
+same pass runs again letting the replacement keep an escaping object at
+another start (`prove_function`'s ``moved_objects``).
+
+- The pairing.  An object pair is the donor's object, at its start s1, and
+  the replacement's at s2, with the donor's extent n: the replacement's
+  object is [ESP0 + s2, ESP0 + s2 + n) by definition (no record of its own
+  locals is read), and its address is the same atom ``("fobj", s1, n)`` as
+  the donor's, so a pointer of each version at offset j into its object is
+  one term: passed pointers are related exactly when they point into paired
+  objects at equal offsets, and the memory reachable through them (the
+  object's bytes) is compared object-wise, in the store log, the footprint
+  and the call and block events, as a14 compares it.  Objects the
+  replacement keeps at the donor's start are related by equality as in a14.
+  The replacement's layout (`FrameFacts.layout`) is the moved objects at
+  their s2 and every other object at its start unless a moved one occupies
+  its bytes there.  Every other byte below E is a private slot of each
+  version, at that version's offsets, as before; leftover stores of the
+  dead frame keep the existing rules.
+- Finding s2.  Nothing about the replacement is believed, so the moves are
+  measured, not declared: a run starts with none, and the replacement's
+  stack address that lies in no escaping object it keeps is left unresolved
+  (``("pstk", k)``), as is its read of a private slot that holds no value
+  (bytes of an object it keeps where the run knows none yet); where a
+  refused pair of paths holds the donor's object
+  atom plus c and the replacement, at the same place in an event, a store
+  or a returned register, an unresolved address or another object's atom
+  plus c', the replacement keeps the object at k + c' - c
+  (`_move_proposals`).  The pass runs again with it (`ObjectMove`); a move
+  once taken is never changed, so the runs settle.  When a run refuses with
+  no suggestion, a probe run that also leaves unresolved the replacement's
+  constant-offset accesses to bytes where the donor keeps an escaping object
+  the replacement keeps elsewhere may suggest one.  A run that proves with
+  an address still unresolved is refused: its object, and so its extent,
+  cannot be determined.  Only the donor's addresses make objects escape.
+- What the function may do with a moved object's address (`pointer_form`,
+  checked after every instruction, on every stored value and at every
+  return): dereference it (a load, store, block move or scan through it);
+  add a constant inside the object (a14's bound) or a variable index (a14
+  places the donor's access inside the object, and the replacement's is the
+  same term); subtract another pointer into the same object (the atoms
+  cancel to a constant, which does not depend on where the object lies);
+  keep it in a register or a private slot, carry it across joins; pass it
+  to a call; store it into an escaping object or into memory a callee may
+  read.
+- Refused, each a numeric use or a leftover the proof would compare
+  wrongly: a branch, ``setcc`` or ``adc``/``sbb`` that reads it (a
+  pointer compare); a coefficient other than 1, or two objects'
+  addresses in one value (a subtraction of pointers into different objects,
+  a negation, a scaling); any opaque operation on it (a mask, a shift, a
+  product, a narrow part, an x87 conversion: an integer cast reaching
+  arithmetic); a string instruction's count or value; a call through it; a
+  load one of whose possibly-reaching stores holds it, unless the store
+  supplies the load whole (a copy through memory the proof cannot follow);
+  at a return, a returned register, x87 register or surviving store holding
+  it (a dangling pointer that would differ); on the path from the entry
+  before any call or block event, a load of the object's bytes that no store
+  wrote (they hold different stack bytes in the two versions); and among
+  the moves: a parameter moved, an object placed outside the replacement's
+  locals block [B, ESP0), two moved objects overlapping there (their places
+  cannot hold the donor's extents: the objects have different extents), and
+  a donor pointer at a boundary between objects (a14's one-past-the-end
+  case) that the replacement keeps at different distances, which a callee
+  could use to reach different bytes.
+
+A record this pass made with a moved object pins ``moved_frame_objects``
+(each [s1, s2]) and ``assumptions: ["a14", "a15"]``; one that moved nothing
+pins what the frame-objects pass pins, and records of every earlier pass
+keep their pins.  The build re-derives the extents from the donor it
 compiles and the PDB that compile wrote (`classic_project.
 ClassicDispatchMaterials.donor_type_server`).
 
@@ -480,10 +590,9 @@ reassociated.  In a shared frame (a stack address escapes) every frame byte
 is still memory, compared exactly, even a slot whose address is never
 taken; only the frame-objects pass, under a14 and the extents the donor's
 debug records and type server give, relates such slots.  An escaping object
-the replacement keeps at another offset is refused: relating two addresses
-of one object would need a callee never to observe a pointer's value (only
-its object and offset), and the memory a function leaves could then hold
-different dangling pointers to its dead frame.  ESP is part of every call
+the replacement keeps at another offset is related only by the
+moved-objects pass, under a15; a dangling pointer to it that the function
+leaves is refused, one a callee keeps is a15's.  ESP is part of every call
 event, so two frames of different sizes make different calls.  And EAX is
 compared at every return: no type in the object says a function is void (its
 S_GPROC32 names a type in the PDB type server), and a caller's use of EAX
@@ -492,7 +601,9 @@ would be a whole-program fact.
 
 from __future__ import annotations
 
+import functools
 import hashlib
+import itertools
 from collections import Counter
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
@@ -582,6 +693,20 @@ class ObjectEscape(ByteIdentityError):
         self.starts = frozenset(starts)
 
 
+class ObjectMove(ByteIdentityError):
+    """The replacement keeps escaping frame objects at other offsets (a15).
+
+    ``moves`` maps each object's start in the donor to the start a run's
+    pair of paths suggests for it in the replacement; the moved-objects pass
+    runs again with them (`prove_function`).  A suggestion is only a guess:
+    the run it leads to proves or refuses as any other.
+    """
+
+    def __init__(self, message: str, moves: Mapping[int, int]) -> None:
+        super().__init__(message)
+        self.moves = dict(moves)
+
+
 class UncarriedSlot(ByteIdentityError):
     """A read of a private slot this version wrote, whose value the relation lost.
 
@@ -615,6 +740,67 @@ def _frame_object_terms(term: Term) -> list[tuple[Term, int]]:
         for atom, coefficient in term[2]
         if isinstance(atom, tuple) and atom and atom[0] == "fobj"
     ]
+
+
+# The atom of a stack address of the replacement that the moved-objects pass
+# (a15) has not yet attributed to an object: ``("pstk", k)`` for ESP0 + k.
+# A run that keeps one is refused; only its comparison suggests moves.
+_UNRESOLVED = "pstk"
+# Terms whose value is read through an address, not computed from it: a
+# load (`region_simulation._load`) and the raw call and block events.
+_DEREFERENCES = frozenset({"ld", "call", "rep"})
+
+
+def observes_moved(term: Term, moved: frozenset[Term]) -> bool:
+    """Whether a value is computed from a moved frame object's address (a15).
+
+    The address may be the operand of an operation whose result the value
+    is, but not only the address of a load or an event's argument: a load
+    reads the object's bytes, which correspond in the two versions, and an
+    argument passes the pointer on.
+    """
+    if not moved:
+        return False
+    stack = [term]
+    seen: set[int] = set()
+    while stack:
+        current = stack.pop()
+        if isinstance(current, (tuple, list, frozenset, set)):
+            if id(current) in seen:
+                continue
+            seen.add(id(current))
+            if isinstance(current, tuple):
+                if current in moved:
+                    return True
+                if current and current[0] in _DEREFERENCES:
+                    continue
+            stack.extend(item for item in current if not isinstance(item, (str, int)))
+    return False
+
+
+def pointer_form(term: Term, moved: frozenset[Term]) -> bool:
+    """Whether a value uses moved frame objects' addresses only as one pointer (a15).
+
+    A 32-bit linear term may hold one moved object's atom with coefficient 1
+    plus a constant and other terms that do not observe one: the object's
+    address plus an offset (an index, a field).  Every other appearance --
+    a coefficient other than 1, two objects' atoms, a narrow part, the
+    operand of any opaque operation (a compare's flags, a mask, a shift, a
+    product, an x87 conversion) -- observes the address's numeric value.
+    """
+    if not moved:
+        return True
+    if term[0] != "lin":
+        return not observes_moved(term, moved)
+    count = 0
+    for atom, coefficient in term[2]:
+        if atom in moved:
+            count += 1
+            if _signed(coefficient) != 1:
+                return False
+        elif observes_moved(atom, moved):
+            return False
+    return count <= 1
 
 
 def computed_from_frame_object(term: Term) -> bool:
@@ -766,10 +952,69 @@ class FrameFacts:
     # Whether partial slot relations run: then every byte's writes are
     # tracked (``FrameModel.dirty``), the locals' in every pass.
     partial: bool = False
+    # The moved-objects pass (a15): the replacement may keep an escaping
+    # object at another start.  ``moves`` pairs the donor's start of each
+    # such object with the replacement's, sorted; ``moving`` lets a run
+    # suggest moves (`ObjectMove`) and leaves a replacement address that no
+    # escaping object holds unresolved instead of escaping; ``probe`` also
+    # leaves unresolved the replacement's constant-offset accesses to bytes
+    # where the donor keeps an escaping object the replacement does not
+    # (a run that only suggests moves).
+    moving: bool = False
+    moves: tuple[tuple[int, int], ...] = ()
+    probe: bool = False
 
     def tracks(self, byte: int) -> bool:
         """Whether ``FrameModel.dirty`` records writes to the byte at ESP0 + byte."""
         return byte >= 0 or self.equivalences or self.partial
+
+    def layout(self, side: str) -> tuple[tuple[FrameObject, int], ...]:
+        """Each frame object one version keeps, with its start there (a14, a15).
+
+        The donor's are its declared objects at their starts.  The
+        replacement keeps a moved object at its start in ``moves`` and every
+        other object at the donor's start, except one whose bytes a moved
+        object occupies there (`_image_layout`).
+        """
+        objects = cast(FrameObjects, self.frame_objects)
+        if side != "P" or not self.moves:
+            return tuple((item, item.start) for item in objects.objects)
+        return _image_layout(objects, self.moves)
+
+    def image_start(self, start: int) -> int:
+        """The replacement's start of the object the donor keeps at ESP0 + start."""
+        return dict(self.moves).get(start, start)
+
+    def moved_atoms(self) -> frozenset[Term]:
+        """The atoms of the objects the two versions keep at different starts (a15)."""
+        if self.frame_objects is None or not self.moves:
+            return frozenset()
+        moved = {start for start, image in self.moves if image != start}
+        return frozenset(
+            frame_object_atom(item) for item in self.frame_objects.objects if item.start in moved
+        )
+
+
+@functools.lru_cache(maxsize=256)
+def _image_layout(
+    objects: FrameObjects, moves: tuple[tuple[int, int], ...]
+) -> tuple[tuple[FrameObject, int], ...]:
+    """The replacement's frame objects under ``moves`` (a15), sorted by start.
+
+    A moved object lies at its new start with the donor's size; an object
+    the donor keeps where a moved one now lies is not kept there (the
+    replacement's address of it, if any, is unresolved, so the pass refuses
+    or suggests where it lies); every other object stays at its start.
+    """
+    moved = dict(moves)
+    placed = [(item, moved[item.start]) for item in objects.objects if item.start in moved]
+    kept = [
+        (item, item.start)
+        for item in objects.objects
+        if item.start not in moved
+        and not any(start < item.end and item.start < start + other.size for other, start in placed)
+    ]
+    return tuple(sorted(placed + kept, key=lambda pair: pair[1]))
 
 
 _IMAGE_SCN_LNK_COMDAT = 0x1000
@@ -863,12 +1108,18 @@ class FrameModel:
         # Pointers a block string operation left, each with the constant k
         # such that the pointer lies at or above ESP0 + k (`block_end`).
         self.block_floors: dict[Term, int] = {}
+        # The moved-objects pass (a15): the atoms of the objects the two
+        # versions keep at different starts, and the replacement's stack
+        # addresses (ESP0 + k) this path left unresolved.
+        self.moved = facts.moved_atoms()
+        self.unresolved: set[int] = set()
 
     def fork(self) -> FrameModel:
         forked = FrameModel(
             self.facts, self.slots, self.dirty, self.context, self.cc_sites, self.side
         )
         forked.block_floors = dict(self.block_floors)
+        forked.unresolved = set(self.unresolved)
         return forked
 
     def block_start(self, state: PathState, pointer: Term, context: str) -> None:
@@ -972,31 +1223,63 @@ class FrameModel:
             offset + width <= self.facts.params_end,
             f"{self.context}: a stack access straddles the end of the parameter words",
         )
-        return self._escaping_object(offset, width) is None
+        return self._object_address(offset, width) is None
 
-    def _escaping_object(self, offset: int, width: int) -> FrameObject | None:
-        """The escaping frame object an access at ESP0 + offset lies in (a14), or None.
+    def _escaping_object(self, offset: int, width: int) -> tuple[FrameObject, int] | None:
+        """The escaping frame object an access at ESP0 + offset lies in, and its start (a14).
 
-        An access that lies partly inside an escaping object is refused: its
-        bytes would be both memory and a private slot.
+        The start is this version's (`FrameFacts.layout`: the replacement's
+        start of a moved object, a15).  An access that lies partly inside an
+        escaping object is refused: its bytes would be both memory and a
+        private slot.
         """
-        objects = self.facts.frame_objects
-        if objects is None:
+        if self.facts.frame_objects is None:
             return None
-        for item in objects.objects:
+        for item, start in self.facts.layout(self.side):
             if (
                 item.start in self.facts.escaping
-                and item.start < offset + width
-                and offset < item.end
+                and start < offset + width
+                and offset < start + item.size
             ):
                 require(
-                    item.start <= offset and offset + width <= item.end,
+                    start <= offset and offset + width <= start + item.size,
                     f"{self.context}: a stack access at ESP0{offset:+d} ({width} bytes) straddles "
-                    f"the escaping frame object [ESP0{item.start:+d}, ESP0{item.end:+d}) of "
+                    f"the escaping frame object [ESP0{start:+d}, ESP0{start + item.size:+d}) of "
                     f"{', '.join(item.names)}",
                 )
-                return item
+                return item, start
         return None
+
+    def _object_address(self, offset: int, width: int) -> Term | None:
+        """The memory address of an access at ESP0 + offset to frame-object bytes, or None.
+
+        An escaping object's bytes are named by its atom (a14).  In a probe
+        run of the moved-objects pass (a15) the replacement's access to bytes
+        where the donor keeps an escaping object that the replacement keeps
+        elsewhere, or not there, is left unresolved, at ``("pstk", offset)``,
+        so that its comparison can suggest where the object lies.
+        """
+        found = self._escaping_object(offset, width)
+        if found is not None:
+            item, start = found
+            return lin(offset - start, [(frame_object_atom(item), 1)])
+        if self.facts.probe and self.side == "P" and self._vacated(offset, width):
+            self.unresolved.add(offset)
+            return lin_atom((_UNRESOLVED, offset))
+        return None
+
+    def _vacated(self, offset: int, width: int) -> bool:
+        """Whether an access overlaps an escaping object's donor bytes that the replacement
+        does not keep it at (a15)."""
+        kept = {item.start: start for item, start in self.facts.layout("P")}
+        objects = cast(FrameObjects, self.facts.frame_objects)
+        return any(
+            item.start in self.facts.escaping
+            and kept.get(item.start) != item.start
+            and item.start < offset + width
+            and offset < item.end
+            for item in objects.objects
+        )
 
     # --- the frame-objects pass (a14) ------------------------------------------------
 
@@ -1024,11 +1307,14 @@ class FrameModel:
             f"{context}: a stack address that is not ESP0 plus a constant, which a14 attributes "
             "to no frame object",
         )
+        k = cast(int, offset)
+        if self.facts.moving and self.side == "P":
+            return self._image_address(k)
         objects = cast(FrameObjects, self.facts.frame_objects)
-        pointees = objects.pointees(cast(int, offset))
+        pointees = objects.pointees(k)
         require(
             bool(pointees),
-            f"{context}: the stack address ESP0{offset:+d} lies in no local the donor's debug "
+            f"{context}: the stack address ESP0{k:+d} lies in no local the donor's debug "
             "records declare, so its object has no extent",
         )
         missing = sorted({item.start for item in pointees} - self.facts.escaping)
@@ -1037,8 +1323,72 @@ class FrameModel:
                 f"{context}: the address of the frame object at ESP0{missing[0]:+d} escapes",
                 missing,
             )
+        if self.facts.moving:
+            self._boundary_shifts(pointees, k, context)
         own = pointees[0]
-        return lin(cast(int, offset) - own.start, [(frame_object_atom(own), 1)])
+        return lin(k - own.start, [(frame_object_atom(own), 1)])
+
+    def _image_address(self, offset: int) -> Term:
+        """The replacement's stack address ESP0 + offset in the moved-objects pass (a15).
+
+        Inside (or one past the end of) an escaping object the replacement
+        keeps, it is that object's atom plus the offset from the object's
+        start there.  Anywhere else it is unresolved, ``("pstk", offset)``:
+        the replacement's objects are the donor's (no record of its own
+        locals is read), so only a donor object the run already knows to
+        escape can hold it, and a run that keeps one is refused
+        (`_compare_pair`), after its comparison has suggested where an
+        object lies.
+        """
+        kept = [
+            (item, start)
+            for item, start in self.facts.layout("P")
+            if item.start in self.facts.escaping
+        ]
+        inside = [pair for pair in kept if pair[1] <= offset < pair[1] + pair[0].size]
+        ending = [pair for pair in kept if pair[1] + pair[0].size == offset]
+        own = inside or ending
+        if not own:
+            self.unresolved.add(offset)
+            return lin_atom((_UNRESOLVED, offset))
+        item, start = own[0]
+        return lin(offset - start, [(frame_object_atom(item), 1)])
+
+    def _boundary_shifts(
+        self, pointees: tuple[FrameObject, ...], offset: int, context: str
+    ) -> None:
+        """A donor pointer at a boundary between objects keeps the boundary (a15).
+
+        A pointer at one object's start and another's end may reach both
+        (a14).  The replacement's pointer reaches the same bytes relative to
+        it (a15), so the replacement must keep the two objects at the same
+        distance: both moved by one shift.  When one keeps the donor's start
+        and the other is moved, the first is suggested to move with it, if
+        it fits there (`_placed_moves`).
+        """
+        shifts = {item.start: self.facts.image_start(item.start) - item.start for item in pointees}
+        if len(set(shifts.values())) == 1:
+            return
+        moved = dict(self.facts.moves)
+        fixed = {shifts[start] for start in shifts if start in moved}
+        if len(fixed) == 1:
+            shift = next(iter(fixed))
+            suggested = {start: start + shift for start in shifts if start not in moved}
+            try:
+                _placed_moves({**moved, **suggested}, self.facts, context)
+            except ByteIdentityError:
+                pass
+            else:
+                raise ObjectMove(
+                    f"{context}: the pointer ESP0{offset:+d} lies at a boundary between frame "
+                    "objects the replacement keeps apart",
+                    suggested,
+                )
+        raise ByteIdentityError(
+            f"{context}: the pointer ESP0{offset:+d} lies at the boundary of frame objects "
+            f"{', '.join(f'ESP0{start:+d}' for start in sorted(shifts))}, which the replacement "
+            "keeps at different distances, so a callee could reach different bytes through it (a15)"
+        )
 
     def _object_access(self, address: Term, width: int, context: str) -> None:
         """Check an access through a frame object's address (a14).
@@ -1074,11 +1424,51 @@ class FrameModel:
             return address
         offset = _esp_offset(address) if address[0] == "lin" else None
         if offset is not None:
-            item = self._escaping_object(offset, width)
-            if item is not None:
-                address = lin(offset - item.start, [(frame_object_atom(item), 1)])
+            named = self._object_address(offset, width)
+            if named is not None:
+                address = named
         self._object_access(address, width, self.context)
         return address
+
+    def loaded(
+        self,
+        state: PathState,
+        address: Term,
+        width: int,
+        deps: list[tuple[Term, int, Term]],
+        exact: bool,
+    ) -> None:
+        """Check a load from memory the stores before it do not supply whole (a15).
+
+        Through a moved object's address: on the path from the function's
+        entry before any call or block event, a byte no store of the path
+        wrote holds what the stack held at the entry, which differs in the
+        two versions (they keep the object at different starts), so the read
+        is refused.  And a load one of whose possibly-reaching stores holds a
+        moved object's address may read that address back, whose later uses
+        the proof cannot follow: refused.
+        """
+        if not self.moved:
+            return
+        reads_moved = any(atom in self.moved for atom, _ in _frame_object_terms(address))
+        require(
+            not (reads_moved and state.epoch is None and not exact),
+            f"{self.context}: a load reads bytes of a moved frame object that no store has "
+            "written since the entry, which hold different stack bytes in the two versions (a15)",
+        )
+        require(
+            not any(observes_moved(entry[2], self.moved) for entry in deps),
+            f"{self.context}: a load may read back a stored address of a moved frame object, "
+            "whose uses the proof cannot follow (a15)",
+        )
+
+    def check_moved(self, value: Term, context: str) -> None:
+        """A value holds a moved object's address only as a pointer (a15, `pointer_form`)."""
+        require(
+            pointer_form(value, self.moved),
+            f"{context}: the address of a frame object the two versions keep at different starts "
+            "is used as a number (compared, masked, scaled or converted), which a15 does not admit",
+        )
 
     def memory_value(self, value: Term) -> Term:
         """A stored value (a14): its stack address named, a stored pointer inside its object.
@@ -1090,6 +1480,7 @@ class FrameModel:
         if self.facts.frame_objects is None:
             return value
         value = self.canonical(value, self.context)
+        self.check_moved(value, f"{self.context}: a stored value")
         named = _frame_object_terms(value)
         if len(named) == 1 and len(value[2]) == 1 and named[0][1] == 1:
             at, size = _signed(value[1]), named[0][0][2]
@@ -1132,6 +1523,8 @@ class FrameModel:
                 self.side,
                 written,
             )
+        if not (offset >= 0 and not written) and self._unresolved_read(offset):
+            return _width_term((_UNRESOLVED, offset, width), width)
         require(
             offset >= 0 and not written,
             f"{self.context}: a read of the stack slot ESP0{offset:+d} whose value the relation "
@@ -1139,6 +1532,20 @@ class FrameModel:
         )
         atom = ("pld", offset, width)
         return lin_atom(atom) if width == 4 else ("b", width * 8, atom)
+
+    def _unresolved_read(self, offset: int) -> bool:
+        """Whether the moved-objects pass leaves a refused private read unresolved (a15).
+
+        The replacement may read bytes of an object it keeps where the run
+        does not yet know one: a private slot with no value.  The read is left
+        unresolved, so the run is refused all the same (`_compare_pair`), but
+        only after its comparison has had the chance to suggest where the
+        object lies.
+        """
+        if not (self.facts.moving and self.side == "P"):
+            return False
+        self.unresolved.add(offset)
+        return True
 
     def _split_read(self, offset: int, width: int, overlapping: list[tuple[int, int]]) -> Term:
         """A read that one wider slot holds or narrower slots tile exactly.
@@ -1845,13 +2252,36 @@ def run_paths(
                 path.regs["esp"] = lin_sub(path.regs["esp"], lin(-pop))
                 results.append(PathEnd("ret", offset, path, start_depth, address))
                 break
+            if path.frame.moved:
+                _moved_operands(path, item, f"{context}: {offset}")
+            events = len(path.events)
             action, detail = _step(path, item, undefined, x87_returns, program.helpers)
+            if path.frame.moved and len(path.events) > events:
+                event = path.events[-1]
+                require(
+                    not (event[0] == "call" and observes_moved(event[1], path.frame.moved)),
+                    f"{context}: the call at {offset} goes through the address of a frame object "
+                    "the two versions keep at different starts (a15)",
+                )
             if frame.frame_objects is not None:
                 # a14: a stack address in a register is named by its frame
                 # object before any later instruction reads it.
                 for name in GENERAL_REGISTERS:
                     path.regs[name] = path.frame.canonical(
                         path.regs[name], f"{context}: {name} after {offset}"
+                    )
+                if path.frame.moved:
+                    # a15: a moved object's address is only ever a pointer.
+                    for name in GENERAL_REGISTERS:
+                        path.frame.check_moved(path.regs[name], f"{context}: {name} after {offset}")
+                    require(
+                        not any(
+                            observes_moved(value, path.frame.moved)
+                            for value in path.fpu.slots.values()
+                        ),
+                        f"{context}: an x87 register holds a value computed from the address of a "
+                        f"frame object the two versions keep at different starts after {offset} "
+                        "(a15)",
                     )
             elif frame.private:
                 for name in GENERAL_REGISTERS:
@@ -1902,8 +2332,35 @@ def run_paths(
             ),
             f"{context}: a path reads an x87 condition bit the last x87 instruction left undefined",
         )
+        moved = end.state.frame.moved
+        require(
+            not any(observes_moved(atom, moved) for atom, _holds in end.state.conditions),
+            f"{context}: a path branches on the address of a frame object the two versions keep "
+            "at different starts (a pointer compare, which a15 does not admit)",
+        )
         _summarise(end, frame, context)
     return results
+
+
+def _moved_operands(path: PathState, item: _Instruction, context: str) -> None:
+    """A string instruction's implicit operands are not a moved object's address (a15).
+
+    ``rep stos``/``rep movs``/``repne scasb`` read ECX as a count and
+    ``stos``/``scas`` read AL, AX or EAX as a value: numbers, which the two
+    versions would hold differently.  (EDI and ESI are pointers.)
+    """
+    if item.opcode not in _STRING_OPCODES:
+        return
+    moved = path.frame.moved
+    used = ["eax"] if item.opcode in (0xAA, 0xAB, 0xAE) else []
+    if item.repeat is not None:
+        used.append("ecx")
+    for name in used:
+        require(
+            not observes_moved(path.regs[name], moved),
+            f"{context}: a string instruction uses {name}, which holds the address of a frame "
+            "object the two versions keep at different starts, as a count or a value (a15)",
+        )
 
 
 def _summarise(end: PathEnd, frame: FrameFacts, context: str) -> None:
@@ -2013,11 +2470,138 @@ def _undefined_bits_note(left: PathEnd, right: PathEnd) -> str:
 
 
 def _compare_pair(left: PathEnd, right: PathEnd, frame: FrameFacts, context: str) -> None:
-    """Check 5 for one consistent pair of paths; a refusal notes undefined x87 bits read (a8)."""
+    """Check 5 for one consistent pair of paths; a refusal notes undefined x87 bits read (a8).
+
+    In the moved-objects pass (a15) a refusal first asks the pair where the
+    replacement keeps an object (`_move_proposals`); a pair the comparison
+    admits must have left no replacement address unresolved, and at a
+    return no moved object's address may outlive the frame.
+    """
     try:
         _compare_paths(left, right, frame, context)
+        if left.kind == "ret":
+            _moved_outputs(left, frame, context, "donor")
+            _moved_outputs(right, frame, context, "replacement")
     except ByteIdentityError as error:
+        if frame.moving:
+            moves = _move_proposals(left, right, frame)
+            if moves:
+                raise ObjectMove(f"{error}", moves) from error
         raise ByteIdentityError(f"{error}{_undefined_bits_note(left, right)}") from error
+    unresolved = right.state.frame.unresolved
+    if frame.moving and unresolved:
+        raise ByteIdentityError(
+            f"{context} (the donor's path to {left.at}, the replacement's to {right.at}): the "
+            f"replacement's stack address ESP0{min(unresolved):+d} lies in no escaping frame "
+            "object the donor's can be paired with, so its object has no extent (a15)"
+        )
+
+
+def _moved_outputs(end: PathEnd, frame: FrameFacts, context: str, name: str) -> None:
+    """At a return, no moved object's address outlives the frame (a15).
+
+    The two versions keep the object at different starts, so a returned
+    register, an x87 register or a store that survives the return holding
+    its address would hold different values in them.
+    """
+    moved = end.state.frame.moved
+    if not moved:
+        return
+    where = f"{context} (the {name}'s return at {end.at})"
+    for register in RETURN_REGISTERS:
+        require(
+            not observes_moved(end.state.regs[register], moved),
+            f"{where}: {register} holds the address of a frame object the two versions keep at "
+            "different starts (a15)",
+        )
+    require(
+        not any(
+            observes_moved(value, moved)
+            for key, value in end.locations.items()
+            if key[0] in ("st", "x87")
+        ),
+        f"{where}: an x87 register holds a value computed from the address of a moved frame "
+        "object (a15)",
+    )
+    for store in end.state.stores:
+        if not _dead_stack_store(store, frame):
+            require(
+                not observes_moved(store[2], moved),
+                f"{where}: a store that outlives the frame holds the address of a frame object "
+                "the two versions keep at different starts (a15)",
+            )
+
+
+_MAX_PROPOSAL_NODES = 200000
+
+
+def _move_proposals(left: PathEnd, right: PathEnd, frame: FrameFacts) -> dict[int, int]:
+    """Where a refused pair of paths suggests the replacement keeps escaping objects (a15).
+
+    The pair's events, then its stores, then (at a return) its returned
+    registers are walked side by side.  Where the donor holds a frame
+    object's atom plus c and the replacement, in the same place, a different
+    object's atom or an unresolved address (``("pstk", k)``) plus c', with
+    the rest of the two linear terms equal, the replacement's pointer is
+    ESP0 + s' + c' for its start s' of that object (or k), so it keeps the
+    donor's object at s' + c' - c.  The first suggestion for each object
+    counts.  Nothing here is believed: the pass runs again under them.
+    """
+    found: dict[int, int] = {}
+    budget = [_MAX_PROPOSAL_NODES]
+
+    def anchor(atom: Term) -> int | None:
+        if isinstance(atom, tuple) and len(atom) == 2 and atom[0] == _UNRESOLVED:
+            return cast(int, atom[1])
+        if isinstance(atom, tuple) and len(atom) == 3 and atom[0] == "fobj":
+            return frame.image_start(cast(int, atom[1]))
+        return None
+
+    def visit(donor: Any, image: Any) -> None:
+        pending = [(donor, image)]
+        seen: set[tuple[int, int]] = set()
+        while pending and budget[0] > 0:
+            budget[0] -= 1
+            d, p = pending.pop()
+            if d is p or not isinstance(d, tuple) or not isinstance(p, tuple) or d == p:
+                continue
+            if (id(d), id(p)) in seen:
+                continue
+            seen.add((id(d), id(p)))
+            if d and p and d[0] == "lin" and p[0] == "lin":
+                d_frame = [
+                    pair for pair in d[2] if isinstance(pair[0], tuple) and pair[0][:1] == ("fobj",)
+                ]
+                p_frame = [pair for pair in p[2] if anchor(pair[0]) is not None]
+                d_rest = [pair for pair in d[2] if pair not in d_frame]
+                p_rest = [pair for pair in p[2] if pair not in p_frame]
+                if (
+                    len(d_frame) == 1
+                    and len(p_frame) == 1
+                    and d_frame[0][1] == 1
+                    and p_frame[0][1] == 1
+                    and d_rest == p_rest
+                ):
+                    start = cast(int, d_frame[0][0][1])
+                    image_start = cast(int, anchor(p_frame[0][0])) + _signed(p[1]) - _signed(d[1])
+                    if image_start != frame.image_start(start):
+                        found.setdefault(start, image_start)
+                elif len(d_rest) == len(p_rest):
+                    pending.extend((a[0], b[0]) for a, b in zip(d_rest, p_rest, strict=True))
+                continue
+            if len(d) == len(p) and (not d or d[0] == p[0] or not isinstance(d[0], str)):
+                pending.extend(zip(d, p, strict=True))
+
+    for donor_event, image_event in zip(left.state.events, right.state.events, strict=False):
+        visit(donor_event, image_event)
+    if not found and len(left.state.stores) == len(right.state.stores):
+        visit(tuple(left.state.stores), tuple(right.state.stores))
+    if not found and left.kind == right.kind == "ret":
+        visit(
+            tuple(left.state.regs[name] for name in RETURN_REGISTERS),
+            tuple(right.state.regs[name] for name in RETURN_REGISTERS),
+        )
+    return found
 
 
 def _entry_values(value: Any) -> set[int]:
@@ -2434,6 +3018,7 @@ def prove_function(
     objects: ObjectModel | None = None,
     frame_objects: FrameObjects | None = None,
     partial_slots: bool = False,
+    moved_objects: bool = False,
 ) -> ValidationProof:
     """Checks 2 and 4-7: a private frame when one is given and no stack address escapes.
 
@@ -2449,6 +3034,14 @@ def prove_function(
     runs again with each object whose address a run finds escaping
     (`ObjectEscape`), until a run needs no more; there is no shared-frame
     fallback.
+    ``moved_objects`` (with ``frame_objects``) runs the moved-objects pass
+    (a15): the replacement may keep an escaping object at another start.
+    The run starts with no object escaping or moved; each run grows the
+    escaping objects (the donor's addresses, `ObjectEscape`) or the moves
+    (`ObjectMove`: the starts a refused pair of paths suggests, each checked
+    by `_admit_moves`), until a run proves.  When a run refuses with no
+    suggestion, a probe run (`FrameFacts.probe`) may still suggest one; the
+    refusal stands otherwise.
     ``partial_slots`` relates a private slot at a join only on the paths
     that wrote it: when a run reads a slot it wrote on only some paths to the
     join it started from (`UncarriedSlot`), the run is repeated with those
@@ -2521,15 +3114,48 @@ def prove_function(
             f"{context}: a frame object lies below the locals block",
         )
         escaping: frozenset[int] = frozenset()
-        for _ in range(len(frame_objects.objects) + 1):
-            facts = replace(frame, frame_objects=frame_objects, escaping=escaping)
+        moves: dict[int, int] = {}
+        for _ in range(2 * len(frame_objects.objects) + 2):
+            facts = replace(
+                frame,
+                frame_objects=frame_objects,
+                escaping=escaping,
+                moving=moved_objects,
+                moves=tuple(sorted(moves.items())),
+            )
+            note = " (moved objects)" if moved_objects else " (frame objects)"
             try:
-                return validate(facts, " (frame objects)")
+                return validate(facts, note)
             except ObjectEscape as escape:
                 grown = escaping | escape.starts
                 require(grown != escaping, f"{context}: {escape}, and it already escapes")
                 escaping = grown
+            except ObjectMove as move:
+                moves = _admit_moves(move, moves, facts, context)
+            except ByteIdentityError as error:
+                if getattr(error, "admission", False):
+                    raise
+                error.private_frame = True  # type: ignore[attr-defined]
+                error.moves = dict(moves)  # type: ignore[attr-defined]
+                if not moved_objects:
+                    raise
+                # A probe run: the replacement's accesses where the donor keeps
+                # an object the replacement keeps elsewhere are left unresolved,
+                # so that a comparison may suggest where it lies.
                 donor, image = programs()
+                try:
+                    validate(replace(facts, probe=True), note + " (probe)")
+                except ObjectEscape as escape:
+                    if not escape.starts - escaping:
+                        raise error from escape
+                    escaping = escaping | escape.starts
+                except ObjectMove as move:
+                    moves = _admit_moves(move, moves, facts, context)
+                except ByteIdentityError:
+                    raise error from None
+                else:
+                    raise error
+            donor, image = programs()
         raise ByteIdentityError(f"{context}: the escaping frame objects do not settle")
     escaped = False
     if private_frame is not None and locals_block_first(donor, private_frame.base):
@@ -2545,6 +3171,65 @@ def prove_function(
         # private one: the case the frame-objects pass (a14) is for.
         error.escaped = escaped  # type: ignore[attr-defined]
         raise
+
+
+def _admit_moves(
+    move: ObjectMove, moves: Mapping[int, int], facts: FrameFacts, context: str
+) -> dict[int, int]:
+    """The moves of the moved-objects pass grown by a run's suggestions (a15), or a refusal.
+
+    A suggestion for an object already moved is not taken (a move is never
+    changed, so the runs settle).  Each new one must keep a local of the
+    donor (a parameter lies where the caller put it) wholly inside the
+    replacement's locals block [B, ESP0), and the moved objects must stay
+    pairwise disjoint there: the replacement's object has the donor's extent
+    (a15 carries the donor's accesses through a pointer to the same offsets
+    of the replacement's), so a place that cannot hold it whole means the
+    two versions' objects have different extents.
+    """
+    fresh = {start: image for start, image in move.moves.items() if start not in moves}
+    try:
+        require(
+            bool(fresh),
+            f"{move}; the suggested starts are for frame objects the replacement already keeps "
+            "elsewhere",
+        )
+        return _placed_moves({**moves, **fresh}, facts, context)
+    except ByteIdentityError as refused:
+        # The refusal of the pass: it names the moves that led to it.
+        refused.private_frame = True  # type: ignore[attr-defined]
+        refused.moves = {**moves, **fresh} or dict(move.moves)  # type: ignore[attr-defined]
+        refused.admission = True  # type: ignore[attr-defined]
+        raise
+
+
+def _placed_moves(grown: dict[int, int], facts: FrameFacts, context: str) -> dict[int, int]:
+    """``grown`` when every moved object fits the replacement's locals block, disjointly."""
+    objects = cast(FrameObjects, facts.frame_objects)
+    placed = []
+    for start, image in sorted(grown.items()):
+        item = objects.by_start(start)
+        require(
+            item.start < 0,
+            f"{context}: the replacement passes the parameter at ESP0{start:+d} from another "
+            "offset; a parameter lies where the caller put it (a15)",
+        )
+        require(
+            facts.base <= image and image + item.size <= 0,
+            f"{context}: the replacement would keep the frame object [ESP0{start:+d}, "
+            f"ESP0{item.end:+d}) of {', '.join(item.names)} at ESP0{image:+d}, outside its "
+            f"locals block [ESP0{facts.base:+d}, ESP0) (a15)",
+        )
+        placed.append((image, item))
+    placed.sort(key=lambda pair: pair[0])
+    for (image, item), (after, other) in itertools.pairwise(placed):
+        require(
+            image + item.size <= after,
+            f"{context}: the replacement keeps the frame object of {', '.join(other.names)} at "
+            f"ESP0{after:+d}, inside the {item.size} bytes of {', '.join(item.names)} it would "
+            f"keep at ESP0{image:+d}: the two versions' objects have different extents (a15)",
+        )
+    return grown
 
 
 def _x87_case_proofs(
@@ -2627,6 +3312,10 @@ def proof_summary(proof: ValidationProof) -> dict[str, Any]:
             item.pin() for item in objects.objects if item.start in proof.frame.escaping
         ]
         summary["assumptions"] = ["a14"]
+        if proof.frame.moves:
+            # Only a moved-objects proof that moved one pins its moves and a15.
+            summary["moved_frame_objects"] = [list(pair) for pair in proof.frame.moves]
+            summary["assumptions"] = ["a14", "a15"]
     return summary
 
 
@@ -2838,7 +3527,10 @@ def measure_function_validation(
     partial = {"on": False, "needed": False}
 
     def summary(
-        model: ObjectModel | None, tag: str, frame_objects: FrameObjects | None = None
+        model: ObjectModel | None,
+        tag: str,
+        frame_objects: FrameObjects | None = None,
+        moved_objects: bool = False,
     ) -> dict[str, Any]:
         tag += " (partial slots)" if partial["on"] else ""
 
@@ -2856,6 +3548,7 @@ def measure_function_validation(
                     objects=model,
                     frame_objects=frame_objects,
                     partial_slots=partial["on"],
+                    moved_objects=moved_objects,
                 )
             except UncarriedSlot:
                 partial["needed"] = True
@@ -2889,8 +3582,22 @@ def measure_function_validation(
                 f"{earlier}; the frame-objects pass (a14) cannot run: the donor does not allocate "
                 "its locals block first"
             ) from earlier
+        try:
+            return objects_run(frame_objects, "frame-objects pass", False)
+        except ByteIdentityError as error:
+            # Only when the frame-objects pass refuses: the moved-objects pass
+            # (a15), whose records pin their moves.  Its refusal is reported
+            # when it moved an object; otherwise the frame-objects pass's is.
+            try:
+                return objects_run(frame_objects, "moved-objects pass", True)
+            except ByteIdentityError as moved:
+                if getattr(moved, "moves", None):
+                    raise moved from error
+                raise error from None
+
+    def objects_run(frame_objects: FrameObjects, tag: str, moved: bool) -> dict[str, Any]:
         return {
-            **summary(objects, " (frame-objects pass)", frame_objects=frame_objects),
+            **summary(objects, f" ({tag})", frame_objects=frame_objects, moved_objects=moved),
             "equivalences": True,
         }
 
