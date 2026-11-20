@@ -11,13 +11,39 @@ The locals.  The function's ``.debug$S`` child opens with its procedure
 record; every ``S_BPREL32`` record of MSVC 5.0 (``S_BPREL32_ST``, 0x1006:
 offset i32, type u32, name) places one local or parameter at a constant
 offset from the frame's base.  In a frame-pointer-free function (the FPO
-record's cbFrame 0) that base is the entry ESP: the parameters lie at +4
-upwards, above the return address, and the locals in the block
-[ESP0 - 4 cdwLocals, ESP0) the prologue allocates.  Every record must lie
-wholly inside one of those two ranges, or the convention is not the one
-assumed and the extents are refused.  A local kept in a register
-(``S_REGISTER``) has no stack memory; a static (``S_LDATA32``) is not in the
-frame.
+record's cbFrame 0) that base is the entry ESP: the parameters lie in the
+words [ESP0 + 4, E) above the return address, E = ESP0 + 4 + 4 cdwParams,
+and the locals in the block [B, ESP0) the prologue allocates,
+B = ESP0 - 4 cdwLocals.  A local kept in a register (``S_REGISTER``) has
+no stack memory; a static (``S_LDATA32``) is not in the frame.
+
+A parameter's word may be reused once the parameter is dead: MSVC 5.0 then
+keeps a local there (`tooltip_draw`'s ``i`` in ``mouseY``'s word).  Such a
+*homed* local's record is 4 bytes above its slot.  The compiler names every
+stack slot by its listing offset L (``/FAs``: ``_mouseY$ = 16``,
+``_i$ = 16``).  A name in the parameter words is addressed at ESP0 + L - 4
+(``_i$[esp+K]`` with K = depth - 4, as for a parameter), and one in the
+locals block at ESP0 + L.  The ``S_BPREL32`` record carries L - 4 for a
+parameter but L for every other name, a homed local included: ``mouseY``
+is recorded at ESP0+12 and ``i`` at ESP0+16, but the code keeps both at
+ESP0+12.  So a record is read by what it names:
+
+- a parameter: the first n ``S_BPREL32``/``S_REGISTER`` records, all in the
+  procedure's own scope (CodeView emits the parameters first, in order).
+  n is the parameter count of the procedure's ``LF_PROCEDURE_ST`` type
+  (0x1008), equal to its ``LF_ARGLIST_ST`` (0x1201) entry count, less a
+  trailing ``T_NOTYPE`` (``...``).  It lies at ESP0 + offset, in [4, E);
+- any later record at a positive offset: a homed local, at ESP0 + offset - 4,
+  in [4, E);
+- any other: a local at ESP0 + offset, in [B, ESP0).
+
+A record outside its range is refused, and so is a function with a record
+at a positive offset whose procedure type is not available (it is read from
+the same type records as the sizes).  The rule was checked against MSVC
+5.0's own listings over lrr's 214 matching-build units (4,149
+frame-pointer-free functions): every parameter record is L - 4, every other
+record is L, and every scalar homed local whose addressing could be decided
+from an adjacent access (298 accesses) is addressed as a parameter is.
 
 The sizes.  A type index below 0x1000 is a CodeView primitive, whose size
 the index itself fixes (`PRIMITIVE_SIZES`: ``T_INT4`` 4, ``T_REAL64`` 8, a
@@ -66,7 +92,12 @@ from reprobit.coff_format import CoffObject, coff_body
 from reprobit.small_msf import SMALL_MSF_MAGIC
 
 from .coff import _comdat_child
-from .debug import parse_codeview_symbol_stream
+from .debug import (
+    CODEVIEW_BPREL_RECORD_TYPES,
+    CODEVIEW_END_RECORD_TYPE,
+    CODEVIEW_REGISTER_RECORD_TYPES,
+    parse_codeview_symbol_stream,
+)
 from .foundation import sha256_bytes
 
 # CodeView type records, numbered from 0x1000, an object compiled with /Z7
@@ -75,6 +106,7 @@ from .foundation import sha256_bytes
 CODEVIEW_FIRST_TYPE_INDEX = 0x1000
 CODEVIEW_TYPE_SIGNATURES = frozenset({1, 2})
 CODEVIEW_LF_TYPESERVER = (0x0016, 0x1501)
+CODEVIEW_LF_PROCEDURE_ST = 0x1008
 
 
 def codeview_type_records(stream: bytes, context: str) -> list[bytes]:
@@ -100,8 +132,13 @@ def codeview_type_records(stream: bytes, context: str) -> list[bytes]:
 
 # The procedure records a function's `.debug$S` opens with, both widths.
 _PROCEDURE_RECORDS = frozenset({516, 517, 0x100A, 0x100B})
+# The MSVC 5.0 procedure records, whose type index is a u32 at payload offset 24.
+_PROCEDURE_ST_RECORDS = frozenset({0x100A, 0x100B})
 _BPREL32 = 512  # CodeView 4: offset i32, type u16
 _BPREL32_ST = 0x1006  # MSVC 5.0: offset i32, type u32
+_BLOCK32 = 519  # S_BLOCK32: opens a nested scope, closed by S_END
+# A homed local's record is this many bytes above its slot (see the module docstring).
+HOMED_RECORD_BIAS = 4
 
 # Direct primitives (mode 0) by index, and the 32-bit near pointer mode.
 PRIMITIVE_SIZES = {
@@ -138,6 +175,8 @@ LF_CLASS_ST = 0x1004
 LF_STRUCTURE_ST = 0x1005
 LF_UNION_ST = 0x1006
 LF_ENUM_ST = 0x1007
+LF_ARGLIST_ST = 0x1201
+_T_NOTYPE = 0x0000  # an argument list's trailing entry for `...`
 _CV_PTR_NEAR32 = 0x0A
 _FORWARD_REFERENCE = 0x80
 _AGGREGATES = (LF_CLASS_ST, LF_STRUCTURE_ST, LF_UNION_ST)
@@ -160,7 +199,11 @@ _DELETED_STREAM = 0xFFFFFFFF
 
 @dataclass(frozen=True)
 class FrameLocal:
-    """One ``S_BPREL32`` record: a local or parameter at ESP0 + ``start``."""
+    """One ``S_BPREL32`` record: a local or parameter at ESP0 + ``start``.
+
+    ``start`` is where the code keeps it: for a homed local, 4 below the
+    offset its record carries (see the module docstring).
+    """
 
     name: str
     start: int
@@ -503,6 +546,62 @@ def primitive_size(index: int, context: str) -> int:
     return int(size)  # type: ignore[arg-type]
 
 
+def parameter_count(
+    stream: bytes, procedure: dict[str, Any], sizes: TypeSizes, context: str
+) -> int:
+    """How many of the procedure's first location records are its parameters.
+
+    The procedure record's type index names an ``LF_PROCEDURE_ST`` record
+    (return type u32, calling convention u8, reserved u8, parameter count
+    u16, argument list u32); its ``LF_ARGLIST_ST`` (count u32, then a u32
+    type per entry) must have as many entries.  A trailing ``T_NOTYPE``
+    entry is ``...``, which has no record.  Anything else is refused.
+    """
+    require(
+        procedure["type"] in _PROCEDURE_ST_RECORDS,
+        f"{context}: the procedure record of type 0x{procedure['type']:x} is CodeView 4's, "
+        "whose parameter records this reader does not tell from its locals",
+    )
+    payload = stream[procedure["offset"] + 4 : procedure["offset"] + procedure["size"]]
+    type_index = int.from_bytes(payload[24:28], "little")
+    require(
+        type_index >= CODEVIEW_FIRST_TYPE_INDEX,
+        f"{context}: the procedure type 0x{type_index:x} is not a type record",
+    )
+    record = sizes.record(type_index)
+    leaf = int.from_bytes(record[2:4], "little")
+    require(
+        leaf == CODEVIEW_LF_PROCEDURE_ST and len(record) >= 16,
+        f"{context}: the procedure type 0x{type_index:x} is leaf 0x{leaf:04x}, not LF_PROCEDURE",
+    )
+    count = int.from_bytes(record[10:12], "little")
+    arguments_index = int.from_bytes(record[12:16], "little")
+    require(
+        arguments_index >= CODEVIEW_FIRST_TYPE_INDEX,
+        f"{context}: the argument list 0x{arguments_index:x} is not a type record",
+    )
+    arguments = sizes.record(arguments_index)
+    require(
+        len(arguments) >= 8 and int.from_bytes(arguments[2:4], "little") == LF_ARGLIST_ST,
+        f"{context}: the type 0x{arguments_index:x} is not an LF_ARGLIST",
+    )
+    entries = int.from_bytes(arguments[4:8], "little")
+    require(
+        len(arguments) == 8 + 4 * entries and entries == count,
+        f"{context}: the argument list 0x{arguments_index:x} has {entries} entries in "
+        f"{len(arguments)} bytes, but the procedure counts {count} parameters",
+    )
+    types = [
+        int.from_bytes(arguments[8 + 4 * index : 12 + 4 * index], "little")
+        for index in range(entries)
+    ]
+    require(
+        _T_NOTYPE not in types[:-1],
+        f"{context}: the argument list 0x{arguments_index:x} has `...` before its last entry",
+    )
+    return entries - (1 if types and types[-1] == _T_NOTYPE else 0)
+
+
 def frame_locals(
     donor: CoffObject,
     primary: dict[str, Any],
@@ -512,12 +611,13 @@ def frame_locals(
     params_end: int,
     context: str,
 ) -> tuple[tuple[FrameLocal, ...], tuple[str, ...]]:
-    """Every ``S_BPREL32`` local of the donor function with its size (see the module docstring).
+    """Every ``S_BPREL32`` local of the donor function with its extent (see the module docstring).
 
     ``base`` is B, the bottom of the locals block (ESP0 - 4 cdwLocals), and
-    ``params_end`` E, the end of the parameter words; every local must lie
-    in [B, 0) or [4, E).  Returns the locals and the digests of the type
-    records their sizes needed.
+    ``params_end`` E, the end of the parameter words.  A parameter must lie
+    in [4, E), a homed local (at its record's offset less 4) in [4, E) and
+    any other local in [B, 0).  Returns the locals and the digests of the
+    type records their sizes and the parameter count needed.
     """
     stream = bytes(coff_body(donor, _comdat_child(donor, primary, ".debug$S")))
     records = parse_codeview_symbol_stream(stream, f"{context} debug$S")
@@ -527,35 +627,94 @@ def frame_locals(
     )
     sizes: TypeSizes | None = None
     reason = ""
+
+    def type_sizes() -> TypeSizes | None:
+        nonlocal sizes, reason
+        if sizes is None and not reason:
+            available, reason = object_type_records(donor, type_server, context)
+            if available is not None:
+                sizes = TypeSizes(available, context)
+        return sizes
+
+    # Every location record in order: (record, offset or None in a register,
+    # type index, whether it is in the procedure's own scope).
+    locations: list[tuple[dict[str, Any], int | None, int, bool]] = []
+    depth = 0
+    for item in records[1:]:
+        kind = item["type"]
+        if kind == _BLOCK32:
+            depth += 1
+        elif kind == CODEVIEW_END_RECORD_TYPE:
+            depth -= 1
+        elif kind in CODEVIEW_REGISTER_RECORD_TYPES:
+            locations.append((item, None, 0, depth == 0))
+        elif kind in CODEVIEW_BPREL_RECORD_TYPES:
+            payload = stream[item["offset"] + 4 : item["offset"] + item["size"]]
+            wide = kind == _BPREL32_ST
+            locations.append(
+                (
+                    item,
+                    int.from_bytes(payload[0:4], "little", signed=True),
+                    int.from_bytes(payload[4 : 8 if wide else 6], "little"),
+                    depth == 0,
+                )
+            )
+    parameters = 0
+    if any(offset is not None and offset > 0 for _item, offset, _type, _top in locations):
+        known = type_sizes()
+        require(
+            known is not None,
+            f"{context}: a record at a positive offset is a parameter or a local homed in a "
+            f"parameter's word, which only the procedure's type tells apart, and the types are "
+            f"unknown: {reason}",
+        )
+        parameters = parameter_count(stream, records[0], cast(TypeSizes, known), context)
+        require(
+            len(locations) >= parameters
+            and all(top for _item, _offset, _type, top in locations[:parameters]),
+            f"{context}: the procedure's {parameters} parameters are not its first "
+            "location records in its own scope",
+        )
     found = []
-    for item in records:
-        if item["type"] not in (_BPREL32, _BPREL32_ST):
+    for position, (item, offset, type_index, _top) in enumerate(locations):
+        if offset is None:
             continue
-        payload = stream[item["offset"] + 4 : item["offset"] + item["size"]]
-        offset = int.from_bytes(payload[0:4], "little", signed=True)
-        wide = item["type"] == _BPREL32_ST
-        type_index = int.from_bytes(payload[4 : 8 if wide else 6], "little")
         where = f"{context}: the local {item['name']!r} (ESP0{offset:+d}, type 0x{type_index:x})"
         if type_index < CODEVIEW_FIRST_TYPE_INDEX:
             size = primitive_size(type_index, where)
         else:
-            require(wide, f"{where} has a CodeView 4 user type, which this reader does not read")
-            if sizes is None and not reason:
-                available, reason = object_type_records(donor, type_server, context)
-                if available is not None:
-                    sizes = TypeSizes(available, context)
             require(
-                sizes is not None,
+                item["type"] == _BPREL32_ST,
+                f"{where} has a CodeView 4 user type, which this reader does not read",
+            )
+            known = type_sizes()
+            require(
+                known is not None,
                 f"{where} has a user-defined type whose size is unknown: {reason}",
             )
-            size = cast(TypeSizes, sizes).size(type_index)
-        require(
-            (base <= offset and offset + size <= 0)
-            or (offset >= 4 and offset + size <= params_end),
-            f"{where} of {size} bytes lies outside the locals block [ESP0{base:+d}, ESP0) and "
-            f"the parameter words [ESP0+4, ESP0{params_end:+d})",
-        )
-        found.append(FrameLocal(item["name"], offset, size, type_index))
+            size = cast(TypeSizes, known).size(type_index)
+        if position < parameters:
+            start = offset
+            require(
+                offset >= 4 and offset + size <= params_end,
+                f"{context}: the parameter {item['name']!r} (ESP0{offset:+d}, type "
+                f"0x{type_index:x}) of {size} bytes lies outside the parameter words "
+                f"[ESP0+4, ESP0{params_end:+d})",
+            )
+        elif offset > 0:
+            start = offset - HOMED_RECORD_BIAS
+            require(
+                start >= 4 and start + size <= params_end,
+                f"{where}, homed in a parameter's word at ESP0{start:+d}, of {size} bytes lies "
+                f"outside the parameter words [ESP0+4, ESP0{params_end:+d})",
+            )
+        else:
+            start = offset
+            require(
+                base <= offset and offset + size <= 0,
+                f"{where} of {size} bytes lies outside the locals block [ESP0{base:+d}, ESP0)",
+            )
+        found.append(FrameLocal(item["name"], start, size, type_index))
     used = tuple(sorted(sizes.used)) if sizes is not None else ()
     return tuple(found), used
 
@@ -592,6 +751,7 @@ def donor_frame_objects(
 
 
 __all__ = [
+    "HOMED_RECORD_BIAS",
     "PRIMITIVE_SIZES",
     "FrameLocal",
     "FrameObject",
@@ -602,6 +762,7 @@ __all__ = [
     "frame_locals",
     "merge_frame_objects",
     "object_type_records",
+    "parameter_count",
     "primitive_size",
     "read_type_server",
 ]

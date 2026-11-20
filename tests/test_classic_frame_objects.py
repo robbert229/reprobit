@@ -10,11 +10,14 @@ holds 0, the addend the closed set admits).
 
 1. Extents: CodeView locals, primitive sizes, MSVC 5.0 type records in the
    object or in the PDB type server it names (bound by signature and age),
-   overlapping locals merged.
-2. Proofs: swapped slots beside an escaping array or structure; refusals for
-   an extent the replacement does not keep, an unknown size, an access or a
-   stored pointer outside its object, a stack address in no local, and a
-   stack access at a variable offset.
+   overlapping locals merged; parameters told from locals by the procedure's
+   type, and a local homed in a dead parameter's word placed 4 below its
+   record (a real MSVC 5.0 compile, `tests/fixtures/frame_objects`).
+2. Proofs: swapped slots beside an escaping array or structure; a structure
+   argument built through a register copy of ESP; refusals for an extent the
+   replacement does not keep, an unknown size, an access or a stored pointer
+   outside its object, a stack address in no local (stored, not only held),
+   and a stack access at a variable offset.
 3. The record: authored and dispatched with the donor's type server, pinning
    a14 and its escaping objects.
 4. Grind and the build: grind authors the record with the PDB its donor
@@ -26,6 +29,7 @@ from __future__ import annotations
 
 import re
 import struct
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -34,17 +38,25 @@ from test_classic_function_validation import _extern_donor
 from test_classic_register_bijection_reencoding_full import TARGET_SYMBOL, make_coff
 
 from reprobit.binary import ByteIdentityError
+from reprobit.classic.coff import _comdat_child
+from reprobit.classic.debug import parse_codeview_symbol_stream
 from reprobit.classic.frame_objects import (
     FrameLocal,
     FrameObjects,
     TypeSizes,
     donor_frame_objects,
+    frame_locals,
     merge_frame_objects,
     object_type_records,
     primitive_size,
     read_type_server,
 )
-from reprobit.classic.function_validation import FrameFacts, proof_summary, prove_function
+from reprobit.classic.function_validation import (
+    FrameFacts,
+    parse_fpo_data,
+    proof_summary,
+    prove_function,
+)
 from reprobit.classic.region_simulation import ObjectModel
 from reprobit.classic_donors import merge_candidate_constraints
 from reprobit.classic_project import (
@@ -108,6 +120,21 @@ def _enum(underlying: int) -> bytes:
     return _type_record(0x1007, struct.pack("<HHII", 3, 0, underlying, 0) + _name("E"))
 
 
+def _arglist(types: list[int]) -> bytes:
+    return _type_record(0x1201, struct.pack(f"<I{len(types)}I", len(types), *types))
+
+
+def _procedure(arguments: int, count: int, leaf: int = 0x1008) -> bytes:
+    """LF_PROCEDURE_ST: return type, convention, reserved, parameter count, argument list."""
+    return _type_record(leaf, struct.pack("<IBBHI", 0x03, 0, 0, count, arguments))
+
+
+# The fixture's types: char[16] (0x1000) and `void f(int)`'s argument list
+# (0x1001) and procedure (0x1002), which the procedure record names.
+REP_TYPES = [_array(T_RCHAR, 16), _arglist([T_INT4]), _procedure(0x1001, 1)]
+REP_PROCEDURE_TYPE = 0x1002
+
+
 def _pdb(records: list[bytes], signature: int = SIGNATURE, age: int = AGE) -> bytes:
     """A PDB 2.00 SmallMSF file of 1 KiB pages: header, directory, then streams 0-2."""
     page = 1024
@@ -153,19 +180,36 @@ def _object_types(records: list[bytes]) -> bytes:
     return struct.pack("<I", 2) + b"".join(records)
 
 
-def _debug_s(body_length: int, local_records: list[tuple[str, int, int]]) -> bytes:
-    """S_GPROC32, one S_BPREL32_ST per (name, offset, type), S_END."""
+def _debug_s(
+    body_length: int,
+    local_records: list[tuple[str, int, int]],
+    procedure_type: int = REP_PROCEDURE_TYPE,
+    *,
+    codeview4: bool = False,
+) -> bytes:
+    """S_GPROC32_ST naming ``procedure_type``, one S_BPREL32_ST per (name, offset,
+    type), S_END.  A name "{" opens an S_BLOCK32 scope and "}" closes it."""
     records = bytearray()
 
     def record(kind: int, payload: bytes) -> None:
         records.extend(struct.pack("<HH", len(payload) + 2, kind))
         records.extend(payload)
 
-    proc = bytearray(33)
-    struct.pack_into("<III", proc, 12, body_length, 0, body_length - 1)
-    record(0x0205, bytes(proc) + _name("_fixture"))
+    if codeview4:
+        proc = bytearray(33)
+        struct.pack_into("<III", proc, 12, body_length, 0, body_length - 1)
+        record(0x0205, bytes(proc) + _name("_fixture"))
+    else:
+        proc = bytearray(35)
+        struct.pack_into("<IIII", proc, 12, body_length, 0, body_length - 1, procedure_type)
+        record(0x100B, bytes(proc) + _name("_fixture"))
     for name, offset, type_index in local_records:
-        record(0x1006, struct.pack("<iI", offset, type_index) + _name(name))
+        if name == "{":
+            record(0x0207, bytes(18) + _name(""))
+        elif name == "}":
+            record(0x0006, b"")
+        else:
+            record(0x1006, struct.pack("<iI", offset, type_index) + _name(name))
     record(0x0006, b"")
     return bytes(records)
 
@@ -177,6 +221,7 @@ def _coff(
     types: bytes | None,
     locals_words: int,
     params: int,
+    codeview4: bool = False,
 ) -> bytes:
     """A donor (or reference) object with an FPO record of the given frame."""
     data = bytearray(
@@ -184,7 +229,7 @@ def _coff(
             body=body,
             relocations=(),
             lines=((0, 10),),
-            debug_stream=_debug_s(len(body), local_records),
+            debug_stream=_debug_s(len(body), local_records, codeview4=codeview4),
             types=types,
         )
     )
@@ -250,8 +295,8 @@ def test_the_type_server_must_carry_the_signature_and_age_the_object_names() -> 
     donor = CoffObject(
         _coff(REP_D, REP_LOCALS, types=_type_server_stream(), locals_words=7, params=1)
     )
-    records, source = object_type_records(donor, _pdb([_array(T_RCHAR, 16)]), "x")
-    assert source == "type server" and records is not None and len(records) == 1
+    records, source = object_type_records(donor, _pdb(REP_TYPES), "x")
+    assert source == "type server" and records is not None and len(records) == 3
     with pytest.raises(ByteIdentityError, match=r"has signature 0x00000001 and age 42"):
         object_type_records(donor, _pdb([], signature=1), "x")
     with pytest.raises(ByteIdentityError, match=r"and age 7, but the object names"):
@@ -272,9 +317,7 @@ def test_the_type_server_reader_is_strict() -> None:
 
 def test_an_object_compiled_with_z7_carries_its_own_types() -> None:
     donor = CoffObject(
-        _coff(
-            REP_D, REP_LOCALS, types=_object_types([_array(T_RCHAR, 16)]), locals_words=7, params=1
-        )
+        _coff(REP_D, REP_LOCALS, types=_object_types(REP_TYPES), locals_words=7, params=1)
     )
     objects = donor_frame_objects(
         donor, donor.function_section(TARGET_SYMBOL), None, base=-28, params_end=8, context="x"
@@ -303,24 +346,176 @@ def test_locals_that_overlap_merge_and_locals_that_touch_do_not() -> None:
     assert merged.pointees(-210) == ()
 
 
-def test_a_local_outside_the_fpo_frame_is_refused() -> None:
+def _extents(
+    local_records: list[tuple[str, int, int]],
+    types: list[bytes] | None = REP_TYPES,
+    *,
+    codeview4: bool = False,
+) -> FrameObjects:
+    """The frame objects of the fixture's frame (7 local words, 1 parameter) with these records."""
     donor = CoffObject(
-        _coff(REP_D, [("bx", 12, T_INT4)], types=_type_server_stream(), locals_words=7, params=1)
-    )
-    with pytest.raises(ByteIdentityError, match=r"'bx' .* lies outside the locals block"):
-        donor_frame_objects(
-            donor, donor.function_section(TARGET_SYMBOL), None, base=-28, params_end=8, context="x"
+        _coff(
+            REP_D,
+            local_records,
+            types=_type_server_stream(),
+            locals_words=7,
+            params=1,
+            codeview4=codeview4,
         )
+    )
+    return donor_frame_objects(
+        donor,
+        donor.function_section(TARGET_SYMBOL),
+        None if types is None else _pdb(types),
+        base=-28,
+        params_end=8,
+        context="x",
+    )
+
+
+def test_a_local_outside_the_fpo_frame_is_refused() -> None:
+    with pytest.raises(ByteIdentityError, match=r"the parameter 'bx' .* outside the parameter"):
+        _extents([("bx", 12, T_INT4)])
+    with pytest.raises(
+        ByteIdentityError,
+        match=r"'bx' \(ESP0\+12, .*\), homed in a parameter's word at ESP0\+8, of 4 bytes lies "
+        r"outside the parameter words \[ESP0\+4, ESP0\+8\)",
+    ):
+        _extents([("n", 4, T_INT4), ("bx", 12, T_INT4)])
+    with pytest.raises(ByteIdentityError, match=r"'t' .* lies outside the locals block"):
+        _extents([("n", 4, T_INT4), ("t", -32, T_INT4)])
+
+
+def test_a_record_after_the_parameters_at_a_positive_offset_is_homed_4_below_it() -> None:
+    # `void f(int a, int b)` (E = 12): `x`'s record says ESP0+8, but MSVC 5.0
+    # keeps a local homed in a parameter's word 4 bytes below its record, in
+    # `a`'s word; `y` (ESP0+12, past the parameters) shares `b`'s word.  Each
+    # merges with its parameter.
+    types = [_array(T_RCHAR, 16), _arglist([T_INT4, T_INT4]), _procedure(0x1001, 2)]
+    donor = CoffObject(
+        _coff(
+            REP_D,
+            [("a", 4, T_INT4), ("b", 8, T_INT4), ("x", 8, T_INT4), ("y", 12, T_INT4)],
+            types=_type_server_stream(),
+            locals_words=7,
+            params=2,
+        )
+    )
+    local_records, used = frame_locals(
+        donor,
+        donor.function_section(TARGET_SYMBOL),
+        _pdb(types),
+        base=-28,
+        params_end=12,
+        context="x",
+    )
+    assert [(item.name, item.start) for item in local_records] == [
+        ("a", 4),
+        ("b", 8),
+        ("x", 4),
+        ("y", 8),
+    ]
+    assert len(used) == 2  # the procedure and its argument list
+    objects = merge_frame_objects(local_records, used)
+    assert [(item.pin(), item.names) for item in objects.objects] == [
+        ([4, 4], ("a", "x")),
+        ([8, 4], ("b", "y")),
+    ]
+
+
+def _types_with(arguments: bytes, procedure: bytes) -> list[bytes]:
+    return [_array(T_RCHAR, 16), arguments, procedure]
+
+
+def test_the_parameters_come_from_the_procedure_type() -> None:
+    # A trailing T_NOTYPE is `...`: `void f(int, ...)` has one parameter record,
+    # so `i` (ESP0+8) is homed in n's word.
+    varargs = _types_with(_arglist([T_INT4, 0]), _procedure(0x1001, 2))
+    objects = _extents([("n", 4, T_INT4), ("i", 8, T_INT4)], varargs)
+    assert [(item.pin(), item.names) for item in objects.objects] == [([4, 4], ("i", "n"))]
+    with pytest.raises(ByteIdentityError, match=r"has `...` before its last entry"):
+        _extents([("n", 4, T_INT4)], _types_with(_arglist([0, T_INT4]), _procedure(0x1001, 2)))
+    with pytest.raises(ByteIdentityError, match=r"has 1 entries in 12 bytes, but the procedure"):
+        _extents([("n", 4, T_INT4)], _types_with(_arglist([T_INT4]), _procedure(0x1001, 2)))
+    with pytest.raises(ByteIdentityError, match=r"is leaf 0x1009, not LF_PROCEDURE"):
+        _extents(
+            [("n", 4, T_INT4)],
+            _types_with(_arglist([T_INT4]), _procedure(0x1001, 1, leaf=0x1009)),
+        )
+    with pytest.raises(ByteIdentityError, match=r"is not an LF_ARGLIST"):
+        _extents([("n", 4, T_INT4)], _types_with(_array(T_RCHAR, 4), _procedure(0x1001, 1)))
+    with pytest.raises(ByteIdentityError, match=r"1 parameters are not its first location"):
+        _extents([("{", 0, 0), ("n", 4, T_INT4), ("}", 0, 0)])
+    with pytest.raises(ByteIdentityError, match=r"CodeView 4's, whose parameter records"):
+        _extents([("n", 4, T_INT4)], codeview4=True)
+    with pytest.raises(
+        ByteIdentityError,
+        match=r"a record at a positive offset is a parameter or a local homed in a parameter's "
+        r"word, which only the procedure's type tells apart, and the types are unknown: .* not "
+        r"supplied",
+    ):
+        _extents([("n", 4, T_INT4)], None)
+    # Without a record at a positive offset no type is read.
+    assert [item.pin() for item in _extents([("t", -4, T_INT4)], None).objects] == [[-4, 4]]
+
+
+FIXTURES = Path(__file__).parent / "fixtures" / "frame_objects"
+
+
+def test_a_real_compile_s_local_homed_in_a_dead_parameter_s_word() -> None:
+    # tests/fixtures/frame_objects/homed.c compiled by MSVC 5.0 (cl /nologo /TC
+    # /ML /Zi /O2 /Ob1 /FAs /Fahomed.asm /Fohomed.obj /Fdhomed.obj.pdb), the
+    # record shape of lrr's tooltip_draw.  After `down`'s last read the loop
+    # keeps `i` in down's word, ESP0+12: homed.asm has `_down$ = 16` and
+    # `_i$ = 16`, and `mov DWORD PTR _i$[esp+32], ecx` (`mov [esp+0x30], ecx`
+    # at 0x2f, ESP at ESP0-36) stores ESP0+12.  The S_BPREL32 records say
+    # down 12 and i 16.
+    data = (FIXTURES / "homed.obj").read_bytes()
+    server = (FIXTURES / "homed.obj.pdb").read_bytes()
+    donor = CoffObject(data)
+    primary = donor.function_section("_homed_draw")
+    body = bytes(coff_body(donor, primary))
+    stream = bytes(coff_body(donor, _comdat_child(donor, primary, ".debug$S")))
+    recorded = {
+        item["name"]: struct.unpack_from("<i", stream, item["offset"] + 4)[0]
+        for item in parse_codeview_symbol_stream(stream, "x")
+        if item["type"] == 0x1006
+    }
+    assert recorded == {"row": 4, "across": 8, "down": 12, "pos": -24, "i": 16}
+    assert body[0x2F:0x33] == bytes.fromhex("894c2430")
+    fpo = parse_fpo_data(
+        bytes(coff_body(donor, _comdat_child(donor, primary, ".debug$F"))),
+        expected_proc_size=primary["raw_size"],
+        body=body,
+    )
+    base, params_end = -4 * fpo["cdwLocals"], 4 + 4 * fpo["cdwParams"]
+    assert (base, params_end, fpo["cbFrame"]) == (-24, 16, 0)
+    local_records, _used = frame_locals(
+        donor, primary, server, base=base, params_end=params_end, context="x"
+    )
+    assert {item.name: (item.start, item.size) for item in local_records} == {
+        "row": (4, 4),
+        "across": (8, 4),
+        "down": (12, 4),
+        "pos": (-24, 8),
+        "i": (12, 4),
+    }
+    objects = donor_frame_objects(
+        donor, primary, server, base=base, params_end=params_end, context="x"
+    )
+    assert [(item.pin(), item.names) for item in objects.objects] == [
+        ([-24, 8], ("pos",)),
+        ([4, 4], ("row",)),
+        ([8, 4], ("across",)),
+        ([12, 4], ("down", "i")),
+    ]
+    with pytest.raises(ByteIdentityError, match=r"types are unknown: .* not supplied"):
+        donor_frame_objects(donor, primary, None, base=base, params_end=params_end, context="x")
 
 
 def test_a_user_type_without_its_type_server_has_no_size() -> None:
-    donor = CoffObject(
-        _coff(REP_D, REP_LOCALS, types=_type_server_stream(), locals_words=7, params=1)
-    )
     with pytest.raises(ByteIdentityError, match=r"'buf' .* whose size is unknown: .* not supplied"):
-        donor_frame_objects(
-            donor, donor.function_section(TARGET_SYMBOL), None, base=-28, params_end=8, context="x"
-        )
+        _extents([("buf", -16, 0x1000)], None)
 
 
 # --- 2. proofs ---------------------------------------------------------------------------
@@ -365,7 +560,7 @@ REP_P = _code("83ec1c 57 8b4c2424 894c2404 8d7c2410 33c0 f3aa 8b442404 5f 83c41c
 REP_FRAME = FrameFacts(True, base=-28, params_end=8)
 # buf is char[16] (type 0x1000 in the type server); n the int parameter.  The
 # slots that hold n's copy are the compiler's, with no record.
-REP_LOCALS = [("buf", -16, 0x1000), ("n", 4, T_INT4)]
+REP_LOCALS = [("n", 4, T_INT4), ("buf", -16, 0x1000)]
 
 
 def test_a_slot_swap_beside_an_escaping_array_is_proved_under_a14() -> None:
@@ -495,6 +690,55 @@ def test_a_stack_access_at_a_variable_offset_is_refused() -> None:
         _prove(INDEXED, INDEXED, {}, {}, STRUCT_FRAME, _objects(*STRUCT_OBJECTS))
 
 
+# 0: sub esp,0x10 / 3: mov eax,[esp+0x14] / 7: mov [esp+4],eax / 11: sub esp,8
+# 14: mov ecx,esp / 16: mov [ecx],eax / 18: mov [ecx+4],eax / 21: call _g / 26: add esp,8
+# 29: mov eax,[esp+4] / 33: add esp,0x10 / 36: ret: g(s) of a structure argument {p, p}
+# built through a copy of ESP, as MSVC 5.0 passes tooltip_draw_box its colours, with p's
+# copy in the slot ESP0-12.  ECX holds ESP0-24, in the outgoing argument block, which no
+# local declares.
+ARGUMENT_D = _code(
+    "83ec10 8b442414 89442404 83ec08 8bcc 8901 894104 e800000000 83c408 8b442404 83c410 c3"
+)
+# ... built through EDX, with p's copy in ESP0-16: 7: mov [esp+0],eax / 14: mov edx,esp
+# 16: mov [edx],eax / 18: mov [edx+4],eax / 29: mov eax,[esp+0]
+ARGUMENT_P = _code(
+    "83ec10 8b442414 89442400 83ec08 8bd4 8902 894204 e800000000 83c408 8b442400 83c410 c3"
+)
+# 0: sub esp,0x10 / 3: mov eax,[esp+0x14] / 7: sub esp,8 / 10: mov ecx,esp
+# 12: mov [ecx],eax / 14: mov [ecx+4],eax / 17: push ecx / 18: call _g / 23: add esp,0x1c
+# 26: ret: the pointer itself pushed as a further argument.
+ARGUMENT_STORED = _code("83ec10 8b442414 83ec08 8bcc 8901 894104 51 e800000000 83c41c c3")
+
+
+def test_a_structure_argument_built_through_a_copy_of_esp_is_related() -> None:
+    # In the shared frame the call reads p's copies, which differ.  The
+    # frame-objects pass keeps ECX and EDX as ESP0-24: every access through
+    # them is a private slot of the argument window, and no callee receives
+    # them (a call's event names no register, and _g takes none).
+    relocations = {22: ("rel32", "_g")}
+    with pytest.raises(ByteIdentityError, match=r"make different calls"):
+        _prove(ARGUMENT_D, ARGUMENT_P, relocations, relocations, STRUCT_FRAME, None)
+    proof = _prove(
+        ARGUMENT_D, ARGUMENT_P, relocations, relocations, STRUCT_FRAME, _objects(*STRUCT_OBJECTS)
+    )
+    summary = proof_summary(proof)
+    assert summary["frame"] == "private" and summary["frame_objects"] == []
+
+
+def test_a_stored_stack_address_in_no_declared_local_is_refused() -> None:
+    # Held in a register it is admitted; pushed, a callee could reach past it.
+    relocations = {19: ("rel32", "_g")}
+    with pytest.raises(ByteIdentityError, match=r"ESP0-24 lies in no local"):
+        _prove(
+            ARGUMENT_STORED,
+            ARGUMENT_STORED,
+            relocations,
+            relocations,
+            STRUCT_FRAME,
+            _objects(*STRUCT_OBJECTS),
+        )
+
+
 # --- 3. the record -----------------------------------------------------------------------
 
 
@@ -518,7 +762,7 @@ def _author(type_server: bytes | None) -> Any:
 
 
 def test_a_frame_objects_record_pins_a14_and_dispatches_with_the_type_server() -> None:
-    server = _pdb([_array(T_RCHAR, 16)])
+    server = _pdb(REP_TYPES)
     seed, authored = _author(server)
     proof = authored.function.receipt.expected_values["function_validation.expected_proof"]
     assert proof["assumptions"] == ["a14"] and proof["frame_objects"] == [[-16, 16]]
@@ -667,7 +911,7 @@ def _compose(seed: bytes, authored: Any, type_server: bytes | None) -> Any:
 def test_grind_authors_an_a14_record_from_its_donor_compile_s_pdb_and_the_build_composes_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    server = _pdb([_array(T_RCHAR, 16)])
+    server = _pdb(REP_TYPES)
     seed, authored = _grind_rewriting(monkeypatch, server)
     proof = authored.function.receipt.expected_values["function_validation.expected_proof"]
     assert proof["assumptions"] == ["a14"] and proof["frame_objects"] == [[-16, 16]]
@@ -699,7 +943,7 @@ def test_grind_without_its_donor_compile_s_pdb_cannot_run_a14(
 
 
 def test_grind_refuses_a_pdb_another_compile_wrote(monkeypatch: pytest.MonkeyPatch) -> None:
-    other = _pdb([_array(T_RCHAR, 16)], signature=SIGNATURE + 1)
+    other = _pdb(REP_TYPES, signature=SIGNATURE + 1)
     with pytest.raises(DiscoveryAuthoringError, match=r"block string moves"):
         _grind_rewriting(monkeypatch, other)
     assert len(_REFUSALS) == 1
@@ -712,11 +956,11 @@ def test_grind_refuses_a_pdb_another_compile_wrote(monkeypatch: pytest.MonkeyPat
 def test_the_build_refuses_an_a14_record_without_its_pdb_or_with_another_compile_s(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    server = _pdb([_array(T_RCHAR, 16)])
+    server = _pdb(REP_TYPES)
     seed, authored = _grind_rewriting(monkeypatch, server)
     with pytest.raises((ByteIdentityError, ClassicProjectError), match=r"not supplied"):
         _compose(seed, authored, None)
-    older = _pdb([_array(T_RCHAR, 16)], age=AGE - 1)
+    older = _pdb(REP_TYPES, age=AGE - 1)
     with pytest.raises(
         (ByteIdentityError, ClassicProjectError),
         match=r"supplied type server has signature 0x6afe5730 and age 41",
