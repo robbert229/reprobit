@@ -87,3 +87,11 @@ def test_without_debug_information_the_pdb_option_is_still_required() -> None:
 
     with pytest.raises(ByteIdentityError, match="expected one exact /Fd, found 0"):
         validate_compile_arguments(command)
+
+
+def test_the_optimisations_o2_implies_are_admitted_one_by_one() -> None:
+    # MSVC 5.0's /O2 is /Og /Oi /Ot /Oy /Ob1 /Gs /Gf /Gy; a unit linked without
+    # function-level linking spells the rest.
+    parsed = lex_compile_arguments(_command("/Og", "/Oi", "/Ot", "/Oy", "/Ob1", "/Gs", "/Gf"))
+
+    assert parsed["errors"] == []

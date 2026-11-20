@@ -81,6 +81,19 @@ ADMITTED_NO_OPERAND_OPTIONS = {
     "-MT",
     "/MTd",
     "-MTd",
+    # The optimisations /O2 implies, spelled one by one: MSVC 5.0's /O2 is
+    # /Og /Oi /Ot /Oy /Ob1 /Gs /Gf /Gy, so a unit built without function-level
+    # linking names the others itself.  Each changes only the code.
+    "/Og",
+    "-Og",
+    "/Oi",
+    "-Oi",
+    "/Ot",
+    "-Ot",
+    "/Gs",
+    "-Gs",
+    "/Gf",
+    "-Gf",
 }
 
 DEBUG_FORMAT_OPTIONS = ("/Zi", "-Zi")
