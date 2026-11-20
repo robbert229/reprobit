@@ -802,8 +802,10 @@ def test_without_the_type_server_the_frame_objects_pass_cannot_run() -> None:
 # --- 4. grind and the build: the type server the donor's own compile wrote ----------------
 
 
-def _grind_rewriting(monkeypatch: pytest.MonkeyPatch, type_server: bytes | None) -> Any:
-    """Grind's donor rewriting of the fixture, with the probe's type server."""
+def _grind_rewriting(
+    monkeypatch: pytest.MonkeyPatch, type_server: bytes | None, debug_sibling: Any = None
+) -> Any:
+    """Grind's donor rewriting of the fixture, with the probe's type server or debug sibling."""
     import reprobit.discovery_grind as grind
     from reprobit.discovery_contracts import DeclarationFamily
 
@@ -827,6 +829,7 @@ def _grind_rewriting(monkeypatch: pytest.MonkeyPatch, type_server: bytes | None)
         donor_object=seed,
         reference_object=_rep_coff(REP_P),
         donor_type_server=type_server,
+        donor_debug_sibling=debug_sibling,
     )
 
 
@@ -839,8 +842,11 @@ _RUN = {
 }
 
 
-def _donor_material(donor: Any, donor_object: bytes, type_server: bytes | None) -> Any:
-    """The build's fresh donor material: the object and the PDB its compile wrote."""
+def _donor_material(
+    donor: Any, donor_object: bytes, type_server: bytes | None, debug_sibling: Any = None
+) -> Any:
+    """The build's fresh donor material: the object and the PDB its compile wrote
+    (or, without /Zi, its debug sibling)."""
     from reprobit.classic.semantic_contracts import (
         _CLASSIC_SEMANTIC_ISSUER,
         _ClassicDonorSemanticMaterial,
@@ -853,10 +859,13 @@ def _donor_material(donor: Any, donor_object: bytes, type_server: bytes | None) 
         compiler_statement={"schema": 1},
         _issuer=_CLASSIC_SEMANTIC_ISSUER,
         donor_type_server=type_server,
+        donor_debug_sibling=debug_sibling,
     )
 
 
-def _compose(seed: bytes, authored: Any, type_server: bytes | None) -> Any:
+def _compose(
+    seed: bytes, authored: Any, type_server: bytes | None, debug_sibling: Any = None
+) -> Any:
     """Compose the unit as the build does, from the donor compile's own outputs."""
     from reprobit.classic_orchestration import (
         ClassicPreparedDonor,
@@ -889,7 +898,9 @@ def _compose(seed: bytes, authored: Any, type_server: bytes | None) -> Any:
         unit,
         seed_object=seed,
         donor_materials={
-            authored.donor.intervention.id: _donor_material(authored.donor, seed, type_server)
+            authored.donor.intervention.id: _donor_material(
+                authored.donor, seed, type_server, debug_sibling
+            )
         },
         seed_source=b"source",
     )

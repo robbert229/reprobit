@@ -20,6 +20,7 @@ from reprobit.authority_snapshot import (
 )
 from reprobit.binary import ByteIdentityError
 from reprobit.classic.arguments import compile_writes_pdb
+from reprobit.classic.frame_objects import DebugSibling
 from reprobit.classic.toolchain_helpers import HelperLibrary, HelperLibraryError
 from reprobit.classic_donors import (
     merge_candidate_constraints,
@@ -100,12 +101,16 @@ class DonorCompileProduct:
     taken from the same compile as the object, never from another build.
 
     ``type_server`` is None exactly when the unit compiles without ``/Zi``:
-    the compile then writes no PDB, and a14 refuses for want of the donor's
-    CodeView symbols and types.
+    the compile then writes no PDB.  ``debug_sibling`` is then the same
+    compile with ``/Zi`` added (its object and PDB, or why it failed), from
+    which a14 reads the locals and types only when its function is the
+    donor's exactly (`classic.frame_objects.sibling_frame_source`); it is
+    None for a ``/Zi`` unit.
     """
 
     object_payload: bytes
     type_server: bytes | None
+    debug_sibling: DebugSibling | None = None
 
 
 SeedProbe = Callable[[Path, str], bytes]
@@ -403,6 +408,7 @@ def _state_rewriting(
     reference_object: bytes,
     helper_library: HelperLibrary | None = None,
     donor_type_server: bytes | None = None,
+    donor_debug_sibling: DebugSibling | None = None,
 ) -> DeclarationShapeEqualBodyAuthoring:
     """Author the state's extern-run donor and a donor rewriting reaching the reference.
 
@@ -411,9 +417,10 @@ def _state_rewriting(
     no region replacement proves, a whole-function translation validation.
     ``helper_library`` is the authenticated toolchain library both proofs
     simulate compiler helpers from; without it they refuse helper calls.
-    ``donor_type_server`` is the PDB the donor's own compile wrote
-    (`DonorCompileProduct`), read only by the function validation's
-    frame-objects pass (a14).
+    ``donor_type_server`` is the PDB the donor's own compile wrote, and
+    ``donor_debug_sibling`` the unit's ``/Zi`` sibling compile when it
+    compiles without ``/Zi`` (`DonorCompileProduct`), read only by the
+    function validation's frame-objects pass (a14).
     """
 
     _require_grind_family(state)
@@ -476,6 +483,7 @@ def _state_rewriting(
                 reference_object=reference_object,
                 helper_library=helper_library,
                 donor_type_server=donor_type_server,
+                donor_debug_sibling=donor_debug_sibling,
             )
         except DiscoveryAuthoringError as validation_error:
             raise DiscoveryAuthoringError(
@@ -579,6 +587,7 @@ def qualify_state(
     seed_body: bool = False,
     helper_library: HelperLibrary | None = None,
     donor_type_server: bytes | None = None,
+    donor_debug_sibling: DebugSibling | None = None,
 ) -> DeclarationShapeEqualBodyAuthoring:
     """Author one state's records and check the candidate against the reference object.
 
@@ -586,7 +595,7 @@ def qualify_state(
     (a reorder, then a region resize).  A donor that compiles the seed's own
     body (``seed_body``) can only be rewritten -- an equal-body family has
     nothing to splice -- so it goes straight to the rewriting.
-    ``helper_library`` and ``donor_type_server`` are passed to the
+    ``helper_library``, ``donor_type_server`` and ``donor_debug_sibling`` are passed to the
     rewriting's proofs (:func:`_state_rewriting`).  A function in a plain
     .text section is authored on both objects' function-isolated views
     (:func:`isolated_grind_objects`).
@@ -606,6 +615,7 @@ def qualify_state(
                 reference_object=reference_object,
                 helper_library=helper_library,
                 donor_type_server=donor_type_server,
+                donor_debug_sibling=donor_debug_sibling,
             )
         except DiscoveryAuthoringError as rewriting_error:
             raise DiscoveryAuthoringError(
@@ -643,6 +653,7 @@ def qualify_state(
                 reference_object=reference_object,
                 helper_library=helper_library,
                 donor_type_server=donor_type_server,
+                donor_debug_sibling=donor_debug_sibling,
             )
         except DiscoveryAuthoringError as rewriting_error:
             raise DiscoveryAuthoringError(f"{splice_error}; rewriting: {rewriting_error}") from None
@@ -1023,9 +1034,12 @@ def run_project_grind(
             or type(product.object_payload) is not bytes
             or not product.object_payload
             or (
-                type(product.type_server) is not bytes or not product.type_server
+                type(product.type_server) is not bytes
+                or not product.type_server
+                or product.debug_sibling is not None
                 if writes_pdb
                 else product.type_server is not None
+                or type(product.debug_sibling) is not DebugSibling
             )
             for product in donor_products.values()
         ):
@@ -1079,6 +1093,9 @@ def run_project_grind(
                     donor_type_server=donor_products[
                         provisional_record.intervention.id
                     ].type_server,
+                    donor_debug_sibling=donor_products[
+                        provisional_record.intervention.id
+                    ].debug_sibling,
                 )
                 if authored.donor.intervention.id != provisional_record.intervention.id:
                     raise GrindError("final donor identity differs from its compiler probe")

@@ -6,7 +6,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from reprobit.classic.semantic_errors import ClassicSemanticError
 from reprobit.implementation import scoped_package_import_closure_digest
@@ -20,6 +20,9 @@ from reprobit.schema import (
     ClassicRecipeIntervention,
 )
 from reprobit.strict_json import canonical_json
+
+if TYPE_CHECKING:
+    from reprobit.classic.frame_objects import DebugSibling
 
 
 class SemanticValidatorContract(Protocol):
@@ -296,6 +299,9 @@ class _ClassicDonorSemanticMaterial:
     # frame-objects proof reads (a14 of `function_validation`); None when the
     # producer did not keep it.
     donor_type_server: bytes | None = field(default=None, repr=False, compare=False)
+    # For a donor compiled without /Zi whose consumer reads it (a14): the same
+    # compile with /Zi added (`frame_objects.DebugSibling`); None otherwise.
+    donor_debug_sibling: DebugSibling | None = field(default=None, repr=False, compare=False)
 
 
 def _require_classic_candidate_semantic_material(

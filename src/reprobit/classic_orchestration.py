@@ -869,6 +869,10 @@ def compose_classic_unit(
         donor_id: getattr(material, "donor_type_server", None)
         for donor_id, material in donor_materials.items()
     }
+    donor_debug_siblings = {
+        donor_id: getattr(material, "donor_debug_sibling", None)
+        for donor_id, material in donor_materials.items()
+    }
     donor_object_recorder = getattr(measured_receipt_repair, "record_unit_donor_objects", None)
     if donor_object_recorder is not None:
         # A repair analysis keeps every unit's fresh donor objects, bound to the
@@ -1033,6 +1037,7 @@ def compose_classic_unit(
             compiler_identity=unit.compiler_identity,
             helper_library=unit.helper_library,
             donor_type_server=donor_type_servers.get(primary_id),
+            donor_debug_sibling=donor_debug_siblings.get(primary_id),
         )
         dispatch = repair_dispatch.dispatch_classic_action(
             dispatcher,

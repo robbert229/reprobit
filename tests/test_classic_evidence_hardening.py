@@ -677,3 +677,83 @@ def test_a_private_donor_s_type_server_is_a_produced_artifact_of_its_compile() -
     assembler, _produced, _certified = _donor_output_assembler(incomplete)
     with pytest.raises(ClassicProjectError, match="type-server receipt is incomplete"):
         assembler._add_donor_outputs()
+
+
+def _sibling_receipt(**changes: object) -> object:
+    from reprobit.classic_execution_records import ClassicDonorOutputReceipt
+
+    return ClassicDonorOutputReceipt(
+        "donor.private",
+        "compiler.unit",
+        "donor.step",
+        "R:/build/donors/o.obj",
+        Digest.from_bytes(b"donor object"),
+        len(b"donor object"),
+        **{
+            "debug_sibling_step_id": "donor.step.debug-sibling",
+            "debug_sibling_object_digest": Digest.from_bytes(b"sibling object"),
+            "debug_sibling_object_size": len(b"sibling object"),
+            "debug_sibling_type_server_digest": Digest.from_bytes(b"sibling pdb"),
+            "debug_sibling_type_server_size": len(b"sibling pdb"),
+            **changes,
+        },  # type: ignore[arg-type]
+    )
+
+
+def test_a_private_donor_s_debug_sibling_is_produced_by_its_own_step() -> None:
+    # A donor without /Zi: its debug sibling (the compile with /Zi added) is
+    # two more outputs of the donor's compiler node, from the same inputs,
+    # under the donor's certificate, attested to the sibling's own step.
+    assembler, produced, certified = _donor_output_assembler(_sibling_receipt())
+
+    assembler._add_donor_outputs()
+
+    assert [(item["reference"], item["digest"], item["step_id"]) for item in produced] == [
+        (
+            "build/private-donors/donor.private.obj",
+            Digest.from_bytes(b"donor object"),
+            "donor.step",
+        ),
+        (
+            "build/private-donors/donor.private.debug-sibling.obj",
+            Digest.from_bytes(b"sibling object"),
+            "donor.step.debug-sibling",
+        ),
+        (
+            "build/private-donors/donor.private.debug-sibling.pdb",
+            Digest.from_bytes(b"sibling pdb"),
+            "donor.step.debug-sibling",
+        ),
+    ]
+    assert produced[0]["inputs"] == produced[1]["inputs"] == produced[2]["inputs"]
+    assert certified[0] == (
+        "witness",
+        (
+            "artifact.build/private-donors/donor.private.obj",
+            "artifact.build/private-donors/donor.private.debug-sibling.obj",
+            "artifact.build/private-donors/donor.private.debug-sibling.pdb",
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"debug_sibling_type_server_size": None}, "debug-sibling receipt is incomplete"),
+        ({"debug_sibling_step_id": None}, "debug-sibling receipt is incomplete"),
+        (
+            {
+                "type_server_digest": Digest.from_bytes(b"donor pdb"),
+                "type_server_size": len(b"donor pdb"),
+            },
+            "a /Zi private donor names a debug sibling",
+        ),
+    ],
+)
+def test_an_incomplete_or_misplaced_debug_sibling_receipt_is_refused(
+    changes: dict[str, object], message: str
+) -> None:
+    assembler, _produced, _certified = _donor_output_assembler(_sibling_receipt(**changes))
+
+    with pytest.raises(ClassicProjectError, match=message):
+        assembler._add_donor_outputs()

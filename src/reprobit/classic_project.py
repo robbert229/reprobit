@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import reprobit.classic.composition as composition
 import reprobit.classic.composition_hybrid_resize as hybrid_resize
@@ -30,6 +30,7 @@ import reprobit.classic.rewriting as rewriting
 import reprobit.classic.rewriting_region_resize as region_resize
 import reprobit.classic.scheduling as scheduling
 from reprobit.classic.compiler_identity import Msvc420CompilerIdentity
+from reprobit.classic.frame_objects import DebugSibling
 from reprobit.classic.semantic_contracts import (
     _CLASSIC_SEMANTIC_ISSUER,
     _ClassicCandidateSemanticMaterial,
@@ -108,6 +109,10 @@ class ClassicDispatchMaterials:
     # a function-validation record of the frame-objects pass reads (a14);
     # None when not supplied.
     donor_type_server: bytes | None = None
+    # For a primary donor compiled without /Zi: the same unit compiled with
+    # /Zi added, whose symbols and types a frame-objects record reads when its
+    # function is the donor's exactly (a14); None when not compiled.
+    donor_debug_sibling: DebugSibling | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,6 +143,15 @@ def _reads_donor_types(family: ClassicRecipeFamily, function: Mapping[str, objec
     proof = spec.get("expected_proof") if isinstance(spec, Mapping) else None
     assumptions = proof.get("assumptions") if isinstance(proof, Mapping) else None
     return isinstance(assumptions, list) and "a14" in assumptions
+
+
+def reads_debug_sibling(family: ClassicRecipeFamily, function: Mapping[str, object]) -> bool:
+    """Whether a proved record pins a14 with extents read from the donor's /Zi sibling."""
+    if not _reads_donor_types(family, function):
+        return False
+    spec = cast(Mapping[str, object], function["function_validation"])
+    proof = cast(Mapping[str, object], spec["expected_proof"])
+    return proof.get("frame_objects_from") == "debug-sibling"
 
 
 # The families that read a donor object besides the primary one.
@@ -298,7 +312,12 @@ class ClassicFamilyDispatcher:
             )
         elif family is ClassicRecipeFamily.RETAIL_EXACT_FUNCTION_TRANSLATION_VALIDATION:
             output, proof = function_validation.produce_function_validation_candidate(
-                seed, donor, function, materials.helper_library, materials.donor_type_server
+                seed,
+                donor,
+                function,
+                materials.helper_library,
+                materials.donor_type_server,
+                materials.donor_debug_sibling,
             )
         elif family is ClassicRecipeFamily.RETAIL_EXACT_SAME_TU_INSTRUCTION_HYBRID_RESIZE:
             output, proof = hybrid_resize.produce_same_tu_instruction_hybrid_resize_candidate(
@@ -346,6 +365,17 @@ class ClassicFamilyDispatcher:
             # A record of the frame-objects pass read the donor's type server.
             binary_inputs[f"dependency_types:{intervention.dependencies[0]}"] = (
                 materials.donor_type_server
+            )
+        sibling = materials.donor_debug_sibling
+        if reads_debug_sibling(family, function):
+            # It read the debug sibling's object and PDB instead (the proof
+            # refuses a sibling it could not admit, so both are present).
+            sibling = cast(DebugSibling, sibling)
+            binary_inputs[f"dependency_debug_sibling:{intervention.dependencies[0]}"] = cast(
+                bytes, sibling.object_payload
+            )
+            binary_inputs[f"dependency_debug_sibling_types:{intervention.dependencies[0]}"] = cast(
+                bytes, sibling.type_server
             )
         source_inputs = _present_bytes(
             seed_source=materials.seed_source,

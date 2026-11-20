@@ -627,7 +627,12 @@ A record this pass made pins ``frame_objects`` (the escaping objects'
 starts and sizes) and ``assumptions: ["a14"]``; records of the earlier
 passes pin neither.  The build re-derives the extents from the donor it
 compiles and the PDB that compile wrote (`classic_project.
-ClassicDispatchMaterials.donor_type_server`).
+ClassicDispatchMaterials.donor_type_server`).  A donor compiled without
+``/Zi`` has neither symbols nor types: its extents are read from its debug
+sibling, the unit compiled with ``/Zi`` added, admitted only when its
+function's code, relocations and FPO record are the donor's exactly
+(`frame_objects.sibling_frame_source`); such a record also pins
+``frame_objects_from: "debug-sibling"``.
 
 Still refused, with the reason.  x87 operands are commuted only between
 registers (since `region_simulation`'s commutativity probe): a memory
@@ -685,7 +690,13 @@ from .candidate_recipe import (
 from .coff import _comdat_child, _comdat_child_closure
 from .debug import MSVC50_FUNCTION_FILL_BYTE, parse_codeview_symbol_stream, parse_fpo_data
 from .foundation import require_payload_free_declaration, sha256_bytes
-from .frame_objects import FrameObject, FrameObjects, donor_frame_objects
+from .frame_objects import (
+    DebugSibling,
+    FrameObject,
+    FrameObjects,
+    donor_frame_objects,
+    sibling_frame_source,
+)
 from .region_simulation import (
     _STRING_OPCODES,
     FLAG_NAMES,
@@ -3790,6 +3801,7 @@ def measure_function_validation(
     closure: Iterable[str],
     helper_library: HelperLibrary | None = None,
     donor_type_server: bytes | None = None,
+    donor_debug_sibling: DebugSibling | None = None,
 ) -> FunctionValidationMeasure:
     """Checks 1-7 and 9 on a donor object and a declaration; the measured pins of check 8.
 
@@ -3799,7 +3811,10 @@ def measure_function_validation(
     the compiler helpers the donor calls are read from (check 2).
     ``donor_type_server`` is the PDB the donor's compile wrote its types to
     (``/Zi``), which only the frame-objects pass reads (a14,
-    `frame_objects.object_type_records`).
+    `frame_objects.object_type_records`).  ``donor_debug_sibling`` is, for a
+    donor compiled without ``/Zi``, the same unit compiled with ``/Zi``
+    added; a14 reads its symbols and types only when its function is the
+    donor's exactly (`frame_objects.sibling_frame_source`).
     """
     label = "function-validation"
     donor = CoffObject(donor_bytes)
@@ -3978,11 +3993,20 @@ def measure_function_validation(
         # frame-objects pass (a14), whose summary pins its escaping objects
         # and the assumption.  A record made by an earlier pass never needs it.
         frame = cast(FrameFacts, private_frame)
+        # A donor compiled without /Zi has no CodeView: its locals and types
+        # are read from the debug sibling, admitted only when its function is
+        # the donor's exactly, so they describe the donor's frame.
+        from_sibling = not codeview
         try:
+            source, source_section, types = (
+                sibling_frame_source(donor, dp, mangled, donor_debug_sibling, label)
+                if from_sibling
+                else (donor, dp, donor_type_server)
+            )
             frame_objects = donor_frame_objects(
-                donor,
-                dp,
-                donor_type_server,
+                source,
+                source_section,
+                types,
                 base=frame.base,
                 params_end=frame.params_end,
                 context=label,
@@ -3996,10 +4020,13 @@ def measure_function_validation(
                 f"{earlier}; the frame-objects pass (a14) cannot run: the donor does not allocate "
                 "its locals block first"
             ) from earlier
+        # Only a record whose extents came from a debug sibling pins it.
+        source_pin = {"frame_objects_from": "debug-sibling"} if from_sibling else {}
         try:
             return {
                 **summary(objects, " (frame-objects pass)", frame_objects=frame_objects),
                 "equivalences": True,
+                **source_pin,
             }
         except ByteIdentityError as error:
             if not getattr(error, "private_frame", False):
@@ -4013,6 +4040,7 @@ def measure_function_validation(
             ),
             "equivalences": True,
             "entry_values": True,
+            **source_pin,
         }
 
     def passes() -> dict[str, Any]:
@@ -4146,13 +4174,15 @@ def produce_function_validation_candidate(
     function: dict[str, Any],
     helper_library: HelperLibrary | None = None,
     donor_type_server: bytes | None = None,
+    donor_debug_sibling: DebugSibling | None = None,
 ) -> tuple[bytes, dict[str, Any]]:
     """Produce the translation-validated replacement of a fresh donor body (checks 1-9).
 
     ``helper_library`` is the authenticated toolchain library, needed when
     the donor calls a compiler helper.  ``donor_type_server`` is the PDB the
-    donor's compile wrote, needed only by a record of the frame-objects pass
-    (a14).
+    donor's compile wrote, and ``donor_debug_sibling`` the ``/Zi`` sibling
+    compile of a donor compiled without ``/Zi``, each needed only by a
+    record of the frame-objects pass (a14).
     """
     label = "function-validation"
     seats = open_candidate_seats(seed_bytes, donor_bytes, function, FUNCTION_VALIDATION_RECIPE)
@@ -4160,7 +4190,13 @@ def produce_function_validation_candidate(
     pin_candidate_bodies(seats, function, FUNCTION_VALIDATION_RECIPE)
     require(set(spec) <= _SPEC_FIELDS, f"{label} declaration names an unknown field")
     measured = measure_function_validation(
-        donor_bytes, mangled, spec, seats.expected_closure, helper_library, donor_type_server
+        donor_bytes,
+        mangled,
+        spec,
+        seats.expected_closure,
+        helper_library,
+        donor_type_server,
+        donor_debug_sibling,
     )
     for key, value in measured.pins.items():
         require(

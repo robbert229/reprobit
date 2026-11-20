@@ -1265,6 +1265,53 @@ class _ClassicEvidenceAssembler:
                         logical_path=f".reprobit/private-donors/{donor.intervention_id}.pdb",
                     )
                 )
+            sibling = (
+                donor.debug_sibling_step_id,
+                donor.debug_sibling_object_digest,
+                donor.debug_sibling_object_size,
+                donor.debug_sibling_type_server_digest,
+                donor.debug_sibling_type_server_size,
+            )
+            if any(item is None for item in sibling) and any(item is not None for item in sibling):
+                raise ClassicProjectError("private donor debug-sibling receipt is incomplete")
+            if (
+                donor.debug_sibling_step_id is not None
+                and donor.debug_sibling_object_digest is not None
+                and donor.debug_sibling_object_size is not None
+                and donor.debug_sibling_type_server_digest is not None
+                and donor.debug_sibling_type_server_size is not None
+            ):
+                if donor.type_server_digest is not None:
+                    raise ClassicProjectError("a /Zi private donor names a debug sibling")
+                # The same compile with /Zi added, from the donor's own
+                # inputs: a frame-objects consumer of a donor without /Zi
+                # names its object and PDB as inputs (a14).
+                for suffix, digest, size in (
+                    (
+                        "debug-sibling.obj",
+                        donor.debug_sibling_object_digest,
+                        donor.debug_sibling_object_size,
+                    ),
+                    (
+                        "debug-sibling.pdb",
+                        donor.debug_sibling_type_server_digest,
+                        donor.debug_sibling_type_server_size,
+                    ),
+                ):
+                    artifact_ids.append(
+                        self._add_produced_artifact(
+                            node=node,
+                            reference=f"build/private-donors/{donor.intervention_id}.{suffix}",
+                            digest=digest,
+                            size=size,
+                            step_id=donor.debug_sibling_step_id,
+                            inputs=inputs,
+                            captured=True,
+                            logical_path=(
+                                f".reprobit/private-donors/{donor.intervention_id}.{suffix}"
+                            ),
+                        )
+                    )
             witness = self.witnesses[donor.intervention_id]
             certificate_id = self._add_certificate(witness, tuple(artifact_ids))
             for item in artifact_ids:

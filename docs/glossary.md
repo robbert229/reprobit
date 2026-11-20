@@ -62,6 +62,15 @@ narrative and [cli.md](cli.md) for the commands.
   directory whenever an imported link asks for debug data, and it never
   contributes to a verdict. (see [authenticity.md](authenticity.md),
   [getting-started.md](getting-started.md#debug-companions-and-the-exported-source-view))
+- **debug sibling**: for a donor whose unit compiles without `/Zi`, the same
+  unit compiled by the same toolchain with the same command line plus `/Zi`,
+  in a private arena of its own. The frame-objects proof (a14) reads a
+  function's locals and their sizes from its CodeView symbols and PDB only
+  when its function's bytes, relocations and FPO record equal the donor's
+  exactly; a sibling whose code `/Zi` changed, or whose compile failed, is
+  refused. It is a build product from the project's own sources, pinned as an
+  output of the donor's compiler node. (see
+  `reprobit.classic.frame_objects.sibling_frame_source`)
 - **terminal artifact**: the final declared output of a target, the file that
   is compared with the reference; the last node of the producer graph.
   (see [project-format.md](project-format.md), `reprobit.model.Artifact`)
