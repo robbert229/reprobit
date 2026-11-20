@@ -180,7 +180,13 @@ never the register a load of it gives (``("fmem", w, m)`` is not
 ``("fld", w, m)``): ``fld`` quiets an SNaN and raises DE for a denormal
 before the operation, so the two differ in the result's NaN payload and in
 DE when the other operand is a NaN (``tests/fixtures/x87_probe/
-memory_operands.out``), and two memory operands never commute.
+memory_operands.out``), and two memory operands never commute.  The one
+exception is a whole-function proof's x87 memory-operands run, under a19
+of :mod:`reprobit.classic.function_validation` (no operand of an add or
+multiply with a memory operand is a NaN): there ``fadd``/``fmul`` m32 and
+m64 take the operand as ``("fld", w, m)`` with its load's event
+(:func:`x87_memory_operands_as_loads`), which ``memory_commute.out`` shows
+exact for every non-NaN operand under every control word.
 """
 
 from __future__ import annotations
@@ -2016,6 +2022,27 @@ def _control_word_step(
         x87.pop()
 
 
+def x87_memory_operands_as_loads(state: PathState) -> bool:
+    """Whether the path runs a whole-function proof's x87 memory-operands run (a19).
+
+    Only a frame model whose facts ask for it (``x87_memory_operands`` of
+    `function_validation.FrameFacts`) turns it on; a region proof never does.
+    Under a19 -- no operand of an x87 add or multiply with a memory operand is
+    a NaN -- ``fadd``/``fmul`` m32 and m64 compute the register form's result
+    from the operand's load: the 80-bit result, the exception flags, SF, ES
+    and C1 of ``fld A; fadd B`` equal those of ``fld A; fld B; faddp`` and of
+    ``fld B; fadd A`` under all twelve rounding-mode and precision-control
+    settings (`tests/fixtures/x87_probe/memory_commute.out`, every non-NaN
+    pair of 15 operands of each width).  So the operand is the term
+    ``("fld", w, m)`` a load gives, whose event (the load's flags: DE for a
+    denormal; no SNaN to quiet) is recorded with the operation's, and add and
+    multiply then sort their operands as for registers.  With a NaN operand
+    the payload chosen and DE differ (40 of the probe's 1156 lines), which
+    a19 excludes; nothing else changes.
+    """
+    return bool(getattr(state.frame, "x87_memory_operands", False))
+
+
 def _x87_step(state: PathState, item: _Instruction, undefined: _Undefined) -> None:
     """Execute one x87 instruction of the closed set (see the module docstring)."""
     context = item.context
@@ -2047,7 +2074,18 @@ def _x87_step(state: PathState, item: _Instruction, undefined: _Undefined) -> No
     if mod != 3:
         if op in (0xD8, 0xDC):
             width = 4 if op == 0xD8 else 8
-            operand = ("fmem", width * 8, _load(state, item.address(state.regs), width))
+            loaded = _load(state, item.address(state.regs), width)
+            if digit in (0, 1) and x87_memory_operands_as_loads(state):
+                # a19 (a whole-function proof's x87 memory-operands run): an
+                # add or multiply whose operands are never NaNs reads its
+                # memory operand as the register a load gives -- the same
+                # value, raising what the load raises (DE for a denormal) --
+                # so the operation is the register form, whose operands
+                # commute (`x87_memory_operands_as_loads`).
+                operand = ("fld", width * 8, loaded)
+                x87.event(operand)
+            else:
+                operand = ("fmem", width * 8, loaded)
             if digit in (2, 3):
                 x87.compare("fcom", operand)
                 if digit == 3:
@@ -3678,5 +3716,6 @@ __all__ = [
     "term_atoms",
     "x87_intrinsic_arity",
     "x87_intrinsic_call",
+    "x87_memory_operands_as_loads",
     "x87_stacks_equivalent",
 ]
