@@ -91,7 +91,8 @@ def test_conditions_bound_a_term_exactly() -> None:
     assert facts[v] == (3, 9)
     assert condition_ranges([(("ltu", 32, v, lin(4)), False)])[v] == (4, 0xFFFFFFFF)
     assert condition_ranges([(("eqz", 32, v), True)])[v] == (0, 0)
-    assert condition_ranges([(("eqz", 32, v), False)]) == {}
+    # v != 0 (the canonical form of not (v <u 1)) puts v in [1, 2**32 - 1].
+    assert condition_ranges([(("eqz", 32, v), False)])[v] == (1, 0xFFFFFFFF)
 
 
 def test_an_atom_is_bounded_by_a_fact_on_itself_plus_a_constant() -> None:

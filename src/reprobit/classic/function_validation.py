@@ -150,7 +150,10 @@ Checks (each is a refusal):
    CL, the count masked to five bits and never assumed non-zero (the flags
    are functions of the value, the masked count and the flag before; CF of
    a narrow shift by CL, OF and AF are undefined); ``adc`` and ``sbb``, the
-   carry the canonical CF bit (``sbb r, r`` is ``-CF``); byte-wide ``not``,
+   carry the canonical CF bit (``sbb r, r`` is ``-CF``, and an unsigned
+   compare against a constant has one canonical atom and polarity, so
+   ``[1 <u x]`` and ``1 - [x <u 2]`` meet: `region_simulation._ltu`,
+   `region_simulation.zero_extend`); byte-wide ``not``,
    ``neg``, ``mul``, ``imul``, ``div`` and ``idiv`` (a division an event in
    the footprint); and ``movzx``/``movsx`` into a 16-bit register.  Every
    other operand-size-prefixed form is refused.
@@ -899,6 +902,7 @@ from .region_simulation import (
     contradictory,
     lin,
     lin_atom,
+    lin_scale,
     lin_sub,
     mentions_x87_undefined,
     region_boundaries,
@@ -1141,8 +1145,9 @@ def condition_ranges(conditions: Iterable[tuple[Term, bool]]) -> dict[Term, Rang
     Each condition is a fact of the path (``run_paths`` forks at it), so each
     bound is exact: ``v <u M`` taken puts v in [0, M - 1], not taken in
     [M, 2**32 - 1]; ``N <u v`` taken puts v in [N + 1, 2**32 - 1], not taken
-    in [0, N]; ``v == 0`` puts v at 0, and a switch fact ``("case", v, i)``
-    at i.  Several facts on one term intersect.
+    in [0, N]; ``v == 0`` puts v (and -v) at 0, and ``v != 0`` in [1, 2**32 -
+    1] (the canonical ``v <u 1``, `region_simulation._ltu`); and a switch
+    fact ``("case", v, i)`` at i.  Several facts on one term intersect.
     """
     found: dict[Term, Range] = {}
 
@@ -1165,8 +1170,12 @@ def condition_ranges(conditions: Iterable[tuple[Term, bool]]) -> dict[Term, Rang
                     bound(right, k + 1, _TOP)
                 elif not holds:
                     bound(right, 0, k)
-        elif atom[0] == "eqz" and len(atom) == 3 and atom[1] == 32 and holds:
-            bound(atom[2], 0, 0)
+        elif atom[0] == "eqz" and len(atom) == 3 and atom[1] == 32:
+            for term in (atom[2], lin_scale(atom[2], -1)):
+                if holds:
+                    bound(term, 0, 0)
+                else:
+                    bound(term, 1, _TOP)
         elif atom[0] == "case" and len(atom) == 3 and holds and isinstance(atom[2], int):
             bound(atom[1], atom[2], atom[2])
     return found
@@ -2280,10 +2289,21 @@ def switch_bound(conditions: Iterable[tuple[Term, bool]], value: Term) -> int | 
 
     The fall-through of ``cmp v, N; ja default`` holds ``not (N <u v)``; the
     taken side of ``cmp v, M; jb case`` (or the fall-through of ``jae``)
-    holds ``v <u M``.  Each is a fact of the path, so the bound is exact.
+    holds ``v <u M``.  `region_simulation._ltu` writes the first as ``v <u N
+    + 1`` and ``v <u 1`` as ``v == 0``, the bound 0.  Each is a fact of the
+    path, so the bound is exact.
     """
     best: int | None = None
     for atom, holds in conditions:
+        if (
+            holds
+            and isinstance(atom, tuple)
+            and len(atom) == 3
+            and atom[:2] == ("eqz", 32)
+            and value in (atom[2], lin_scale(atom[2], -1))
+        ):
+            best = 0
+            continue
         if not (isinstance(atom, tuple) and len(atom) == 4 and atom[:2] == ("ltu", 32)):
             continue
         left, right = atom[2], atom[3]
