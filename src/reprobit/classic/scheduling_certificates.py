@@ -7,6 +7,7 @@ from typing import Any, cast
 from reprobit.binary import require
 from reprobit.coff_format import (
     CoffObject,
+    carries_codeview,
     coff_body,
     coff_unpack,
     detailed_relocations,
@@ -18,7 +19,12 @@ from .coff import (
     _comdat_child_closure,
     function_symbol,
 )
-from .debug import CODEVIEW_PROCEDURE_RECORD_TYPES, FPO_RECORD_KEYS, parse_codeview_symbol_stream
+from .debug import (
+    CODEVIEW_PROCEDURE_RECORD_TYPES,
+    FPO_RECORD_KEYS,
+    parse_codeview_symbol_stream,
+    parse_fpo_data,
+)
 from .foundation import (
     RelocationView,
     exact_audit_keys,
@@ -44,20 +50,34 @@ def measure_instruction_schedule_debug_envelope(
     section: dict[str, Any],
     context: str,
 ) -> dict[str, Any]:
-    """Measure the procedure range and closure references used by rewriting proofs."""
+    """Measure the procedure range and closure references used by rewriting proofs.
 
-    child = _comdat_child(coff, section, ".debug$S")
-    stream = coff_body(coff, child)
-    records = parse_codeview_symbol_stream(stream, f"{context} debug$S")
-    procedures = [record for record in records if record["type"] in CODEVIEW_PROCEDURE_RECORD_TYPES]
-    require(
-        len(procedures) == 1,
-        f"{context}: the .debug$S stream does not carry exactly one procedure record",
-    )
-    record = procedures[0]
-    procedure_range = list(
-        coff_unpack("<III", stream, record["offset"] + 16, f"{context} procedure record")
-    )
+    The range is the CodeView procedure record's (code length, debug start,
+    debug end).  An object without CodeView (its unit compiles without /Zi)
+    has no such record; its range is the FPO record's (cbProcSize, cbProlog),
+    the same code length and the prologue end the record keeps
+    (:func:`procedure_range_boundaries`).
+    """
+
+    if not carries_codeview(coff):
+        frame = _comdat_child(coff, section, ".debug$F")
+        fpo = parse_fpo_data(bytes(coff_body(coff, frame)), expected_proc_size=section["raw_size"])
+        procedure_range = [fpo["cbProcSize"], fpo["cbProlog"]]
+    else:
+        child = _comdat_child(coff, section, ".debug$S")
+        stream = coff_body(coff, child)
+        records = parse_codeview_symbol_stream(stream, f"{context} debug$S")
+        procedures = [
+            record for record in records if record["type"] in CODEVIEW_PROCEDURE_RECORD_TYPES
+        ]
+        require(
+            len(procedures) == 1,
+            f"{context}: the .debug$S stream does not carry exactly one procedure record",
+        )
+        record = procedures[0]
+        procedure_range = list(
+            coff_unpack("<III", stream, record["offset"] + 16, f"{context} procedure record")
+        )
     values = {
         symbol["name"]: symbol["value"]
         for symbol in coff.symbols.values()
@@ -73,6 +93,25 @@ def measure_instruction_schedule_debug_envelope(
         "procedure_range": procedure_range,
         "code_symbol_references": referenced,
     }
+
+
+def procedure_range_boundaries(
+    coff: CoffObject, procedure_range: list[int], context: str
+) -> tuple[int, list[tuple[str, int]]]:
+    """Split a measured procedure range into its code length and named boundaries.
+
+    A CodeView range names its debug start and end; an FPO range (an object
+    without CodeView) names the prologue end its record keeps.  The range's
+    shape must be the one the object's debug format writes.
+    """
+
+    if carries_codeview(coff):
+        require(len(procedure_range) == 3, f"{context}: the CodeView procedure range is malformed")
+        code_length, debug_start, debug_end = procedure_range
+        return code_length, [("debug_start", debug_start), ("debug_end", debug_end)]
+    require(len(procedure_range) == 2, f"{context}: the FPO procedure range is malformed")
+    code_length, prologue_end = procedure_range
+    return code_length, [("FPO prologue end", prologue_end)]
 
 
 def require_instruction_schedule_debug_fidelity(
@@ -107,16 +146,22 @@ def require_instruction_schedule_debug_fidelity(
     boundaries.add(len(image) if code_length is None else code_length)
     index_of = {start: position for position, (start, _) in enumerate(spans)}
     line_bytes = _coff_table_bytes(coff, section, "lines")
+    # The sentinel row is always present; a function the compiler gave no
+    # line row (MSVC 5.0 does so for some one-statement functions) has no
+    # row for a reordering to keep on an instruction boundary.  A compile
+    # without /Zi writes no line table at all, sentinel included.
+    lineless = not carries_codeview(coff) and section["line_count"] == 0
     require(
-        len(line_bytes) == section["line_count"] * 6 and len(line_bytes) >= 12,
+        len(line_bytes) == section["line_count"] * 6 and (len(line_bytes) >= 12 or lineless),
         f"{context}: the compiler line table is missing",
     )
-    marker_index, marker_line = coff_unpack("<IH", line_bytes, 0, f"{context} line sentinel")
-    function_index, _ = function_symbol(coff, mangled, section["number"])
-    require(
-        marker_line == 0 and marker_index == function_index,
-        f"{context}: the compiler line sentinel differs",
-    )
+    if not lineless:
+        marker_index, marker_line = coff_unpack("<IH", line_bytes, 0, f"{context} line sentinel")
+        function_index, _ = function_symbol(coff, mangled, section["number"])
+        require(
+            marker_line == 0 and marker_index == function_index,
+            f"{context}: the compiler line sentinel differs",
+        )
     rows = []
     for position in range(1, section["line_count"]):
         offset, line = coff_unpack(
@@ -150,15 +195,16 @@ def require_instruction_schedule_debug_fidelity(
         )
         interior.extend(attribution)
     envelope = measure_instruction_schedule_debug_envelope(coff, section, context)
-    code_length, debug_start, debug_end = envelope["procedure_range"]
+    procedure_range = list(envelope["procedure_range"])
+    code_length, named_boundaries = procedure_range_boundaries(coff, procedure_range, context)
     require(
-        [code_length, debug_start, debug_end] == spec["expected_procedure_range"],
+        procedure_range == spec["expected_procedure_range"],
         f"{context}: the procedure record's code range differs from its declaration",
     )
     require(
         code_length == len(image), f"{context}: the procedure record's code length is not the body"
     )
-    for name, value in (("debug_start", debug_start), ("debug_end", debug_end)):
+    for name, value in named_boundaries:
         require(
             value in boundaries,
             f"{context}: the procedure record's {name} is not an instruction boundary of the image",
@@ -188,7 +234,7 @@ def require_instruction_schedule_debug_fidelity(
     return {
         "line_rows": len(rows),
         "window_line_rows": interior,
-        "procedure_range": [code_length, debug_start, debug_end],
+        "procedure_range": procedure_range,
         "code_symbol_references": referenced,
     }
 

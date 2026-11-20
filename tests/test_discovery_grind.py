@@ -216,7 +216,10 @@ def _install_grind_fixture(
         reference_object: bytes,
         candidate_object: bytes,
         symbol: str,
+        isolated: bool = False,
     ) -> None:
+        # The fixture's objects are not COFF, so none is a function-isolated view.
+        assert not isolated
         trace.reference_objects.append(reference_object)
         assert reference_object == b"sealed reference"
         assert symbol == "_sealed_symbol"

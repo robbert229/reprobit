@@ -18,7 +18,9 @@ from reprobit.authority_snapshot import (
     JsonAuthorityDirectorySnapshot,
     assert_json_authority_unchanged,
 )
+from reprobit.binary import ByteIdentityError
 from reprobit.classic_donors import generate_declaration_shape, generate_extern_run
+from reprobit.coff_function_view import defined_in_plain_text, isolate_functions
 from reprobit.costs import calculate_cost
 from reprobit.discovery_authoring import (
     AuthoredClassicRecord,
@@ -336,6 +338,34 @@ def _state_equal_body(
             raise strict_error from None
 
 
+def isolated_grind_objects(
+    seed_object: bytes, donor_object: bytes, symbol: str
+) -> tuple[bytes, bytes, bool]:
+    """The seed and donor the producers read, and whether they are isolated views.
+
+    When the seed keeps ``symbol`` in a plain .text section (its unit compiles
+    without /Gy), both objects are replaced by their function-isolated views
+    (`reprobit.coff_function_view`): the producers place and replace the
+    function as a COMDAT there, and the build projects each record's output
+    back onto the object it compiles.
+    """
+    if not defined_in_plain_text(seed_object, symbol):
+        return seed_object, donor_object, False
+    try:
+        if not defined_in_plain_text(donor_object, symbol):
+            raise ByteIdentityError("the donor does not keep the function in a plain .text section")
+        return (
+            isolate_functions(seed_object).view,
+            isolate_functions(donor_object).view,
+            True,
+        )
+    except ByteIdentityError as exc:
+        raise DiscoveryAuthoringError(
+            f"{symbol!r} lies in a plain .text section (its unit compiles without /Gy) and "
+            f"cannot be isolated: {exc}"
+        ) from exc
+
+
 def describe_state(state: DeclarationState) -> str:
     """A short human label for one grind state's declarations."""
 
@@ -636,11 +666,16 @@ def run_project_grind(
             state_id = declaration_state_id(state)
             rejected = False
             try:
+                state_seed, state_donor, isolated = isolated_grind_objects(
+                    seed_object,
+                    donor_objects[provisional_record.intervention.id],
+                    context.symbol,
+                )
                 authored = _state_equal_body(
                     state,
                     context,
-                    seed_object=seed_object,
-                    donor_object=donor_objects[provisional_record.intervention.id],
+                    seed_object=state_seed,
+                    donor_object=state_donor,
                 )
                 if authored.donor.intervention.id != provisional_record.intervention.id:
                     raise GrindError("final donor identity differs from its compiler probe")
@@ -648,6 +683,7 @@ def run_project_grind(
                     reference_object=reference_object,
                     candidate_object=authored.candidate_object,
                     symbol=context.symbol,
+                    isolated=isolated,
                 )
                 final_documents = merge_authored_records(
                     context.intervention_document,
