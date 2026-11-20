@@ -968,6 +968,10 @@ def _load(state: PathState, address: Term, width: int) -> Term:
         relation = address_relation(address, width, entry[0], entry[1], objects)
         if relation == "disjoint":
             continue
+        if state.frame is not None and state.frame.apart(address, entry[0]):
+            # A whole-function proof's frame object whose address has not
+            # left the function (`function_validation.FrameModel.apart`).
+            continue
         if relation == "same" and not deps:
             return entry[2]
         deps.append(entry)
@@ -2397,6 +2401,8 @@ def _block_string(state: PathState, item: _Instruction, width: int) -> None:
     if movs:
         frame.block_start(state, esi, f"{context}: the rep {kind}'s source")
     value = None if movs else _get(state, 0, width * 8)
+    if value is not None:
+        frame.expose(value)  # the value reaches memory
     term = (
         "rep",
         kind,
@@ -2604,6 +2610,117 @@ def run_helper(
 
 
 HELPER_MAX_DEPTH = 4
+
+
+# The CRT's x87 intrinsic dispatchers (``__CIfmod``, ``__CIsin``, ...): a
+# body ``mov edx, __OP_<NAME>jmptab; jmp __cintrindispN`` dispatches on N
+# operands on the x87 stack (`x87_intrinsic_arity`).
+_INTRINSIC_DISPATCHERS = {"__cintrindisp1": 1, "__cintrindisp2": 2}
+
+
+def x87_intrinsic_arity(helper: HelperCode) -> int | None:
+    """N when a helper's body is an x87 intrinsic dispatcher of N operands, else None.
+
+    The body must start exactly ``mov edx, imm32`` whose field is a DIR32 to
+    an ``__OP_<NAME>jmptab`` table, then ``jmp rel32`` whose field is a
+    REL32 to ``__cintrindisp1`` (one operand, ST(0)) or ``__cintrindisp2``
+    (two, ST(0) and ST(1)) with a zero addend, and that dispatcher must be a
+    body of the helper's resolved closure.  This is the form of every
+    ``__CI<name>`` member of MSVC 5.0's libc.lib (``87cdisp.obj``'s callers).
+    """
+    code, relocations = helper.code, helper.relocations
+    if len(code) < 10 or code[0] != 0xBA or code[5] != 0xE9 or any(code[6:10]):
+        return None
+    table, target = relocations.get(1), relocations.get(6)
+    if not (
+        isinstance(table, str)
+        and table.startswith("__OP_")
+        and table.endswith("jmptab")
+        and isinstance(target, tuple)
+        and target[0] == "rel32"
+    ):
+        return None
+    arity = _INTRINSIC_DISPATCHERS.get(target[1])
+    if arity is None or target[1] not in helper.linked:
+        return None
+    if set(relocations) & set(range(2, 5)) or set(relocations) & set(range(7, 10)):
+        return None
+    return arity
+
+
+def x87_intrinsic_call(
+    state: PathState, helper: HelperCode, arity: int, undefined: _Undefined, context: str
+) -> None:
+    """A call to an x87 intrinsic dispatcher (a17): one event, as a call to a C function is.
+
+    Whole-function proofs only.  ``__CIfmod`` and its kin take their N
+    operands on the x87 stack and leave one result there; the dispatcher
+    behind them classifies the operands, may call ``_matherr``, set
+    ``errno`` or raise an exception (each reading or writing memory), and
+    loops on ``fprem`` -- control flow on the operands' values, which the
+    simulator cannot run.  Under a17 of
+    :mod:`reprobit.classic.function_validation` the call is an event named
+    by everything it can read: the helper, ESP, the store log since the
+    last event and that event (memory), the whole x87 stack and the sticky
+    exception flags; the control word must be the one both versions share.
+    The x87 stack must hold exactly the N operands (its depth is known), so
+    no register below them exists to preserve.  After it: memory is the
+    event's result (the store log restarts), the stack holds one value, the
+    event's result ``("fret", event)``, C0-C3 are the event's, EAX, ECX and
+    EDX are fresh results of the event, the flags are undefined, and ESP,
+    EBX, ESI, EDI and EBP are kept.
+    """
+    where = f"{context}: the x87 intrinsic {helper.symbol}"
+    fpu = state.fpu
+    require(fpu.cw is None, f"{where} is called while the x87 control word is changed")
+    require(not fpu.after_call, f"{where} is called with an x87 stack of unknown depth")
+    if fpu.call_frame:
+        depth: Any = fpu.push
+    else:
+        require(fpu.origin is not None, f"{where} is called with an x87 stack of unknown depth")
+        depth = fpu.origin + fpu.push
+    require(
+        depth == arity,
+        f"{where} takes {arity} x87 operands, and is called with {depth} values on the stack",
+    )
+    identity: Term = (
+        "x87intrinsic",
+        helper.symbol,
+        helper.sha256,
+        state.regs["esp"],
+        store_normal_form(state.stores, _objects(state)),
+        state.epoch,
+        (fpu.base, fpu.push, fpu.view().slots),
+        tuple(sorted(set(fpu.events), key=repr)),
+    )
+    if not fpu.call_frame:
+        # The operands may be entry registers of the frame: name them too.
+        identity = (
+            *identity,
+            tuple(
+                fpu.slots.get(position, fpu.entry_term(position))
+                for position in range(-fpu.push, -fpu.push + arity)
+            ),
+        )
+        fpu.call_pushes.append(fpu.push - arity)
+        fpu.need = max(fpu.need, arity - fpu.push)
+    state.events.append(identity)
+    state.footprint.add(("event", identity))
+    frame = state.frame
+    identity = frame.event_name(identity)
+    state.stores = []
+    state.epoch = identity
+    fpu.base = identity
+    fpu.cc = {name: ("fcccall", identity, fpu.cc[name]) for name in X87_CONDITION_BITS}
+    fpu.push = 1
+    fpu.slots = {-1: ("fret", identity)}
+    fpu.after_call = False
+    fpu.call_frame = True
+    fpu.used = True
+    for name in ("eax", "ecx", "edx"):
+        state.regs[name] = lin_atom(("callret", name, identity))
+    for name in FLAG_NAMES:
+        state.flags[name] = undefined(name)
 
 
 def _helper_transfer(body: HelperCode, item: _Instruction) -> tuple[str, Any] | None:
@@ -3163,6 +3280,15 @@ def _step(
         )
         if helpers is not None and symbol in helpers:
             esp = state.regs["esp"]
+            arity = x87_intrinsic_arity(helpers[symbol])
+            if arity is not None and state.frame is not None:
+                require(
+                    item.helper_stack_change in (None, 0),
+                    f"{context}: the x87 intrinsic {symbol} changes ESP otherwise than the stack "
+                    f"relation solved ({item.helper_stack_change:+d})",
+                )
+                x87_intrinsic_call(state, helpers[symbol], arity, undefined, context)
+                return ("fall", None)
             run_helper(state, helpers[symbol], undefined, context, item.offset + item.length)
             if item.helper_stack_change is not None:
                 change = const_of(lin_sub(state.regs["esp"], esp))
@@ -3550,5 +3676,7 @@ __all__ = [
     "store_normal_form",
     "stores_equivalent",
     "term_atoms",
+    "x87_intrinsic_arity",
+    "x87_intrinsic_call",
     "x87_stacks_equivalent",
 ]

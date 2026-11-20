@@ -524,6 +524,26 @@ obeys the same rule whenever it uses it.  The replacement's accesses that
 are not at a constant offset from ESP0 are the donor's (5c compares the
 footprints path by path), and its constant-offset accesses are classified
 by the same extents, so the two versions agree on which bytes are memory.
+(a16) Lifetimes, for the indexed frame-objects pass only (below): a local's
+storage begins at the function's entry, so no pointer that exists before
+it -- an argument, a register's entry value, a word of memory -- points
+into the function's own locals block, and the donor, compiled C, never
+dereferences a stale one (C99 6.2.4p2: a pointer to an object whose
+lifetime has ended is indeterminate).  So until a local's address is
+stored to memory or passed to a callee, only addresses computed from that
+address reach it.  (a17) x87 intrinsics: a call to a CRT intrinsic
+dispatcher of the toolchain's library (``__CIfmod``, ``__CIsin``, ...: a
+body ``mov edx, __OP_<NAME>jmptab; jmp __cintrindispN``) behaves as MSVC
+5.0 calls it: it takes its N operands from ST(0) (and ST(1)), leaves one
+result in ST(0) and nothing else on the x87 stack, returns to its caller
+with ESP, EBX, ESI, EDI and EBP as they were, reads no general register
+and no word of its caller's stack, and is otherwise a deterministic
+function of its operands, the x87 control and status words and memory (it
+may read and write memory: ``errno``, ``_matherr``, its own flags).  It
+classifies its operands and loops on ``fprem``, so its control flow
+depends on the operands' values, which the simulator does not run; the
+call is an event named by all of those inputs, as a C call is
+(`region_simulation.x87_intrinsic_call`).
 No other assumption is made: the relation is inferred, nothing about the
 replacement is believed, and the simulator's term model is exact.
 
@@ -616,14 +636,53 @@ private frame whose escaping objects are memory.
   object that is stored or starts a block string operation (a compiler
   temporary has no record, so its extent is unknown);
   an access at a variable offset from ESP itself (its displacement may fold
-  an index, so its object is not known); an access that lies partly inside
+  an index, so its object is not known; the indexed pass admits one whose
+  index range proves its object); an access that lies partly inside
   an escaping object; an access at a constant offset from an object's atom
   that leaves the object; a stored pointer at a constant offset outside its
   object, one past its end included (``va_start``'s address past the last
   parameter, which a callee walks beyond the object); an address combining
   objects' atoms other than as one pointer.
 
-A record this pass made pins ``frame_objects`` (the escaping objects'
+The indexed frame-objects pass.  When the frame-objects pass refuses, it
+runs once more (`FrameFacts.indexed`) with three changes, each a fact the
+proof establishes or a16:
+
+- An address ESP0 + k + V, V = sum(c_i a_i) not constant, is admitted when
+  the range of V lies in one object: each atom's unsigned range is known
+  (`atom_range`: its form -- a zero-extended or inserted ``setcc`` byte, a
+  masked value -- the path's conditions, and the relation's ranges), so
+  every value of k + V lies in [k + lo, k + hi].  An access whose bytes
+  [k + lo, k + hi + width) lie inside one object is memory in that object,
+  which escapes; a value (a register, a stored word) whose every address
+  [k + lo, k + hi] is a byte of one object becomes that object's atom plus
+  k - s + V, as a constant-offset address does.  Every other variable
+  stack address is still refused.  The C rule of a14 is not used to place
+  them: the range is proved.
+- The relation carries an unsigned range for each non-constant class of
+  32-bit values (`ValueClass.bounds`): the range both paths of a pair give
+  its term at the join (`establish`), the hull over every pair into it
+  (`meet`, widened away after ``MAX_WIDENINGS`` growths), and the final
+  pass checks that every pair's range lies within it (`implies`).  So a
+  loop counter compared with its bound before the back edge is bounded at
+  the loop head, where its class atom then carries that range.
+- On a path from the function's entry, an escaping local whose address has
+  not yet left the function -- stored to memory, passed in a call's
+  argument words or as a ``rep stos`` value -- is disjoint from every
+  address that names no frame object and is not computed from ESP0
+  (`FrameModel.apart`, a16): a load through a pointer argument does not
+  depend on the stores the function made into its own fresh locals.
+
+A record this pass made pins ``frame_object_indexes`` and ``assumptions:
+["a14", "a16"]``.
+
+A call to an x87 intrinsic dispatcher (a17) is an event in every pass: its
+body always refused before (it branches on memory), so no earlier record
+runs through one.  The x87 stack must hold exactly its operands.  A record
+whose donor calls one pins ``x87_intrinsics`` (the helpers) and a17 among
+its ``assumptions``.
+
+A record the frame-objects pass made pins ``frame_objects`` (the escaping objects'
 starts and sizes) and ``assumptions: ["a14"]``; records of the earlier
 passes pin neither.  The build re-derives the extents from the donor it
 compiles and the PDB that compile wrote (`classic_project.
@@ -724,6 +783,7 @@ from .region_simulation import (
     mentions_x87_undefined,
     region_boundaries,
     stores_equivalent,
+    x87_intrinsic_arity,
 )
 from .region_x87 import x87_return_cases, x87_stack_solution
 from .relational import ia32_relational_flow_walk
@@ -918,6 +978,154 @@ def closed_term(term: Term) -> bool:
     return True
 
 
+# --- unsigned ranges (the indexed frame-objects pass) ---------------------------------
+
+Range = tuple[int, int]
+_TOP = _MASK
+
+
+def _meet_range(left: Range | None, right: Range | None) -> Range | None:
+    if left is None:
+        return right
+    if right is None:
+        return left
+    return (max(left[0], right[0]), min(left[1], right[1]))
+
+
+def condition_ranges(conditions: Iterable[tuple[Term, bool]]) -> dict[Term, Range]:
+    """The unsigned range each 32-bit term a path's conditions bound must lie in.
+
+    Each condition is a fact of the path (``run_paths`` forks at it), so each
+    bound is exact: ``v <u M`` taken puts v in [0, M - 1], not taken in
+    [M, 2**32 - 1]; ``N <u v`` taken puts v in [N + 1, 2**32 - 1], not taken
+    in [0, N]; ``v == 0`` puts v at 0, and a switch fact ``("case", v, i)``
+    at i.  Several facts on one term intersect.
+    """
+    found: dict[Term, Range] = {}
+
+    def bound(term: Term, low: int, high: int) -> None:
+        found[term] = cast(Range, _meet_range(found.get(term), (low, high)))
+
+    for atom, holds in conditions:
+        if not isinstance(atom, tuple) or not atom:
+            continue
+        if atom[0] == "ltu" and len(atom) == 4 and atom[1] == 32:
+            left, right = atom[2], atom[3]
+            r, k = const_of(right), const_of(left)
+            if r is not None:
+                if holds and r > 0:
+                    bound(left, 0, r - 1)
+                elif not holds:
+                    bound(left, r, _TOP)
+            elif k is not None:
+                if holds and k < _TOP:
+                    bound(right, k + 1, _TOP)
+                elif not holds:
+                    bound(right, 0, k)
+        elif atom[0] == "eqz" and len(atom) == 3 and atom[1] == 32 and holds:
+            bound(atom[2], 0, 0)
+        elif atom[0] == "case" and len(atom) == 3 and holds and isinstance(atom[2], int):
+            bound(atom[1], atom[2], atom[2])
+    return found
+
+
+def _part_range(part: Term) -> Range | None:
+    """The range of a narrow (``("b", w, ...)``) value: a ``setcc`` byte is 0 or 1."""
+    if not (isinstance(part, tuple) and len(part) == 3 and part[0] == "b"):
+        return None
+    inner = part[2]
+    if isinstance(inner, tuple) and inner and inner[0] == "cc":
+        return (0, 1)
+    if isinstance(inner, tuple) and inner and inner[0] == "k":
+        return (inner[1], inner[1])
+    return (0, (1 << part[1]) - 1)
+
+
+def _structural_range(atom: Term) -> Range | None:
+    """An atom's range from its form alone (`region_simulation.term_range`'s atoms).
+
+    A zero-extended narrow value lies in its part's range; a constant with
+    bits [low, low + w) replaced by a narrow value lies between the constant
+    with those bits clear and with the part's largest value there; ``x & m``
+    for a constant m in [0, m].
+    """
+    if not isinstance(atom, tuple) or not atom:
+        return None
+    if atom[0] == "zx" and isinstance(atom[2], int):
+        return _part_range(atom[1])
+    if atom[0] == "ins" and const_of(atom[1]) is not None:
+        part = _part_range(atom[4])
+        if part is None:
+            return None
+        mask = ((1 << atom[3]) - 1) << atom[2]
+        cleared = cast(int, const_of(atom[1])) & ~mask & _MASK
+        return (cleared + (part[0] << atom[2]), cleared + (part[1] << atom[2]))
+    if atom[0] == "op" and atom[1] == "and" and atom[2] == 32:
+        masks = [const_of(operand) for operand in atom[3] if const_of(operand) is not None]
+        if masks:
+            return (0, min(cast(int, mask) for mask in masks))
+    return None
+
+
+def atom_range(atom: Term, facts: Mapping[Term, Range]) -> Range | None:
+    """The unsigned range of an atom: its form, and every fact on a term atom + c.
+
+    A fact t in [lo, hi] with t = atom + c (mod 2**32) puts the atom in
+    [lo - c, hi - c] when no value of t lies on both sides of c (the
+    subtraction then does not wrap, or wraps for every value alike).
+    """
+    found = _structural_range(atom)
+    single = lin_atom(atom)
+    for term, (low, high) in facts.items():
+        if term[0] != "lin":
+            continue
+        difference = lin_sub(term, single)
+        c = const_of(difference)
+        if c is None:
+            continue
+        if low >= c:
+            found = _meet_range(found, (low - c, high - c))
+        elif high < c:
+            found = _meet_range(found, (low - c + (1 << 32), high - c + (1 << 32)))
+    return found
+
+
+def linear_range(terms: Iterable[tuple[Term, int]], facts: Mapping[Term, Range]) -> Range | None:
+    """The integer range of ``sum(c_i * a_i)`` (each c_i signed), every atom bounded.
+
+    The machine value is that integer modulo 2**32.
+    """
+    low = high = 0
+    for atom, coefficient in terms:
+        bounds = atom_range(atom, facts)
+        if bounds is None:
+            return None
+        factor = _signed(coefficient)
+        if factor >= 0:
+            low += factor * bounds[0]
+            high += factor * bounds[1]
+        else:
+            low += factor * bounds[1]
+            high += factor * bounds[0]
+    return (low, high)
+
+
+def value_range(value: Term, facts: Mapping[Term, Range]) -> Range | None:
+    """The unsigned range of a 32-bit term, from the facts on it and its atoms' ranges."""
+    if value[0] != "lin":
+        return None
+    found = facts.get(value)
+    summed = linear_range(value[2], facts)
+    if summed is not None:
+        for constant in (value[1], value[1] - (1 << 32)):
+            if constant + summed[0] >= 0 and constant + summed[1] <= _TOP:
+                found = _meet_range(found, (constant + summed[0], constant + summed[1]))
+                break
+    if found is not None and found[0] > found[1]:
+        return None  # contradictory facts: the path is infeasible; claim nothing
+    return found
+
+
 # --- the frame model ----------------------------------------------------------------
 
 
@@ -952,6 +1160,11 @@ class FrameFacts:
     # Whether partial slot relations run: then every byte's writes are
     # tracked (``FrameModel.dirty``), the locals' in every pass.
     partial: bool = False
+    # The indexed frame-objects pass (with ``frame_objects``): a stack
+    # address ESP0 + k + V with a variable V whose range keeps it inside one
+    # frame object is that object's (`FrameModel.indexed_object`), and the
+    # relation carries each class's unsigned range (`ValueClass.bounds`).
+    indexed: bool = False
 
     def tracks(self, byte: int) -> bool:
         """Whether ``FrameModel.dirty`` records writes to the byte at ESP0 + byte."""
@@ -1049,13 +1262,133 @@ class FrameModel:
         # Pointers a block string operation left, each with the constant k
         # such that the pointer lies at or above ESP0 + k (`block_end`).
         self.block_floors: dict[Term, int] = {}
+        # The indexed pass: the range of each class atom the relation bounds
+        # (`entry_state`), and the conditions of the path this model belongs
+        # to, which `run_paths` points here before every instruction.
+        self.ranges: dict[Term, Range] = {}
+        self.conditions: list[tuple[Term, bool]] = []
+        # The indexed pass, on a path from the function's entry: the starts
+        # of the escaping objects whose address has not left the function on
+        # it (`expose`, `apart`, a16).  Empty on every other path.
+        self.unexposed: set[int] = set()
 
     def fork(self) -> FrameModel:
         forked = FrameModel(
             self.facts, self.slots, self.dirty, self.context, self.cc_sites, self.side
         )
         forked.block_floors = dict(self.block_floors)
+        forked.ranges = self.ranges
+        forked.unexposed = set(self.unexposed)
         return forked
+
+    def expose(self, value: Term) -> None:
+        """A value leaves the function: every frame object it names is exposed (a16).
+
+        Called for every value stored to memory (outside the private slots),
+        for a ``rep stos`` value, and for the argument words of every call.
+        """
+        if not self.unexposed or not computed_from_frame_object(value):
+            return
+        stack = [value]
+        while stack:
+            current = stack.pop()
+            if isinstance(current, tuple):
+                if current and current[0] == "fobj":
+                    self.unexposed.discard(current[1])
+                    continue
+                stack.extend(item for item in current if isinstance(item, (tuple, list)))
+            elif isinstance(current, list):
+                stack.extend(current)
+
+    def apart(self, left: Term, right: Term) -> bool:
+        """Whether two memory addresses are disjoint because one is an unexposed object's (a16).
+
+        On a path from the function's entry, an escaping frame object whose
+        address has not yet left the function (`expose`) can be reached only
+        through its own atom: every other address the path uses is computed
+        from the entry state (whose pointers, by C's lifetime rule, point
+        into objects that existed before this call), from loads of memory
+        (which holds no pointer into the object: none was stored), from call
+        results (no callee was given one), or from another object's atom.
+        So an access through the object's atom and one whose address names
+        no frame object's atom are disjoint.
+        """
+        if not self.unexposed:
+            return False
+        for one, other in ((left, right), (right, left)):
+            named = _frame_object_terms(one)
+            if (
+                len(named) == 1
+                and named[0][0][1] in self.unexposed
+                and other[0] == "lin"
+                and not computed_from_frame_object(other)
+                and not computed_from_stack(other)
+            ):
+                return True
+        return False
+
+    def facts_now(self, conditions: Iterable[tuple[Term, bool]] | None = None) -> dict[Term, Range]:
+        """Every range this path knows: the relation's and its conditions'."""
+        found = dict(self.ranges)
+        held = self.conditions if conditions is None else conditions
+        for term, bounds in condition_ranges(held).items():
+            found[term] = cast(Range, _meet_range(found.get(term), bounds))
+        return found
+
+    def indexed_object(self, address: Term, width: int, context: str) -> FrameObject | None:
+        """The frame object ESP0 + k + V lies in, V variable, when its range proves one.
+
+        Only in the indexed pass, for a 32-bit linear term with ESP0 at
+        coefficient 1 and other atoms none of which is computed from ESP0 or
+        a frame object.  V = sum(c_i a_i) is an integer in [lo, hi] when each
+        atom's unsigned range is known (`linear_range`: its form, the path's
+        conditions and the relation's ranges, all exact facts), so the
+        machine address is ESP0 + (k + V) mod 2**32 with k + V in
+        [k + lo, k + hi].  When [k + lo, k + hi + width) lies inside one
+        object [s, s + n), every address the term can take, and the
+        ``width`` bytes from it, lie in that object: it is returned.  Any
+        other form returns None; a range that leaves every object is refused.
+        """
+        if not self.facts.indexed or self.facts.frame_objects is None or address[0] != "lin":
+            return None
+        coefficients = dict(address[2])
+        if coefficients.get(ESP0) != 1 or len(coefficients) < 2:
+            return None
+        rest = tuple((atom, c) for atom, c in address[2] if atom != ESP0)
+        require(
+            not any(
+                computed_from_stack(atom) or computed_from_frame_object(atom) for atom, _c in rest
+            ),
+            f"{context}: a stack address whose index is itself computed from a stack address",
+        )
+        bounds = linear_range(rest, self.facts_now())
+        require(
+            bounds is not None,
+            f"{context}: a stack address at a variable offset whose index no path condition, "
+            "relation range or form bounds, so its frame object is not known",
+        )
+        offset = _signed(address[1])
+        low, high = offset + cast(Range, bounds)[0], offset + cast(Range, bounds)[1] + width
+        for item in self.facts.frame_objects.objects:
+            if item.start <= low and high <= item.end:
+                return item
+        raise ByteIdentityError(
+            f"{context}: a stack access at ESP0{low:+d}..ESP0{high:+d} (a variable offset) lies "
+            "in no single frame object the donor's debug records declare"
+        )
+
+    def _indexed_atom(self, address: Term, item: FrameObject) -> Term:
+        """ESP0 + k + V in the object at s, as its atom + (k - s) + V (a14)."""
+        rest = [(atom, c) for atom, c in address[2] if atom != ESP0]
+        return lin(_signed(address[1]) - item.start, [(frame_object_atom(item), 1), *rest])
+
+    def _require_escaping(self, item: FrameObject, context: str) -> None:
+        if item.start not in self.facts.escaping:
+            raise ObjectEscape(
+                f"{context}: the frame object at ESP0{item.start:+d} is reached at a variable "
+                "offset",
+                [item.start],
+            )
 
     def block_start(self, state: PathState, pointer: Term, context: str) -> None:
         """Check one pointer of a block string operation (`region_simulation._block_string`).
@@ -1124,7 +1457,9 @@ class FrameModel:
         )
         return cast(int, offset)
 
-    def _offset(self, state: PathState, address: Term, *, probe: bool = False) -> int | None:
+    def _offset(
+        self, state: PathState, address: Term, *, probe: bool = False, width: int = 1
+    ) -> int | None:
         """k for an access at ESP0 + k; None for other memory.
 
         With ``probe`` (a load inside an inlined helper) an access below ESP
@@ -1136,6 +1471,17 @@ class FrameModel:
         if ESP0 not in coefficients:
             return None
         if len(coefficients) != 1 or coefficients[ESP0] != 1:
+            item = self.indexed_object(address, width, self.context)
+            if item is not None:
+                # The indexed pass: the access lies in an escaping object's
+                # bytes, memory (`memory_address` names it by the atom).
+                require(
+                    item.start >= self._current(state) or probe,
+                    f"{self.context}: a stack access in the frame object at ESP0{item.start:+d} "
+                    "lies below ESP",
+                )
+                self._require_escaping(item, self.context)
+                return None
             require(
                 self.facts.frame_objects is None,
                 f"{self.context}: a stack access at a variable offset from ESP, which a14 "
@@ -1213,6 +1559,14 @@ class FrameModel:
             "register or memory",
         )
         offset = _esp_offset(value)
+        if offset is None:
+            # The indexed pass: ESP0 + k + V inside one object, which escapes.
+            # Every value it can take is a byte of the object (width 1): a
+            # variable pointer one past the end is not admitted.
+            item = self.indexed_object(value, 1, context)
+            if item is not None:
+                self._require_escaping(item, context)
+                return self._indexed_atom(value, item)
         require(
             offset is not None,
             f"{context}: a stack address that is not ESP0 plus a constant, which a14 attributes "
@@ -1273,6 +1627,11 @@ class FrameModel:
             item = self._escaping_object(offset, width)
             if item is not None:
                 address = lin(offset - item.start, [(frame_object_atom(item), 1)])
+        else:
+            indexed = self.indexed_object(address, width, self.context)
+            if indexed is not None:
+                self._require_escaping(indexed, self.context)
+                address = self._indexed_atom(address, indexed)
         self._object_access(address, width, self.context)
         return address
 
@@ -1301,7 +1660,7 @@ class FrameModel:
         return [key for key in self.slots if key[0] < offset + width and offset < key[0] + key[1]]
 
     def load(self, state: PathState, address: Term, width: int) -> Term | None:
-        offset = self._offset(state, address, probe=self.helper_reads is not None)
+        offset = self._offset(state, address, probe=self.helper_reads is not None, width=width)
         if offset is not None and offset < self._current(state):
             # A helper's stack probe below ESP: memory no model owns, so a
             # fresh value of this version (never equal to the other's).
@@ -1398,8 +1757,9 @@ class FrameModel:
             value = self.memory_value(value)
         elif self.facts.private and mentions_stack_address(value):
             raise EscapeRefusal(f"{self.context}: a stack address is stored to memory")
-        offset = self._offset(state, address)
+        offset = self._offset(state, address, width=width)
         if offset is None or not self._owned(offset, width):
+            self.expose(value)
             return False
         for key in self._overlapping(offset, width):
             del self.slots[key]
@@ -1470,6 +1830,7 @@ class FrameModel:
             return
         current, end = self._window(state, self.context)
         for key in self._overlapping(current, end - current):
+            self.expose(self.slots[key])
             del self.slots[key]
         for offset in range(current, end, 4):
             self.slots[(offset, 4)] = lin_atom(("argout", identity, offset - current))
@@ -2395,6 +2756,24 @@ class ValueClass:
     members: frozenset[Member]
     constant: Term
     shape: Any
+    # The indexed pass only: the unsigned range of the class's 32-bit value
+    # on every path into the join (None: none claimed), and how often a meet
+    # has widened it (`meet`).
+    bounds: Range | None = None
+    widened: int = 0
+
+
+def _class_bounds(cls: ValueClass) -> Range | None:
+    """A class's range: its bounds, or its constant's value."""
+    if cls.constant is not None and cls.shape == "lin" and const_of(cls.constant) is not None:
+        value = cast(int, const_of(cls.constant))
+        return (value, value)
+    return cls.bounds
+
+
+# A class's range may widen this many times before a meet drops it, so the
+# fixpoint settles; the final pass checks every range it keeps (`implies`).
+MAX_WIDENINGS = 2
 
 
 @dataclass(frozen=True)
@@ -2423,8 +2802,18 @@ def establish(
     image: Mapping[Location, Term],
     donor_facts: SideFacts,
     image_facts: SideFacts,
+    ranges: tuple[Mapping[Term, Range], Mapping[Term, Range]] | None = None,
 ) -> Relation:
-    """The relation a pair of path ends establishes (check 6)."""
+    """The relation a pair of path ends establishes (check 6).
+
+    With ``ranges`` (the indexed pass: the facts both paths of the pair hold,
+    `_pair_ranges`) each non-constant class of 32-bit values carries the
+    unsigned range those facts give its term (`value_range`): the range the
+    paths' own conditions and the term's form give, or, only when they give
+    none, the range with the relation's ranges of the class atoms the paths
+    started from too.  Both are facts; preferring the first keeps a counter
+    compared with its bound from growing its range at every visit.
+    """
     by_term: dict[Term, set[Member]] = {}
     for side, locations in (("D", donor), ("P", image)):
         for location, term in locations.items():
@@ -2433,8 +2822,28 @@ def establish(
     for term, members in by_term.items():
         constant = term if closed_term(term) else None
         if len(members) >= 2 or constant is not None:
-            classes.add(ValueClass(frozenset(members), constant, _shape(term)))
+            bounds = None
+            if ranges is not None and constant is None and term[0] == "lin":
+                bounds = value_range(term, ranges[0])
+                if bounds is None:
+                    bounds = value_range(term, ranges[1])
+            classes.add(ValueClass(frozenset(members), constant, _shape(term), bounds))
     return Relation(frozenset(classes), donor_facts, image_facts)
+
+
+def _pair_ranges(left: PathEnd, right: PathEnd) -> tuple[dict[Term, Range], dict[Term, Range]]:
+    """A pair of path ends' ranges (indexed pass): its conditions', then with the relation's.
+
+    The pair runs together from one related state, so the conditions of both
+    paths hold at once, and so do the ranges the relation gave their class
+    atoms at the start (`FrameModel.ranges`, shared by both versions' atoms).
+    """
+    conditions = condition_ranges([*left.state.conditions, *right.state.conditions])
+    found = dict(conditions)
+    for end in (left, right):
+        for term, bounds in end.state.frame.ranges.items():
+            found[term] = cast(Range, _meet_range(found.get(term), bounds))
+    return conditions, found
 
 
 def meet(left: Relation, right: Relation, context: str) -> Relation:
@@ -2466,8 +2875,19 @@ def meet(left: Relation, right: Relation, context: str) -> Relation:
             if a_class.constant is not None and a_class.constant == b_class.constant
             else None
         )
+        bounds: Range | None = None
+        widened = 0
+        if constant is None:
+            # Ranges (the indexed pass): the hull of both, kept while it has
+            # widened the left (earlier) relation's at most MAX_WIDENINGS times.
+            a_bounds, b_bounds = _class_bounds(a_class), _class_bounds(b_class)
+            if a_bounds is not None and b_bounds is not None:
+                bounds = (min(a_bounds[0], b_bounds[0]), max(a_bounds[1], b_bounds[1]))
+                widened = a_class.widened + (bounds != a_bounds)
+                if widened > MAX_WIDENINGS:
+                    bounds, widened = None, 0
         if len(members) >= 2 or constant is not None:
-            classes.add(ValueClass(frozenset(members), constant, a_class.shape))
+            classes.add(ValueClass(frozenset(members), constant, a_class.shape, bounds, widened))
     return Relation(
         frozenset(classes),
         SideFacts(left.donor.esp, left.donor.x87, left.donor.dirty | right.donor.dirty),
@@ -2493,6 +2913,13 @@ def implies(established: Relation, target: Relation) -> str | None:
         holder = cast(ValueClass, next(iter(holders)))
         if cls.constant is not None and holder.constant != cls.constant:
             return "a constant class of the relation is not that constant at the end of a path"
+        if cls.bounds is not None:
+            held = _class_bounds(holder)
+            if held is None or not (cls.bounds[0] <= held[0] and held[1] <= cls.bounds[1]):
+                return (
+                    f"a class of the relation is not within its range [{cls.bounds[0]}, "
+                    f"{cls.bounds[1]}] at the end of a path"
+                )
     return None
 
 
@@ -2530,15 +2957,24 @@ def entry_state(
             {name: ("flag0", name) for name in FLAG_NAMES},
         )
         state.frame = FrameModel(frame, context=context, side=side)
+        if frame.indexed:
+            # a16: at the entry no escaping local's address has left (a
+            # parameter word existed before the call, so it is left out).
+            state.frame.unexposed = {start for start in frame.escaping if start < 0}
         state.fpu.origin = 0
         return state, ("depth", 0)
     terms: dict[Member, Term] = {}
+    ranges: dict[Term, Range] = {}
     for index, cls in enumerate(
         sorted(relation.classes, key=lambda item: repr(sorted(item.members)))
     ):
         named = cls.constant if cls.constant is not None else _shaped(("cv", key, index), cls.shape)
         for member in cls.members:
             terms[member] = named
+        if cls.constant is None and cls.bounds is not None and cls.shape == "lin":
+            # The indexed pass: the class's value lies in its range on every
+            # path into the join, so its atom does here.
+            ranges[named] = cls.bounds
 
     def value(location: Location, shape: Any) -> Term:
         member = (side, location)
@@ -2565,6 +3001,7 @@ def entry_state(
             slots[(offset, width)] = terms[member]
     state = PathState(regs, flags, fpu=fpu, epoch=("mem@", key))
     state.frame = FrameModel(frame, slots, facts.dirty, context, side=side)
+    state.frame.ranges = ranges
     return state, facts.x87
 
 
@@ -2614,6 +3051,7 @@ def run_paths(
                 path.regs["esp"] = lin_sub(path.regs["esp"], lin(-pop))
                 results.append(PathEnd("ret", offset, path, start_depth, address))
                 break
+            path.frame.conditions = path.conditions
             action, detail = _step(path, item, undefined, x87_returns, program.helpers)
             if frame.frame_objects is not None:
                 # a14: a stack address in a register is named by its frame
@@ -3109,7 +3547,13 @@ def _settle(
             target = pair(left, right, f"{context} from ({node[0][0]}, {node[0][1]})")
             require(target != (0, 0), f"{context}: a branch targets the function's entry")
             left_facts, right_facts = cast(SideFacts, left.facts), cast(SideFacts, right.facts)
-            established = establish(left.locations, right.locations, left_facts, right_facts)
+            established = establish(
+                left.locations,
+                right.locations,
+                left_facts,
+                right_facts,
+                _pair_ranges(left, right) if frame.indexed else None,
+            )
             reached = (target, variant_of(frame, left_facts, right_facts))
             old = relations.get(reached)
             new = (
@@ -3149,7 +3593,13 @@ def _settle(
                 f"{context}: the final pass reaches an unpaired cut point",
             )
             left_facts, right_facts = cast(SideFacts, left.facts), cast(SideFacts, right.facts)
-            established = establish(left.locations, right.locations, left_facts, right_facts)
+            established = establish(
+                left.locations,
+                right.locations,
+                left_facts,
+                right_facts,
+                _pair_ranges(left, right) if frame.indexed else None,
+            )
             reached = (target, variant_of(frame, left_facts, right_facts))
             require(
                 reached in relations,
@@ -3275,6 +3725,7 @@ def prove_function(
     entry_values: bool = False,
     frame_objects: FrameObjects | None = None,
     partial_slots: bool = False,
+    indexed: bool = False,
 ) -> ValidationProof:
     """Checks 2 and 4-7: a private frame when one is given and no stack address escapes.
 
@@ -3293,6 +3744,9 @@ def prove_function(
     runs again with each object whose address a run finds escaping
     (`ObjectEscape`), until a run needs no more; there is no shared-frame
     fallback.
+    ``indexed`` (with ``frame_objects``) runs the indexed frame-objects pass:
+    a stack address at a variable offset whose range lies in one object is
+    that object's, and the relation carries ranges (`FrameFacts.indexed`).
     ``partial_slots`` relates a private slot at a join only on the paths
     that wrote it: when a run reads a slot it wrote on only some paths to the
     join it started from (`UncarriedSlot`), the run is repeated with those
@@ -3370,7 +3824,7 @@ def prove_function(
         )
         escaping: frozenset[int] = frozenset()
         for _ in range(len(frame_objects.objects) + 1):
-            facts = replace(frame, frame_objects=frame_objects, escaping=escaping)
+            facts = replace(frame, frame_objects=frame_objects, escaping=escaping, indexed=indexed)
             try:
                 return validate(facts, " (frame objects)")
             except ObjectEscape as escape:
@@ -3486,7 +3940,34 @@ def proof_summary(proof: ValidationProof) -> dict[str, Any]:
             item.pin() for item in objects.objects if item.start in proof.frame.escaping
         ]
         summary["assumptions"] = ["a14"]
+        if proof.frame.indexed:
+            # Only an indexed frame-objects proof pins it and a16, so earlier
+            # a14 records keep their pins.
+            summary["frame_object_indexes"] = True
+            summary["assumptions"] = ["a14", "a16"]
     return summary
+
+
+def pin_x87_intrinsics(
+    summary: dict[str, Any], helpers: Mapping[str, HelperCode]
+) -> dict[str, Any]:
+    """A proof summary with the x87 intrinsic dispatchers the donor calls pinned (a17).
+
+    A proof through such a call's event pins the helpers (``x87_intrinsics``)
+    and a17 among its ``assumptions``; a summary whose donor calls none is
+    returned unchanged, so no record made before needs it (every run of such
+    a body refused: it branches on memory).
+    """
+    intrinsics = sorted(
+        symbol for symbol, code in helpers.items() if x87_intrinsic_arity(code) is not None
+    )
+    if not intrinsics:
+        return summary
+    return {
+        **summary,
+        "x87_intrinsics": intrinsics,
+        "assumptions": sorted({*summary.get("assumptions", []), "a17"}),
+    }
 
 
 # --- the record, the image and its installation (checks 1, 3, 8, 9) -------------------
@@ -3934,6 +4415,7 @@ def measure_function_validation(
         tag: str,
         entry_values: bool = False,
         frame_objects: FrameObjects | None = None,
+        indexed: bool = False,
     ) -> dict[str, Any]:
         case_proofs.clear()
         tag += " (partial slots)" if partial["on"] else ""
@@ -3963,6 +4445,7 @@ def measure_function_validation(
                 entry_values=entry_values,
                 frame_objects=frame_objects,
                 partial_slots=partial["on"],
+                indexed=indexed,
             )
 
         return _x87_case_proofs(items, successors, entries, donor_body[:proc], view, prove_case)
@@ -4022,26 +4505,43 @@ def measure_function_validation(
             ) from earlier
         # Only a record whose extents came from a debug sibling pins it.
         source_pin = {"frame_objects_from": "debug-sibling"} if from_sibling else {}
-        try:
+
+        def run(indexed: bool) -> dict[str, Any]:
+            note = ", indexed" if indexed else ""
+            try:
+                return {
+                    **summary(
+                        objects,
+                        f" (frame-objects pass{note})",
+                        frame_objects=frame_objects,
+                        indexed=indexed,
+                    ),
+                    "equivalences": True,
+                    **source_pin,
+                }
+            except ByteIdentityError as error:
+                if not getattr(error, "private_frame", False):
+                    raise
             return {
-                **summary(objects, " (frame-objects pass)", frame_objects=frame_objects),
+                **summary(
+                    objects,
+                    f" (frame-objects pass{note}, entry values)",
+                    entry_values=True,
+                    frame_objects=frame_objects,
+                    indexed=indexed,
+                ),
                 "equivalences": True,
+                "entry_values": True,
                 **source_pin,
             }
-        except ByteIdentityError as error:
-            if not getattr(error, "private_frame", False):
-                raise
-        return {
-            **summary(
-                objects,
-                " (frame-objects pass, entry values)",
-                entry_values=True,
-                frame_objects=frame_objects,
-            ),
-            "equivalences": True,
-            "entry_values": True,
-            **source_pin,
-        }
+
+        try:
+            return run(False)
+        except ByteIdentityError:
+            # Only when a14 refuses as before: the indexed frame-objects
+            # pass, whose records pin ``frame_object_indexes``.  A record a14
+            # made never needs it.
+            return run(True)
 
     def passes() -> dict[str, Any]:
         try:
@@ -4062,6 +4562,9 @@ def measure_function_validation(
             raise
         partial["on"] = True
         proof_summary_pin = passes()
+    proof_summary_pin = pin_x87_intrinsics(
+        proof_summary_pin, {symbol: body.code for symbol, body in bodies.items()}
+    )
     for proof in case_proofs:
         for place in sorted(debug_labels):
             paired = proof.pairs.get(place)
