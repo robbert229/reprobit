@@ -38,10 +38,13 @@ from reprobit.coff_format import (
 )
 
 from .coff import (
+    FPO_DEBUG_CLOSURE,
+    FPO_ONLY_CLOSURE,
     _comdat_child,
     _comdat_child_closure,
     comdat_primary_identity_multiset,
     function_multiset,
+    is_fpo_closure,
 )
 from .composition import compose_equal_body_comdat
 from .composition_mosaic import instruction_mosaic_metadata_sha256
@@ -248,6 +251,13 @@ def open_candidate_seats(
         == (len(expected_closure), expected_closure)
     )
     admissible = [list(item) for item in recipe.admissible_closures]
+    if list(FPO_DEBUG_CLOSURE[1]) in admissible and all(
+        is_fpo_closure(coff, FPO_ONLY_CLOSURE) for coff in (seed, donor)
+    ):
+        # A unit compiled without /Zi associates the FPO record alone: the
+        # FPO debug pair's delegate installs it, and each step that reads the
+        # CodeView child refuses on its own.
+        admissible.append(list(FPO_ONLY_CLOSURE[1]))
     if recipe.closure_message is None:
         require(
             closure_pinned,
