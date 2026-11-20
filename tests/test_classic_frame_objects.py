@@ -615,7 +615,10 @@ def test_a_slot_swap_beside_an_escaping_structure_is_proved_under_a14() -> None:
 
 
 def test_an_extent_the_replacement_does_not_keep_is_refused() -> None:
-    with pytest.raises(ByteIdentityError, match=r"straddles the escaping frame object"):
+    # The replacement's write of p's copy straddles s's start: its two bytes
+    # inside s are memory (the access is split into its runs), so s holds
+    # other bytes than the donor's when g reads it.
+    with pytest.raises(ByteIdentityError, match=r"make different calls"):
         _prove(
             STRUCT_D,
             STRUCT_P_STRADDLE,
