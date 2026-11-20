@@ -52,9 +52,16 @@ values on every execution that reaches them from the same entry state):
   ``ltu(a, b)``, ``ja`` is ``ltu(b, a)``, ``jae``/``jbe`` their negations,
   and the signed forms likewise; after a logical operation (``test``,
   ``and``, ``or``, ``xor``) CF=OF=0 is used, so ``test r, r; je`` and
-  ``cmp r, 0; je`` both read ``eqz(r)``.  Every other condition is a raw atom
-  over the exact flag terms it reads.  An atom decided by constants does not
-  fork the path.
+  ``cmp r, 0; je`` both read ``eqz(r)``.  An unsigned compare against a
+  constant is written with the constant on the right (:func:`_ltu`): ``k <u
+  x`` is ``not (x <u k + 1)``, ``x <u 1`` is ``eqz(x)``, and ``x <u 0`` and
+  ``T <u x`` (T the top value) are false, each exact for every x; ``neg x``
+  sets the flags ``sub 0, x`` does, so ``neg r; sbb`` reads ``not eqz(r)``.
+  A zero-extended ``setcc`` byte of polarity False is ``1 - zx(cc(atom,
+  True))`` (:func:`zero_extend`), so ``[1 <u x]`` from ``cmp; sbb; neg``
+  and ``1 - [x <u 2]`` from ``cmp; sbb; inc`` are one linear form.  Every
+  other condition is a raw atom over the exact flag terms it reads.  An atom
+  decided by constants does not fork the path.
 - A region proved under a register bijection starts the replacement from a
   renamed entry state (:func:`entry_state`): its register ``x`` holds the
   donor's entry atom ``("reg0", sigma^-1(x))``, so the two versions' terms
@@ -273,7 +280,7 @@ def extract(value: Term, low: int, width: int) -> Term:
     constant = const_of(value)
     if constant is not None:
         return _small(width, constant >> low)
-    atom = _single_atom(value)
+    atom = _single_atom(value) or _negated_bit(value)
     if atom is not None and atom[0] == "ins":
         _, old, ins_low, ins_width, inserted = atom
         if (ins_low, ins_width) == (low, width):
@@ -310,8 +317,45 @@ def insert(old: Term, low: int, width: int, part: Term) -> Term:
 
 
 def zero_extend(part: Term, width: int) -> Term:
+    """``part`` zero-extended from ``width`` bits to 32.
+
+    A ``setcc`` byte ``("cc", atom, polarity)`` is 1 when the atom equals the
+    polarity and 0 otherwise, so the byte of polarity False is exactly one
+    minus the byte of polarity True.  Zero-extended, it is written that way:
+    ``1 - zx(cc(atom, True))``, so ``setae; movzx`` meets ``sbb r, r; inc
+    r`` (``1 - CF``) and a compare read with either polarity gives one linear
+    form.  :func:`extract` reads the byte back as ``cc(atom, False)``.
+    """
     small = _small_const(part)
-    return lin(small) if small is not None else lin_atom(("zx", part, width))
+    if small is not None:
+        return lin(small)
+    if width == 8 and _is_cc(part) and part[2][2] is False:
+        return lin(1, ((("zx", ("b", 8, ("cc", part[2][1], True)), 8), -1),))
+    return lin_atom(("zx", part, width))
+
+
+def _is_cc(part: Term) -> bool:
+    return (
+        isinstance(part, tuple)
+        and len(part) == 3
+        and part[0] == "b"
+        and isinstance(part[2], tuple)
+        and len(part[2]) == 3
+        and part[2][0] == "cc"
+    )
+
+
+def _negated_bit(value: Term) -> Term | None:
+    """The atom ``("zx", cc(atom, False), 8)`` a value :func:`zero_extend` wrote as ``1 - bit``."""
+    if not (value[0] == "lin" and value[1] == 1 and len(value[2]) == 1):
+        return None
+    atom, coefficient = value[2][0]
+    if coefficient != _MASK or atom[0] != "zx" or atom[2] != 8 or not _is_cc(atom[1]):
+        return None
+    part = atom[1][2]
+    if part[2] is not True:
+        return None
+    return ("zx", ("b", 8, ("cc", part[1], False)), 8)
 
 
 def sign_extend(part: Term, width: int) -> Term:
@@ -638,13 +682,41 @@ def _constant(width: int, value: Term) -> int | None:
     return const_of(value) if width == 32 else _small_const(value)
 
 
-def _ltu(width: int, left: Term, right: Term) -> Term | bool:
+def _ltu(width: int, left: Term, right: Term) -> tuple[Term | bool, bool]:
+    """``left <u right`` as ``(atom, polarity)``: it holds exactly when the atom is ``polarity``.
+
+    An unsigned compare against a constant takes one canonical form, the
+    constant on the right (``x <u c``), each step exact for every ``width``-bit
+    x, the top value T = 2**width - 1:
+
+    - ``k <u x`` is ``not (x <u k + 1)`` for k < T (x > k is x >= k + 1, and
+      k + 1 does not wrap); ``T <u x`` is false (no x exceeds T);
+    - ``x <u 0`` is false (no x lies below 0);
+    - ``x <u 1`` is ``x == 0`` (``eqz``), the only value below 1.
+
+    So ``cmp 1, x; jb`` (``[1 <u x]``) and ``cmp x, 2; jae`` (``not [x <u
+    2]``) read one atom, as do ``cmp x, 1; jb``, ``cmp 0, x; jae`` and ``test
+    x, x; je``.  A decided compare is ``(bool, True)``.  Two non-constant
+    operands keep their order: ``a <u b`` and ``not (b <u a + 1)`` differ when
+    a is T.
+    """
     if left == right:
-        return False
+        return False, True
     a, b = _constant(width, left), _constant(width, right)
     if a is not None and b is not None:
-        return a < b
-    return ("ltu", width, left, right)
+        return a < b, True
+    top = (1 << width) - 1
+    if a is not None:
+        if a == top:
+            return False, True
+        bumped = lin(a + 1) if width == 32 else _small(width, a + 1)
+        atom, polarity = _ltu(width, right, bumped)
+        return (atom != polarity, True) if isinstance(atom, bool) else (atom, not polarity)
+    if b == 0:
+        return False, True
+    if b == 1:
+        return _eqz(width, left), True
+    return ("ltu", width, left, right), True
 
 
 def _lts(width: int, left: Term, right: Term) -> Term | bool:
@@ -680,9 +752,10 @@ def condition(code: int, flags: Mapping[str, Term]) -> tuple[Term, bool] | bool:
             if base == 4:
                 atom = _eq(width, left, right)
             elif base == 2:
-                atom = _ltu(width, left, right)
+                atom, value = _ltu(width, left, right)
             elif base == 6:
-                atom, value = _ltu(width, right, left), False
+                atom, value = _ltu(width, right, left)
+                value = not value
             elif base == 12:
                 atom = _lts(width, left, right)
             elif base == 14:
@@ -2893,6 +2966,8 @@ def interval_truth(atom: Term) -> bool | None:
         bounds = term_range(atom[2])
         if bounds is not None and bounds[0] > 0:
             return False
+        if bounds is not None and bounds[1] == 0:
+            return True
     return None
 
 
@@ -3230,8 +3305,7 @@ def _step(
                 result = (
                     _small(8, -small) if small is not None else ("b", 8, ("op", "neg", (value,)))
                 )
-                for name in FLAG_NAMES:
-                    state.flags[name] = ("flag", name, "neg", 8, value, "")
+                _arith_flags(state, "sub", 8, _small(8, 0), value)
             _write_rm(state, item, 8, result)
             return ("fall", None)
         if width == 8 and item.extended and digit in (4, 5, 6, 7):
@@ -3252,8 +3326,8 @@ def _step(
             result = lin_sub(lin(_MASK), value)
         else:
             result = lin_scale(value, -1)
-            for name in FLAG_NAMES:
-                state.flags[name] = ("flag", name, "neg", 32, value, "")
+            # ``neg x`` sets every flag as ``sub 0, x`` does (CF is x != 0).
+            _arith_flags(state, "sub", 32, lin(0), value)
         _write_rm(state, item, 32, result)
         return ("fall", None)
     if 0x40 <= op <= 0x4F:
