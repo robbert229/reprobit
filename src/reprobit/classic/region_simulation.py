@@ -961,6 +961,7 @@ def _load(state: PathState, address: Term, width: int) -> Term:
     stores = state.stores
     if objects is not None and objects.constant(address, width):
         stores = []  # read-only data: no store reaches it (ObjectModel.constant)
+    exact = False
     for entry in reversed(stores):
         relation = address_relation(address, width, entry[0], entry[1], objects)
         if relation == "disjoint":
@@ -969,7 +970,12 @@ def _load(state: PathState, address: Term, width: int) -> Term:
             return entry[2]
         deps.append(entry)
         if relation == "same":
+            exact = True
             break
+    if state.frame is not None:
+        # The moved-objects pass checks what a load of an escaping object
+        # may read (`function_validation.FrameModel.loaded`, a15).
+        state.frame.loaded(state, address, width, deps, exact)
     named: Term = tuple(reversed(deps))
     if state.frame is not None and named:
         # A whole-function proof names the stores a load depends on by a
