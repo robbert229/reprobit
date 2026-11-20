@@ -427,8 +427,11 @@ private frame whose escaping objects are memory.
   the PDB type server the object names (``/Zi``), which must carry the
   signature and age the object records (`frame_objects`).  Each lies in the
   locals block [B, ESP0) or the parameter words [ESP0 + 4, E); locals of
-  sibling scopes that share bytes are merged into one object.  A local of
-  unknown size refuses the pass.
+  sibling scopes that share bytes are merged into one object.  A local MSVC
+  5.0 keeps in a dead parameter's word is recorded 4 bytes above it, and is
+  placed there by telling the parameters (the procedure type's count of
+  first records) from the later records.  A local of unknown size refuses
+  the pass.
 - The objects' starts are related by equality: an escaping object lies at
   the same offset from ESP0 in both versions, so its address is one value in
   both, named ``("fobj", s, n)`` (`frame_object_atom`).  A replacement that
@@ -441,6 +444,12 @@ private frame whose escaping objects are memory.
   pointer may be either, and C lets a pointer one past the end reach back
   into its object).  The pass starts with no object escaping and runs again
   with every object a run finds escaping (`ObjectEscape`), until none is new.
+- Only a register may hold ESP0 + k for a k in no object (``mov ecx, esp``
+  building a structure argument in the outgoing argument block).  It stays
+  ESP0 + k: every access through it is at a constant offset from ESP0, a
+  private slot related as any other, and no callee receives it, because a
+  call's event names no register and every callee admitted takes no
+  argument in one (its decoration, a5, a12).  No assumption is added.
 - An access at ESP0 + k inside an escaping object, or through its atom, is
   memory, at the atom's address (`FrameModel.memory_address`): in the store
   log, the footprint and the call and block events, compared as any memory
@@ -450,8 +459,9 @@ private frame whose escaping objects are memory.
   (`region_simulation.ObjectModel`).  Every other access at ESP0 + k below E
   is a private slot, related as check 7 relates one: by a14 no callee and no
   pointer reaches it.  At a return the objects' stores are dead stack.
-- Refused: a stack address that is not ESP0 plus a constant or that lies in
-  no object (a compiler temporary has no record, so its extent is unknown);
+- Refused: a stack address that is not ESP0 plus a constant, or one in no
+  object that is stored or starts a block string operation (a compiler
+  temporary has no record, so its extent is unknown);
   an access at a variable offset from ESP itself (its displacement may fold
   an index, so its object is not known); an access that lies partly inside
   an escaping object; an access at a constant offset from an object's atom
@@ -1000,16 +1010,24 @@ class FrameModel:
 
     # --- the frame-objects pass (a14) ------------------------------------------------
 
-    def canonical(self, value: Term, context: str) -> Term:
+    def canonical(self, value: Term, context: str, *, register: bool = False) -> Term:
         """A value with every stack address it holds named by its frame object (a14).
 
         A value computed from ESP0 must be ESP0 + k for a constant k: a pointer
         into the frame object k lies in (or one past the end of one), which
         becomes ``frame_object_atom(object) + (k - start)``.  Its object must
         already escape; when it does not, the pass runs again with it escaping
-        (`ObjectEscape`).  A k outside every object the donor declares, a
-        variable or scaled stack address, and a value naming ESP0 only through
-        a load from the stack outside the frame are refused.
+        (`ObjectEscape`).  A variable or scaled stack address, and a value
+        naming ESP0 only through a load from the stack outside the frame, are
+        refused.  A k outside every object the donor declares is refused too,
+        except in a ``register``: there ESP0 + k stays as it is, a compiler
+        temporary's address (``mov ecx, esp`` builds a structure argument in
+        the outgoing argument block) that only the function itself uses.
+        Every access through it is at a constant offset from ESP0, a private
+        slot; storing it (`memory_value`) or starting a block string
+        operation from it is refused; and no callee receives it, since a
+        call's event names no register and every callee admitted takes no
+        argument in one (its decoration, a5, a12).
         """
         if not mentions_stack_address(value):
             return value
@@ -1026,6 +1044,8 @@ class FrameModel:
         )
         objects = cast(FrameObjects, self.facts.frame_objects)
         pointees = objects.pointees(cast(int, offset))
+        if register and not pointees:
+            return value
         require(
             bool(pointees),
             f"{context}: the stack address ESP0{offset:+d} lies in no local the donor's debug "
@@ -1851,7 +1871,7 @@ def run_paths(
                 # object before any later instruction reads it.
                 for name in GENERAL_REGISTERS:
                     path.regs[name] = path.frame.canonical(
-                        path.regs[name], f"{context}: {name} after {offset}"
+                        path.regs[name], f"{context}: {name} after {offset}", register=True
                     )
             elif frame.private:
                 for name in GENERAL_REGISTERS:
