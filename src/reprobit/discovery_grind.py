@@ -19,6 +19,7 @@ from reprobit.authority_snapshot import (
     assert_json_authority_unchanged,
 )
 from reprobit.binary import ByteIdentityError
+from reprobit.classic.arguments import compile_writes_pdb
 from reprobit.classic.toolchain_helpers import HelperLibrary, HelperLibraryError
 from reprobit.classic_donors import (
     merge_candidate_constraints,
@@ -89,17 +90,21 @@ class ColdTrialEvidence:
 
 @dataclass(frozen=True, slots=True)
 class DonorCompileProduct:
-    """The two outputs one donor compile writes: its object and its type-server PDB.
+    """The outputs one donor compile writes: its object and its type-server PDB.
 
     MSVC 5.0 ``/Zi`` writes a donor's types to the PDB its ``/Fd`` names, and
     the object's ``.debug$T`` holds only an ``LF_TYPESERVER`` record naming
     that PDB's signature and age.  The frame-objects pass (a14 of
     `classic.function_validation`) reads local sizes from it, so the PDB is
     taken from the same compile as the object, never from another build.
+
+    ``type_server`` is None exactly when the unit compiles without ``/Zi``:
+    the compile then writes no PDB, and a14 refuses for want of the donor's
+    CodeView symbols and types.
     """
 
     object_payload: bytes
-    type_server: bytes
+    type_server: bytes | None
 
 
 SeedProbe = Callable[[Path, str], bytes]
@@ -966,12 +971,18 @@ def run_project_grind(
         )
         if donor_completed != len(donor_ids):
             raise GrindError("donor compiler probe omitted completion progress")
+        # The donors compile with the unit's argv, so each writes a type-server
+        # PDB exactly when the unit compiles with /Zi.
+        writes_pdb = compile_writes_pdb(context.compiler_node.arguments)
         if set(donor_products) != set(donor_ids) or any(
             type(product) is not DonorCompileProduct
             or type(product.object_payload) is not bytes
             or not product.object_payload
-            or type(product.type_server) is not bytes
-            or not product.type_server
+            or (
+                type(product.type_server) is not bytes or not product.type_server
+                if writes_pdb
+                else product.type_server is not None
+            )
             for product in donor_products.values()
         ):
             raise GrindError("donor probe returned an incomplete compiler result set")

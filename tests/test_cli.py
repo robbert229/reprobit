@@ -152,6 +152,7 @@ from reprobit.state import KeepWorkspace, RunArena
 from reprobit.strict_json import canonical_json, strict_load
 from reprobit.toolchains import MSVC_42, TOOLCHAIN_PROFILES, profile_source_pins_for_paths
 from reprobit.transactions import CASTransaction, TransactionConflict, TransactionResult
+from reprobit.translation_unit_identity import translation_unit_id
 
 
 def _initialize(root: Path) -> None:
@@ -2571,17 +2572,13 @@ def _fresh_cmake_import_project(root: Path) -> None:
 
 
 def _cmake_tu_id(source: str) -> str:
-    identity = Digest.from_bytes(
-        canonical_json(
-            {
-                "schema": 1,
-                "target": "program",
-                "build_target": "program",
-                "source": source,
-            }
-        )
-    ).value
-    return f"tu.{identity[:24]}"
+    # `_cmake_refresh_graph` compiles without /Zi, which is part of the identity.
+    return translation_unit_id(
+        target_id="program",
+        build_target="program",
+        source=source,
+        debug_information=False,
+    )
 
 
 def _cmake_refresh_graph(

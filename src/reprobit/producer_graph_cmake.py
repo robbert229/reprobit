@@ -9,6 +9,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
+from reprobit.classic.arguments import compile_writes_pdb
 from reprobit.cmake_graph_paths import (
     attached_value as _attached_value,
 )
@@ -180,13 +181,20 @@ def _compiler_nodes(
                     os.fspath(pdb_path),
                 )
         assert pdb_ref is not None
+        # Only a /Zi compile writes the PDB its /Fd names; without debug
+        # information /Fd names nothing, so no PDB is declared or expected.
+        outputs = (
+            (command.output_ref, pdb_ref)
+            if compile_writes_pdb(arguments[1:])
+            else (command.output_ref,)
+        )
         nodes.append(
             _RawNode(
                 role=ProducerRole.COMPILER,
                 owner=command.owner,
                 arguments=arguments[1:],
                 inputs=(command.source_ref,),
-                outputs=(command.output_ref, pdb_ref),
+                outputs=outputs,
                 working_directory=command.directory,
             )
         )

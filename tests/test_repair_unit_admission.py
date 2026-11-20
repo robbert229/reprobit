@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from reprobit.model import Digest
+from reprobit.producer_graph import ProducerRole
 from reprobit.repair_census import RepairCensusEntry
 from reprobit.repair_unit_admission import (
     TranslationUnitAdmissionError,
@@ -18,6 +19,7 @@ from reprobit.repair_unit_admission import (
 )
 from reprobit.schema import BuildPlanDocument, ClassicTranslationUnitPlan
 from reprobit.strict_json import canonical_json
+from reprobit.translation_unit_identity import translation_unit_id
 
 SOURCE = "src/widget.cpp"
 CLEAN = Digest.from_bytes(b"int widget;\n")
@@ -41,7 +43,12 @@ def _plan(*units: ClassicTranslationUnitPlan) -> BuildPlanDocument:
     )
 
 
-def _bundle(plan: BuildPlanDocument, *, overlay_effective: str | None = None) -> Any:
+def _bundle(
+    plan: BuildPlanDocument,
+    *,
+    overlay_effective: str | None = None,
+    producer_graph: Any = None,
+) -> Any:
     interventions: tuple[Any, ...] = ()
     if overlay_effective is not None:
         interventions = (
@@ -63,6 +70,7 @@ def _bundle(plan: BuildPlanDocument, *, overlay_effective: str | None = None) ->
             entries=(SimpleNamespace(path=SOURCE, digest=CLEAN, size=12),)
         ),
         interventions=interventions,
+        producer_graph=producer_graph,
     )
 
 
@@ -86,6 +94,26 @@ def test_a_planned_unit_follows_the_cmake_import_identity_and_effective_digest()
         _bundle(_plan(), overlay_effective="c" * 64), (_entry(),)
     )
     assert overlaid.source_digest.value == "c" * 64
+
+
+@pytest.mark.parametrize("debug", (True, False))
+def test_a_planned_unit_takes_its_compile_lane_s_debug_format(debug: bool) -> None:
+    # The import's identity includes whether the unit compiles with /Zi.
+    lane = SimpleNamespace(
+        id="compiler.widget.0000",
+        role=ProducerRole.COMPILER,
+        owner="widget",
+        inputs=(f"source/{SOURCE}",),
+        arguments=("/nologo", *(("/Zi",) if debug else ()), "/O2", f"${{SOURCE}}/{SOURCE}"),
+    )
+
+    (unit,) = plan_translation_unit_admissions(
+        _bundle(_plan(), producer_graph=SimpleNamespace(nodes=(lane,))), (_entry(),)
+    )
+
+    assert unit.id == translation_unit_id(
+        target_id="program", build_target="widget", source=SOURCE, debug_information=debug
+    )
 
 
 def test_planning_refuses_unmanifested_or_already_planned_sources() -> None:

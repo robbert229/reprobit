@@ -384,6 +384,11 @@ def object_type_records(
     age.  None (with the reason) when the records are not available.
     """
     streams = [bytes(coff_body(donor, s)) for s in donor.sections if s["name"] == ".debug$T"]
+    if not streams:
+        return None, (
+            "the object has no type stream: its unit compiles without /Zi, so there is no "
+            "type-server PDB to read"
+        )
     if len(streams) != 1:
         return None, f"the object has {len(streams)} type streams, not one"
     require(
@@ -594,6 +599,13 @@ def frame_locals(
     any other local in [B, 0).  Returns the locals and the digests of the
     type records their sizes and the parameter count needed.
     """
+    if not any(section["name"] == ".debug$S" for section in donor.sections):
+        require(
+            False,
+            f"{context}: the frame-objects pass (a14) reads the donor's locals from its "
+            "CodeView symbols and their sizes from its type-server PDB, but the donor's unit "
+            "compiles without /Zi, so it has neither",
+        )
     stream = bytes(coff_body(donor, _comdat_child(donor, primary, ".debug$S")))
     records = parse_codeview_symbol_stream(stream, f"{context} debug$S")
     require(

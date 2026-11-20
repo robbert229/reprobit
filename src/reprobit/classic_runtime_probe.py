@@ -6,7 +6,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import ExitStack
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Literal
 
 from reprobit.classic.semantic_contracts import (
@@ -30,6 +30,7 @@ from reprobit.classic_runtime_files import (
     _tree_file_seal,
 )
 from reprobit.classic_runtime_graph import (
+    classic_compiler_pdb_ref,
     classic_compiler_product_refs,
 )
 from reprobit.classic_runtime_overlay import ClassicOverlayEpochs
@@ -61,13 +62,14 @@ class ClassicCompilerProbeOutput:
     node_id: str
     source_reference: str
     object_reference: str
-    pdb_reference: str
+    # The PDB fields are None for a compile without /Zi, which writes none.
+    pdb_reference: str | None
     object_path: Path
-    pdb_path: Path
+    pdb_path: Path | None
     object_digest: Digest
-    pdb_digest: Digest
+    pdb_digest: Digest | None
     object_payload: bytes
-    pdb_payload: bytes
+    pdb_payload: bytes | None
     step: StepExecutionReceipt
     compiler_invocation: CompilerEpochInvocation | None = None
 
@@ -111,9 +113,10 @@ class ClassicDonorProbeOutput:
     producer_node_id: str
     rendered_inputs: tuple[ClassicDonorProbeInput, ...]
     object_digest: Digest
-    pdb_digest: Digest
+    # None when the donor's lane compiles without /Zi and so writes no PDB.
+    pdb_digest: Digest | None
     object_payload: bytes
-    pdb_payload: bytes
+    pdb_payload: bytes | None
     step: StepExecutionReceipt
 
 
@@ -263,32 +266,26 @@ class ClassicProbeExecution:
             outputs: list[ClassicCompilerProbeOutput] = []
             for node in selected:
                 source_ref, object_ref = classic_compiler_product_refs(node)
-                pdb_refs = tuple(
-                    reference
-                    for reference in node.outputs
-                    if PurePosixPath(reference.split("/", 1)[-1]).suffix.casefold() == ".pdb"
-                )
-                if len(pdb_refs) != 1:
-                    raise ClassicProjectError(
-                        f"compiler probe node {node.id!r} lacks one PDB output"
-                    )
+                pdb_ref = classic_compiler_pdb_ref(node)
                 object_declared = self.producer.reference(object_ref)
-                pdb_declared = self.producer.reference(pdb_refs[0])
-                if object_declared is None or pdb_declared is None:
+                pdb_declared = None if pdb_ref is None else self.producer.reference(pdb_ref)
+                if object_declared is None or (pdb_ref is not None and pdb_declared is None):
                     raise ClassicProjectError(
                         f"compiler probe node {node.id!r} output is not materializable"
                     )
                 registered_outputs = self.producer.registered_outputs()
                 object_path = registered_outputs.get(object_declared)
-                pdb_path = registered_outputs.get(pdb_declared)
-                if object_path is None or pdb_path is None:
+                pdb_path = None if pdb_declared is None else registered_outputs.get(pdb_declared)
+                if object_path is None or (pdb_declared is not None and pdb_path is None):
                     raise ClassicProjectError(
                         f"compiler probe node {node.id!r} lacks physical outputs"
                     )
                 self.producer.require_regular(object_path, label="compiler probe OBJ")
-                self.producer.require_regular(pdb_path, label="compiler probe PDB")
                 object_payload = object_path.read_bytes()
-                pdb_payload = pdb_path.read_bytes()
+                pdb_payload: bytes | None = None
+                if pdb_path is not None:
+                    self.producer.require_regular(pdb_path, label="compiler probe PDB")
+                    pdb_payload = pdb_path.read_bytes()
                 step = producer_steps.get(f"probe.{node.id}")
                 if step is None:
                     raise ClassicProjectError(
@@ -299,11 +296,11 @@ class ClassicProbeExecution:
                         node.id,
                         source_ref,
                         object_ref,
-                        pdb_refs[0],
+                        pdb_ref,
                         object_path,
                         pdb_path,
                         Digest.from_bytes(object_payload),
-                        Digest.from_bytes(pdb_payload),
+                        None if pdb_payload is None else Digest.from_bytes(pdb_payload),
                         object_payload,
                         pdb_payload,
                         step,
@@ -472,36 +469,33 @@ class ClassicProbeExecution:
                     outputs: list[ClassicCompilerProbeOutput] = []
                     for node in selected:
                         source_ref, object_ref = classic_compiler_product_refs(node)
-                        pdb_refs = tuple(
-                            reference
-                            for reference in node.outputs
-                            if PurePosixPath(reference.split("/", 1)[-1]).suffix.casefold()
-                            == ".pdb"
-                        )
-                        if len(pdb_refs) != 1:
-                            raise ClassicProjectError(
-                                f"compiler source probe node {node.id!r} lacks one PDB output"
-                            )
+                        pdb_ref = classic_compiler_pdb_ref(node)
                         object_declared = self.producer.reference(object_ref)
-                        pdb_declared = self.producer.reference(pdb_refs[0])
-                        if object_declared is None or pdb_declared is None:
+                        pdb_declared = None if pdb_ref is None else self.producer.reference(pdb_ref)
+                        if object_declared is None or (
+                            pdb_ref is not None and pdb_declared is None
+                        ):
                             raise ClassicProjectError(
                                 f"compiler source probe node {node.id!r} output is not "
                                 "materializable"
                             )
                         registered = self.producer.registered_outputs()
                         object_path = registered.get(object_declared)
-                        pdb_path = registered.get(pdb_declared)
-                        if object_path is None or pdb_path is None:
+                        pdb_path = None if pdb_declared is None else registered.get(pdb_declared)
+                        if object_path is None or (pdb_declared is not None and pdb_path is None):
                             raise ClassicProjectError(
                                 f"compiler source probe node {node.id!r} lacks physical outputs"
                             )
                         self.producer.require_regular(
                             object_path, label="compiler source probe OBJ"
                         )
-                        self.producer.require_regular(pdb_path, label="compiler source probe PDB")
                         object_payload = object_path.read_bytes()
-                        pdb_payload = pdb_path.read_bytes()
+                        pdb_payload: bytes | None = None
+                        if pdb_path is not None:
+                            self.producer.require_regular(
+                                pdb_path, label="compiler source probe PDB"
+                            )
+                            pdb_payload = pdb_path.read_bytes()
                         step = producer_steps.get(f"{prefix}{node.id}")
                         if step is None:
                             raise ClassicProjectError(
@@ -512,11 +506,11 @@ class ClassicProbeExecution:
                                 node.id,
                                 source_ref,
                                 object_ref,
-                                pdb_refs[0],
+                                pdb_ref,
                                 object_path,
                                 pdb_path,
                                 Digest.from_bytes(object_payload),
-                                Digest.from_bytes(pdb_payload),
+                                None if pdb_payload is None else Digest.from_bytes(pdb_payload),
                                 object_payload,
                                 pdb_payload,
                                 step,
@@ -687,7 +681,11 @@ class ClassicProbeExecution:
                         invocation.record.node_id,
                         rendered_inputs,
                         Digest.from_bytes(invocation.object_payload),
-                        Digest.from_bytes(invocation.pdb_payload),
+                        (
+                            None
+                            if invocation.pdb_payload is None
+                            else Digest.from_bytes(invocation.pdb_payload)
+                        ),
                         invocation.object_payload,
                         invocation.pdb_payload,
                         _step_receipt(

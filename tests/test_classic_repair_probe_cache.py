@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import gc
 import json
 import os
@@ -344,6 +345,45 @@ def test_store_round_trips_outputs_through_its_directory(tmp_path: Path) -> None
 
     assert reader.get("epoch-b", key, donor_id="other") is None
     assert reader.get("epoch-a", ("program", "src/unit.cpp", "seat-b"), donor_id="x") is None
+
+
+def test_store_round_trips_a_donor_compiled_without_a_pdb(tmp_path: Path) -> None:
+    # A donor lane without /Zi writes no PDB; the entry records that, and a
+    # replay returns no PDB rather than an empty one.
+    original = dataclasses.replace(_output("compiled"), pdb_digest=None, pdb_payload=None)
+    key = ("program", "src/unit.cpp", "seat-a")
+
+    writer = store_module.ClassicDonorCompileStore(tmp_path / "repair-probes")
+    writer.put("epoch-a", key, original)
+    assert writer.stored == 1
+
+    reader = store_module.ClassicDonorCompileStore(tmp_path / "repair-probes")
+    replayed = reader.get("epoch-a", key, donor_id="later")
+    assert isinstance(replayed, ClassicDonorProbeOutput)
+    assert replayed.object_payload == original.object_payload
+    assert replayed.pdb_payload is None
+    assert replayed.pdb_digest is None
+
+
+@pytest.mark.parametrize(
+    "updates",
+    ({"pdb_digest": "0" * 64}, {"pdb_length": 0}),
+    ids=("digest-without-length", "length-without-digest"),
+)
+def test_store_discards_an_entry_with_half_a_missing_pdb(
+    tmp_path: Path, updates: dict[str, object]
+) -> None:
+    original = dataclasses.replace(_output("compiled"), pdb_digest=None, pdb_payload=None)
+    key = ("program", "src/unit.cpp", "seat-a")
+    encoded = store_module._encode_output("epoch-a", key, original)
+    assert encoded is not None
+
+    assert (
+        store_module._decode_output(
+            _replace_header(encoded, **updates), epoch="epoch-a", key=key, donor_id="later"
+        )
+        is None
+    )
 
 
 def test_store_never_follows_a_symlinked_entry_parent(tmp_path: Path) -> None:

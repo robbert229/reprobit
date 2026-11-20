@@ -71,6 +71,7 @@ def _context(
     label: str,
     plan: object,
     reference: bytes,
+    compiler_arguments: tuple[str, ...] = ("/Zi",),
 ) -> SimpleNamespace:
     root.mkdir(parents=True)
     reference_path = root / "reference.obj"
@@ -95,7 +96,7 @@ def _context(
         proof_document=object(),
         intervention_path=root / "reprobit/interventions/tu.json",
         proof_path=root / "reprobit/proofs/tu.json",
-        compiler_node=SimpleNamespace(id=f"compiler.{label}"),
+        compiler_node=SimpleNamespace(id=f"compiler.{label}", arguments=compiler_arguments),
         reference_path=reference_path,
         symbol=f"_{label}_symbol",
     )
@@ -111,6 +112,7 @@ def _install_grind_fixture(
     seat_collisions: dict[str, str] | None = None,
     qualification_rejections: frozenset[tuple[int, int]] = frozenset(),
     cold_reasons: tuple[str | None, ...] = (None,),
+    compiler_arguments: tuple[str, ...] = ("/Zi",),
 ) -> tuple[Path, Path, _Trace, ProjectGrindCallbacks]:
     staged_states = live_states if staged_states is None else staged_states
     live_root = tmp_path / "live"
@@ -122,12 +124,14 @@ def _install_grind_fixture(
         label="live",
         plan=live_plan,
         reference=b"live reference",
+        compiler_arguments=compiler_arguments,
     )
     staged = _context(
         staged_root,
         label="sealed",
         plan=staged_plan,
         reference=b"sealed reference",
+        compiler_arguments=compiler_arguments,
     )
     for context in (live, staged):
         existing = tuple(
@@ -1015,6 +1019,71 @@ def test_a_donor_probe_without_its_compile_s_pdb_is_refused(
             live_root,
             callbacks=ProjectGrindCallbacks(callbacks.probe_seed, donors, callbacks.cold_verify),
         )
+
+
+def _without_type_servers(
+    callbacks: ProjectGrindCallbacks, type_server: bytes | None = None
+) -> ProjectGrindCallbacks:
+    def donors(
+        root: Path, donor_ids: tuple[str, ...], progress: grind.DonorProgress | None
+    ) -> dict[str, grind.DonorCompileProduct]:
+        products = callbacks.probe_donors(root, donor_ids, progress)
+        return {
+            donor_id: grind.DonorCompileProduct(product.object_payload, type_server)
+            for donor_id, product in products.items()
+        }
+
+    return ProjectGrindCallbacks(callbacks.probe_seed, donors, callbacks.cold_verify)
+
+
+def test_a_unit_without_debug_information_grinds_with_donors_that_have_no_pdb(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from reprobit.discovery_authoring import DiscoveryAuthoringError
+
+    # The unit compiles without /Zi, so its donors write no type-server PDB:
+    # each rewriting receives none, and a14 would refuse for want of it.
+    live_root, _staged_root, _trace, callbacks = _install_grind_fixture(
+        monkeypatch,
+        tmp_path,
+        live_states=(_state(1, 1),),
+        qualification_rejections=frozenset({(1, 1)}),
+        compiler_arguments=("/O2",),
+    )
+    received: list[tuple[object, object]] = []
+
+    def rewriting(
+        *_args: object,
+        donor_object: object = None,
+        donor_type_server: object = None,
+        **_kwargs: object,
+    ) -> None:
+        received.append((donor_object, donor_type_server))
+        raise DiscoveryAuthoringError("fixture rewriting refusal")
+
+    monkeypatch.setattr(grind, "_state_rewriting", rewriting)
+
+    result = run_project_grind(live_root, callbacks=_without_type_servers(callbacks))
+
+    assert result.solution is None
+    assert received == [(b"donor object 1.1", None)]
+
+
+def test_a_pdb_from_a_donor_compiled_without_debug_information_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # Without /Zi the compile writes no PDB, so a PDB here came from elsewhere.
+    live_root, _staged_root, _trace, callbacks = _install_grind_fixture(
+        monkeypatch,
+        tmp_path,
+        live_states=(_state(1, 1),),
+        compiler_arguments=("/O2",),
+    )
+
+    with pytest.raises(grind.GrindError, match="incomplete compiler result set"):
+        run_project_grind(live_root, callbacks=callbacks)
 
 
 def test_the_cli_donor_probe_returns_each_compile_s_object_and_pdb(
