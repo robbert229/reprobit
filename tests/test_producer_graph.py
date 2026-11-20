@@ -813,6 +813,7 @@ def _configured_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
                             f"{toolchain_shell}/wine/x86/cl",
                             "/nologo",
                             f"-I{source_shell}/include",
+                            "/Zi",
                             f"/Fo{compile_output}",
                             f"/Fd{compile_pdb}",
                             "-c",
@@ -1079,6 +1080,66 @@ def test_single_owner_directory_form_pdb_preserves_authentic_argv(
         "build/CMakeFiles/core.dir/vc40.pdb",
     )
     assert "/Fd${BUILD}/CMakeFiles/core.dir/" in compiler.arguments
+
+
+def test_a_compile_without_debug_information_declares_no_pdb(tmp_path: Path) -> None:
+    # Without /Zi the compiler writes no PDB, so none is declared.  /Fd stays in
+    # the argv, as CMake wrote it, and names nothing.
+    source, build, toolchain = _configured_fixture(tmp_path)
+    database_path = build / "compile_commands.json"
+    database = json.loads(database_path.read_text(encoding="utf-8"))
+    database[0]["command"] = database[0]["command"].replace(" /Zi ", " ")
+    database_path.write_text(json.dumps(database), encoding="utf-8")
+
+    graph = extract_cmake_makefiles_graph(
+        configured_build_root=build,
+        effective_source_root=source,
+        toolchain_root=toolchain,
+        toolchain_lock_digest=_digest("4"),
+        path_profile_id="stable",
+        target_outputs={"app": "APP.EXE"},
+    )
+
+    compiler = next(node for node in graph.nodes if node.role is ProducerRole.COMPILER)
+    assert compiler.outputs == ("build/CMakeFiles/core.dir/src/unit.cpp.obj",)
+    assert "/Zi" not in compiler.arguments
+    assert "/Fd${BUILD}/CMakeFiles/core.dir/src/unit.cpp.obj.pdb" in compiler.arguments
+
+
+def test_a_mixed_project_declares_a_pdb_only_for_its_zi_compiles(tmp_path: Path) -> None:
+    source, build, toolchain = _configured_fixture(tmp_path)
+    other_source = source / "src/other.cpp"
+    other_source.write_text("fixture\n", encoding="utf-8")
+    database_path = build / "compile_commands.json"
+    database = json.loads(database_path.read_text(encoding="utf-8"))
+    first = database[0]
+    second = {
+        **first,
+        "file": str(other_source),
+        "command": first["command"].replace("unit.cpp", "other.cpp").replace(" /Zi ", " "),
+    }
+    database_path.write_text(json.dumps([first, second]), encoding="utf-8")
+    (build / "CMakeFiles/core.dir/objects1.rsp").write_text(
+        "CMakeFiles/core.dir/src/unit.cpp.obj CMakeFiles/core.dir/src/other.cpp.obj",
+        encoding="utf-8",
+    )
+
+    graph = extract_cmake_makefiles_graph(
+        configured_build_root=build,
+        effective_source_root=source,
+        toolchain_root=toolchain,
+        toolchain_lock_digest=_digest("4"),
+        path_profile_id="stable",
+        target_outputs={"app": "APP.EXE"},
+    )
+
+    assert {node.outputs for node in graph.nodes if node.role is ProducerRole.COMPILER} == {
+        ("build/CMakeFiles/core.dir/src/other.cpp.obj",),
+        (
+            "build/CMakeFiles/core.dir/src/unit.cpp.obj",
+            "build/CMakeFiles/core.dir/src/unit.cpp.obj.pdb",
+        ),
+    }
 
 
 def test_nested_cmake_target_metadata_is_resolved_from_target_directory(

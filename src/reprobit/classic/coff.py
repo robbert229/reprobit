@@ -363,8 +363,29 @@ def _comdat_child(coff: _CoffObject, primary: dict[str, Any], name: str) -> dict
         and definitions.get(section["number"], {}).get("selection") == 5
         and (definitions[section["number"]]["associated"] == primary["number"])
     ]
+    if (
+        not matches
+        and name in CODEVIEW_SECTION_NAMES
+        and not any(section["name"] == name for section in coff.sections)
+    ):
+        require(False, codeview_absent_reason(name))
     require(len(matches) == 1, f"expected one {name} child, found {len(matches)}")
     return matches[0]
+
+
+# The CodeView sections only a compile with debug information writes.  An
+# MSVC 5.0 compile without /Zi writes neither (its functions keep only the
+# .debug$F frame data), so a step that reads them cannot run on its objects.
+CODEVIEW_SECTION_NAMES = (".debug$S", ".debug$T")
+
+
+def codeview_absent_reason(name: str) -> str:
+    """Why a step that reads CodeView ``name`` refuses an object without any."""
+
+    return (
+        f"the object has no {name} section at all: its unit compiles without /Zi, "
+        "so it carries no CodeView debug information, and this step reads it"
+    )
 
 
 def _coff_table_bytes(coff: _CoffObject, section: dict[str, Any], kind: str) -> bytes:

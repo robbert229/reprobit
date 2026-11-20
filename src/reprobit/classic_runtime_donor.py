@@ -14,7 +14,7 @@ from threading import Lock
 from types import MappingProxyType
 from typing import TYPE_CHECKING, cast
 
-from reprobit.classic.arguments import validate_compile_arguments
+from reprobit.classic.arguments import compile_writes_pdb, validate_compile_arguments
 from reprobit.classic.semantic_contracts import (
     _CLASSIC_SEMANTIC_ISSUER,
     DonorSemanticLane,
@@ -125,7 +125,9 @@ class _DonorCompilerInvocation:
     object_path: Path
     pdb_path: Path
     object_payload: bytes
-    pdb_payload: bytes
+    # The type-server PDB the compile wrote at ``pdb_path``; None when the
+    # donor's lane compiles without /Zi and so writes none.
+    pdb_payload: bytes | None
     result: ProcessResult
     spec: CommandSpec
     namespace: SealedNamespaceSnapshot
@@ -608,7 +610,12 @@ class ClassicDonorComposition:
             path.write_bytes(payload)
         donor_object = arena / "o.obj"
         donor_pdb = arena / "o.pdb"
+        # The donor keeps its lane's argv, so it writes ``o.pdb`` exactly when
+        # the lane compiles with /Zi (`compile_writes_pdb`).
+        writes_pdb = record.pdb_path is not None
         command = self._donor_compiler_command(record, donor.request, arena)
+        if compile_writes_pdb(command) != writes_pdb:
+            raise ClassicProjectError("donor compiler argv differs from its lane's debug format")
         before = _tree_file_seal(arena)
         include_root = arena / "inc"
         namespace_files: list[Path] = []
@@ -667,12 +674,14 @@ class ClassicDonorComposition:
                         donor_object,
                         label=f"donor {donor.intervention.id!r} canonical object",
                     )
-                    self.producer.require_regular(
-                        donor_pdb,
-                        label=f"donor {donor.intervention.id!r} canonical PDB",
-                    )
                     canonical_object = donor_object.read_bytes()
-                    canonical_pdb = donor_pdb.read_bytes()
+                    canonical_pdb: bytes | None = None
+                    if writes_pdb:
+                        self.producer.require_regular(
+                            donor_pdb,
+                            label=f"donor {donor.intervention.id!r} canonical PDB",
+                        )
+                        canonical_pdb = donor_pdb.read_bytes()
                     dependency_replay = self._replay_donor_dependencies(
                         supervisor,
                         donor_id=donor.intervention.id,
@@ -685,9 +694,8 @@ class ClassicDonorComposition:
                         cancellation=cancellation,
                         compiler_epoch=compiler_epoch,
                     )
-                    if (
-                        donor_object.read_bytes() != canonical_object
-                        or donor_pdb.read_bytes() != canonical_pdb
+                    if donor_object.read_bytes() != canonical_object or (
+                        canonical_pdb is not None and donor_pdb.read_bytes() != canonical_pdb
                     ):
                         raise ClassicProjectError(
                             "discarded donor dependency replay changed canonical OBJ/PDB bytes"
@@ -719,15 +727,16 @@ class ClassicDonorComposition:
         finally:
             self.producer.lane_pool.release(lane)
         self.producer.require_regular(donor_object, label=f"donor {donor.intervention.id!r} object")
-        self.producer.require_regular(donor_pdb, label=f"donor {donor.intervention.id!r} PDB")
+        if writes_pdb:
+            self.producer.require_regular(donor_pdb, label=f"donor {donor.intervention.id!r} PDB")
         _require_declared_tree_writes(
             before,
             root=arena,
-            allowed_outputs=(donor_object, donor_pdb),
+            allowed_outputs=(donor_object, donor_pdb) if writes_pdb else (donor_object,),
             phase=f"donor {donor.intervention.id!r}",
         )
         object_payload = donor_object.read_bytes()
-        pdb_payload = donor_pdb.read_bytes()
+        pdb_payload = donor_pdb.read_bytes() if writes_pdb else None
         return _DonorCompilerInvocation(
             record,
             donor_object,
@@ -950,7 +959,7 @@ class ClassicDonorComposition:
     ]:
         record = self.record_for_unit(unit)
         self.producer.require_regular(record.object_path, label=f"seed object for {unit.plan.id!r}")
-        if record.pdb_path.is_symlink():
+        if record.pdb_path is not None and record.pdb_path.is_symlink():
             raise ClassicProjectError(f"seed PDB is redirected: {record.pdb_path}")
         seed = record.object_path.read_bytes()
         steps: list[StepExecutionReceipt] = []

@@ -208,7 +208,7 @@ def _compile_output(
             invocation.record.node_id,
             rendered_inputs,
             Digest.from_bytes(invocation.object_payload),
-            Digest.from_bytes(invocation.pdb_payload),
+            None if invocation.pdb_payload is None else Digest.from_bytes(invocation.pdb_payload),
             invocation.object_payload,
             invocation.pdb_payload,
             _step_receipt(invocation.step_id, invocation.result, invocation.spec),

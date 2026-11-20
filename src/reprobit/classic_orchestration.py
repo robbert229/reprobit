@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, cast
 
 import reprobit.classic.composition_comdat_order as composition_comdat_order
 import reprobit.classic_repair_dispatch as repair_dispatch
+from reprobit.classic.arguments import compile_writes_pdb
 from reprobit.classic.compiler_identity import (
     Msvc420CompilerIdentity,
     issue_msvc420_compiler_identity,
@@ -64,6 +65,7 @@ from reprobit.schema import (
     candidate_auxiliary_donor_ids,
 )
 from reprobit.strict_json import canonical_json
+from reprobit.translation_unit_identity import debug_format_phrase, translation_unit_id
 
 if TYPE_CHECKING:
     from reprobit.oracle_pe32 import PE32VirtualAddressReader
@@ -245,6 +247,45 @@ def compiler_terminal_consumer_targets(
     )
 
 
+def translation_unit_debug_format_mismatch(
+    unit: ClassicTranslationUnitPlan,
+    compiler: ProducerNode,
+) -> bool:
+    """Whether a planned unit's identity was made for the other debug format.
+
+    The identity of a compile without ``/Zi`` is derived
+    (`translation_unit_id`), so such a lane must carry exactly that id.  A
+    compile with ``/Zi`` keeps any id it was given, except the one derived for
+    a compile without ``/Zi``.
+    """
+
+    debug_information = compile_writes_pdb(compiler.arguments)
+    without_debug = translation_unit_id(
+        target_id=unit.target_id,
+        build_target=unit.build_target,
+        source=unit.source,
+        debug_information=False,
+    )
+    return (unit.id == without_debug) == debug_information
+
+
+def require_translation_unit_debug_format(
+    unit: ClassicTranslationUnitPlan,
+    compiler: ProducerNode,
+) -> None:
+    """Refuse a unit whose records were made for the other debug format."""
+
+    if translation_unit_debug_format_mismatch(unit, compiler):
+        debug_information = compile_writes_pdb(compiler.arguments)
+        raise ClassicProjectError(
+            f"translation unit {unit.id!r} ({unit.build_target}/{unit.source}) was "
+            f"planned for a compile {debug_format_phrase(not debug_information)}, but its "
+            f"compiler lane {compiler.id!r} compiles {debug_format_phrase(debug_information)}; "
+            "records made for one debug format are never reused for the other.  Clear the "
+            "unit's records and import the CMake project again to re-derive it"
+        )
+
+
 def classic_compiler_translation_unit_authority(
     bundle: ProjectBundle,
     graph: ProducerGraphDocument,
@@ -281,6 +322,7 @@ def classic_compiler_translation_unit_authority(
                 f"{unit.build_target}/{unit.source}"
             )
         compiler = matches[0]
+        require_translation_unit_debug_format(unit, compiler)
         actual_targets = consumers[compiler.id]
         expected_targets = frozenset({unit.target_id})
         if actual_targets != expected_targets:
@@ -547,9 +589,12 @@ def classic_rdata_repack_graph_authority(
             for reference in producer.outputs
             if reference.startswith("build/") and reference.casefold().endswith(".pdb")
         )
-        if len(object_outputs) != 1 or len(pdb_outputs) != 1:
+        if len(object_outputs) != 1 or len(pdb_outputs) != (
+            1 if compile_writes_pdb(producer.arguments) else 0
+        ):
             raise ClassicProjectError(
-                f"rdata repack compiler {producer.id!r} must publish exactly one object and one PDB"
+                f"rdata repack compiler {producer.id!r} must publish exactly one object, "
+                "and one PDB exactly when it compiles with /Zi"
             )
         selected_producers[object_identity] = producer
         result[object_identity] = matches[0]
@@ -1170,4 +1215,6 @@ __all__ = [
     "compiler_terminal_consumer_targets",
     "compose_classic_unit",
     "prepare_classic_units",
+    "require_translation_unit_debug_format",
+    "translation_unit_debug_format_mismatch",
 ]

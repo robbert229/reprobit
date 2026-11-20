@@ -9,7 +9,7 @@ from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Literal, cast
 
-from reprobit.classic.arguments import validate_compile_arguments
+from reprobit.classic.arguments import compile_writes_pdb, validate_compile_arguments
 from reprobit.classic_project import ClassicProjectError
 from reprobit.classic_runtime_environment import _logical_join
 from reprobit.model import Digest
@@ -40,7 +40,8 @@ class ClassicCompileRecord:
     directory: Path
     source: Path
     object_path: Path
-    pdb_path: Path
+    # None when the compile has no /Zi and so writes no PDB.
+    pdb_path: Path | None
     arguments: tuple[str, ...]
     build_target: str
 
@@ -64,6 +65,29 @@ def classic_compiler_product_refs(node: ProducerNode) -> tuple[str, str]:
             f"compiler node {node.id!r} lacks one source/object semantic edge"
         )
     return sources[0], objects[0]
+
+
+def classic_compiler_pdb_ref(node: ProducerNode) -> str | None:
+    """Return a compiler node's one PDB output, or None for a compile without /Zi.
+
+    The compiler writes the PDB its ``/Fd`` names only with ``/Zi``
+    (`compile_writes_pdb`), so a node declares one PDB exactly when its argv
+    has ``/Zi`` and none otherwise.  Any other count is refused, so no
+    consumer expects a PDB the compile never writes or misses one it does.
+    """
+
+    pdbs = tuple(
+        value
+        for value in node.outputs
+        if PurePosixPath(value.split("/", 1)[-1]).suffix.casefold() == ".pdb"
+    )
+    writes_pdb = compile_writes_pdb(node.arguments)
+    if len(pdbs) != (1 if writes_pdb else 0):
+        raise ClassicProjectError(
+            f"compiler node {node.id!r} declares {len(pdbs)} PDB outputs, but a compile "
+            + ("with /Zi writes one" if writes_pdb else "without /Zi writes none")
+        )
+    return pdbs[0] if pdbs else None
 
 
 def classic_analysis_compiler_pdb_refs(
@@ -169,8 +193,12 @@ def _graph_compile_records(
             for reference, path in outputs.items()
             if reference.casefold().endswith(".pdb") and path is not None
         )
-        if len(objects) != 1 or len(pdbs) != 1:
-            raise ClassicProjectError(f"compiler node {node.id!r} must declare one OBJ and one PDB")
+        pdb_reference = classic_compiler_pdb_ref(node)
+        if len(objects) != 1 or len(pdbs) != (0 if pdb_reference is None else 1):
+            raise ClassicProjectError(
+                f"compiler node {node.id!r} must declare one OBJ, and one PDB exactly "
+                "when it compiles with /Zi"
+            )
         arguments = (
             str(compiler_command),
             *(
@@ -200,18 +228,26 @@ def _graph_compile_records(
             for value in node.outputs
             if value.casefold().endswith(".obj")
         )
-        pdb_relative = next(
-            value.removeprefix("build/")
-            for value in node.outputs
-            if value.casefold().endswith(".pdb")
-        )
         parsed_pdb = cast(str, parsed["Fd"][1])
         if parsed_pdb.endswith(("/", "\\")):
             parsed_pdb = parsed_pdb + "vc40.pdb"
-        if normalize_logical_path(parsed["Fo"][1].replace("/", "\\")) != _logical_join(
-            bundle.spec.paths.build, object_relative
-        ) or normalize_logical_path(parsed_pdb.replace("/", "\\")) != _logical_join(
-            bundle.spec.paths.build, pdb_relative
+        if pdb_reference is None:
+            # Without /Zi, /Fd names no output, but it still must not name a
+            # path outside the build seat.
+            build_prefix = _logical_join(bundle.spec.paths.build, "x")[:-1]
+            pdb_in_build = (
+                normalize_logical_path(parsed_pdb.replace("/", "\\"))
+                .casefold()
+                .startswith(build_prefix.casefold())
+            )
+        else:
+            pdb_in_build = normalize_logical_path(parsed_pdb.replace("/", "\\")) == _logical_join(
+                bundle.spec.paths.build, pdb_reference.removeprefix("build/")
+            )
+        if (
+            normalize_logical_path(parsed["Fo"][1].replace("/", "\\"))
+            != _logical_join(bundle.spec.paths.build, object_relative)
+            or not pdb_in_build
         ):
             raise ClassicProjectError(
                 f"compiler node {node.id!r} output arguments differ from its outputs"
@@ -243,7 +279,7 @@ def _graph_compile_records(
                 directory=build_root,
                 source=resolved_source,
                 object_path=objects[0].resolve(strict=False),
-                pdb_path=pdbs[0].resolve(strict=False),
+                pdb_path=pdbs[0].resolve(strict=False) if pdbs else None,
                 arguments=arguments,
                 build_target=node.owner,
             )
@@ -462,5 +498,6 @@ __all__ = [
     "ClassicCompileRecord",
     "ClassicProducerTarget",
     "classic_analysis_compiler_pdb_refs",
+    "classic_compiler_pdb_ref",
     "classic_compiler_product_refs",
 ]

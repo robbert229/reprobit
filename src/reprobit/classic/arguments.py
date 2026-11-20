@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from typing import Any
 
 from reprobit.binary import require
@@ -80,7 +81,34 @@ ADMITTED_NO_OPERAND_OPTIONS = {
     "-MT",
     "/MTd",
     "-MTd",
+    # The optimisations /O2 implies, spelled one by one: MSVC 5.0's /O2 is
+    # /Og /Oi /Ot /Oy /Ob1 /Gs /Gf /Gy, so a unit built without function-level
+    # linking names the others itself.  Each changes only the code.
+    "/Og",
+    "-Og",
+    "/Oi",
+    "-Oi",
+    "/Ot",
+    "-Ot",
+    "/Gs",
+    "-Gs",
+    "/Gf",
+    "-Gf",
 }
+
+DEBUG_FORMAT_OPTIONS = ("/Zi", "-Zi")
+
+
+def compile_writes_pdb(arguments: Sequence[str]) -> bool:
+    """Whether a compiler argv asks for debug information, and so writes a PDB.
+
+    `/Zi` is the one admitted debug format.  It writes the unit's types and
+    symbols to the PDB its `/Fd` names.  Without it the compiler writes no
+    PDB: `/Fd` stays in the command, names no output, and changes no object
+    byte.  `lex_compile_arguments` admits at most one `/Zi`.
+    """
+
+    return any(token in DEBUG_FORMAT_OPTIONS for token in arguments)
 
 
 def _admitted_warning_option(token: str) -> bool:
@@ -321,8 +349,8 @@ def lex_compile_arguments(arguments: list[str]) -> dict[str, Any]:
         errors.append(f"expected one exact /Fd, found {len(valued['Fd'])}")
     if len(compile_only) != 1:
         errors.append(f"expected one exact /c or -c, found {len(compile_only)}")
-    if len(debug_format) != 1:
-        errors.append(f"expected one exact /Zi or -Zi, found {len(debug_format)}")
+    if len(debug_format) > 1:
+        errors.append(f"expected at most one exact /Zi or -Zi, found {len(debug_format)}")
     if len(language_modes) > 1:
         errors.append(f"expected at most one exact /TC or /TP, found {len(language_modes)}")
     if (
@@ -375,7 +403,8 @@ def validate_compile_arguments(arguments: list[str]) -> dict[str, Any]:
         "role_operands": parsed["role_operands"],
         "source_token": parsed["source_token"],
         "compile_only": parsed["compile_only"][0],
-        "debug_format": parsed["debug_format"][0],
+        # None for a compile without debug information, which writes no PDB.
+        "debug_format": parsed["debug_format"][0] if parsed["debug_format"] else None,
         "language_mode": parsed["language_modes"][0] if parsed["language_modes"] else None,
         "roles": parsed["roles"],
     }
