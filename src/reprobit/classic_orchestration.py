@@ -38,6 +38,7 @@ from reprobit.classic.source_refactor_semantics import validate_donor_source_sem
 from reprobit.classic_donors import (
     DonorCompileRequest,
     DonorSourceError,
+    extern_suffix_changed_functions,
     matching_candidate_constraints,
     prepare_donor_compile_request,
 )
@@ -64,6 +65,7 @@ from reprobit.schema import (
     candidate_auxiliary_donor_ids,
 )
 from reprobit.strict_json import canonical_json
+from reprobit.suffix_run_effect import SuffixRunEffectError, require_suffix_run_effect
 
 if TYPE_CHECKING:
     from reprobit.oracle_pe32 import PE32VirtualAddressReader
@@ -772,6 +774,51 @@ def _named_donor_id(
     return donor_id
 
 
+def _require_suffix_run_effects(
+    unit: ClassicPreparedUnit,
+    seed_object: bytes,
+    donor_objects: Mapping[str, bytes],
+) -> None:
+    """Refuse an extern run after the unit's final line that changes what it does not state.
+
+    The seed is the unit's own fresh compile, without any donor's run: every
+    function the record does not list must compile byte-identically to it
+    (`reprobit.suffix_run_effect`).
+    """
+
+    for prepared in unit.donors:
+        intervention = prepared.intervention
+        if intervention.family is not ClassicRecipeFamily.EXTERN_RUN_PAIR:
+            continue
+        # The recipe as the donor compile read it: with its proof receipt's
+        # pins when the unit carries one.
+        receipts = [item for item in unit.receipts if item.intervention_id == intervention.id]
+        try:
+            parameters: Mapping[str, object] = (
+                matching_candidate_constraints(intervention, receipts).materialize()
+                if receipts
+                else {field.name: field.value for field in intervention.parameters}
+            )
+            changed = extern_suffix_changed_functions(parameters)
+        except DonorSourceError as exc:
+            raise ClassicProjectError(
+                f"extern-run donor {intervention.id!r} is invalid: {exc}"
+            ) from exc
+        if changed is None:
+            continue
+        try:
+            require_suffix_run_effect(
+                seed_object,
+                donor_objects[intervention.id],
+                changed_functions=changed,
+                carrier_identifiers=prepared.request.carrier_identifiers,
+            )
+        except SuffixRunEffectError as exc:
+            raise ClassicProjectError(
+                f"extern-run donor {intervention.id!r} runs after the unit's final line: {exc}"
+            ) from exc
+
+
 def compose_classic_unit(
     unit: ClassicPreparedUnit,
     *,
@@ -810,6 +857,7 @@ def compose_classic_unit(
     donor_objects = {
         donor_id: material.donor_object for donor_id, material in donor_materials.items()
     }
+    _require_suffix_run_effects(unit, seed_object, donor_objects)
     donor_object_recorder = getattr(measured_receipt_repair, "record_unit_donor_objects", None)
     if donor_object_recorder is not None:
         # A repair analysis keeps every unit's fresh donor objects, bound to the

@@ -602,3 +602,58 @@ def test_no_solution_never_publishes_even_with_advance_acceptance(
     assert result.cold_trials == 1
     assert len(result.rejections) == 2
     assert trace.publication_calls == 0
+
+
+# --- an extern run after the unit's final line -----------------------------------------
+
+
+def _extern_run_state(count: int) -> DeclarationState:
+    return DeclarationState(
+        family=DeclarationFamily.EXTERN_RUN_PAIR,
+        parameters=(
+            DeclarationParameter(name="header_count", value=count),
+            DeclarationParameter(name="header_prefix", value="ReproBitPad"),
+            DeclarationParameter(name="seat_count", value=0),
+            DeclarationParameter(name="seat_prefix", value="ReproBitPadSeat"),
+            DeclarationParameter(name="width", value=3),
+        ),
+    )
+
+
+def _extern_run_context(placement: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        unit=SimpleNamespace(target_id="program", id="tu.unit", build_target="program"),
+        config=SimpleNamespace(extern_runs=SimpleNamespace(placement=placement)),
+        symbol="_second",
+    )
+
+
+def test_a_suffix_run_is_probed_stating_no_change_until_its_compile_is_measured() -> None:
+    record = grind._state_donor(_extern_run_state(9), _extern_run_context("suffix"))
+    values = {field.name: field.value for field in record.intervention.parameters}
+
+    assert values["header_placement"] == "suffix"
+    assert values["changed_functions"] == []
+
+
+def test_a_suffix_runs_statement_keeps_its_compiler_seat() -> None:
+    context = _extern_run_context("suffix")
+    probe = grind._state_donor(_extern_run_state(9), context)
+    measured = grind._state_donor(_extern_run_state(9), context, changed_functions=("_f",))
+
+    assert measured.intervention.id != probe.intervention.id
+    assert grind._compiler_seat(measured) == grind._compiler_seat(probe)
+
+
+def test_only_a_suffix_run_states_changed_functions_in_a_grind() -> None:
+    with pytest.raises(grind.GrindError, match="only a suffix extern run"):
+        grind._state_donor(
+            _extern_run_state(9), _extern_run_context("prefix"), changed_functions=("_f",)
+        )
+
+
+def test_a_suffix_run_whose_objects_cannot_be_read_states_nothing() -> None:
+    record = grind._state_donor(_extern_run_state(9), _extern_run_context("suffix"))
+
+    with pytest.raises(grind.DiscoveryAuthoringError, match="effect cannot be stated"):
+        grind.measured_changed_functions(record, seed_object=b"seed", donor_object=b"donor")

@@ -341,8 +341,39 @@ def generate_forward_run(prefix: str, count: int, width: int) -> bytes:
 
 
 # Where an extern-run pair's header run sits: after the unit's final #include
-# (the default, also when the parameter is absent) or at the unit's start.
-EXTERN_HEADER_PLACEMENTS = frozenset({"after_includes", "prefix"})
+# (the default, also when the parameter is absent), at the unit's start, or
+# after the unit's final line.  A suffix run precedes no front-end symbol of
+# the unit; MSVC 5.0 numbers the back end's inline temporaries after it, so it
+# may change any function's code, and its record states which it changes.
+EXTERN_HEADER_PLACEMENTS = frozenset({"after_includes", "prefix", "suffix"})
+EXTERN_SUFFIX_PLACEMENT = "suffix"
+
+
+def extern_suffix_changed_functions(parameters: Mapping[str, object]) -> tuple[str, ...] | None:
+    """The functions an extern-run pair's suffix run states it changes, or None.
+
+    None for a header run at any other placement.  The parameters are a
+    validated recipe's (`validate_donor_recipe`).
+    """
+
+    if parameters.get("header_placement") != EXTERN_SUFFIX_PLACEMENT:
+        return None
+    return _changed_functions(parameters.get("changed_functions"))
+
+
+def _changed_functions(value: object) -> tuple[str, ...]:
+    _require(isinstance(value, (list, tuple)), "changed_functions must be a list")
+    names = tuple(cast(Sequence[object], value))
+    _require(
+        all(isinstance(name, str) and 0 < len(name) <= 2048 for name in names),
+        "changed_functions must name functions",
+    )
+    typed = cast(tuple[str, ...], names)
+    _require(
+        list(typed) == sorted(set(typed)),
+        "changed_functions must be unique and sorted",
+    )
+    return typed
 
 
 def generate_extern_run(prefix: str, count: int, width: int) -> bytes:
@@ -758,17 +789,32 @@ def validate_donor_recipe(
                 "width",
                 "role_policy",
                 "header_placement",
+                "changed_functions",
             },
             family.value,
-            optional={"role_policy", "header_placement"},
+            optional={"role_policy", "header_placement", "changed_functions"},
         )
         _validate_role_policy(parameters)
         # The header run sits after the unit's final #include unless it is
-        # placed at the unit's start, before code that a later include follows.
+        # placed at the unit's start, before code that a later include follows,
+        # or after the unit's final line.
         _require(
             parameters.get("header_placement", "after_includes") in EXTERN_HEADER_PLACEMENTS,
             "extern-run header placement differs",
         )
+        # A suffix run states the functions it changes; the build checks that
+        # statement against the unit's own compile (`suffix_run_effect`).
+        suffix = parameters.get("header_placement") == EXTERN_SUFFIX_PLACEMENT
+        _require(
+            ("changed_functions" in parameters) == suffix,
+            "an extern run states changed_functions exactly when its header run is a suffix",
+        )
+        if suffix:
+            _changed_functions(parameters["changed_functions"])
+            _require(
+                _integer(parameters.get("header_count"), "header_count", minimum=0) > 0,
+                "a suffix extern run needs a header run",
+            )
         width = _integer(parameters.get("width"), "width", minimum=1, maximum=3)
         pieces: list[bytes] = []
         for seat in ("header", "seat"):
@@ -1095,10 +1141,14 @@ def _render_ordinary_source(
             if parameters["seat_count"]
             else b""
         )
+        placement = parameters.get("header_placement", "after_includes")
         if not header:
             rendered = source
-        elif parameters.get("header_placement", "after_includes") == "prefix":
+        elif placement == "prefix":
             rendered = header + source
+        elif placement == EXTERN_SUFFIX_PLACEMENT:
+            # After the unit's final line; the seat run, if any, still ends the unit.
+            rendered = _append_lines(source, header) + b"\n"
         else:
             rendered = _insert_after_includes(source, header, family.value)
         return _append_lines(rendered, seat) if seat else rendered
@@ -1443,6 +1493,7 @@ __all__ = [
     "derive_special_seat_proof",
     "donor_overlay_clean_input_pins",
     "donor_requires_dependency_tracking",
+    "extern_suffix_changed_functions",
     "generate_declaration_shape",
     "generate_extern_run",
     "generate_forward_run",

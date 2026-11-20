@@ -71,11 +71,14 @@ class ProjectGrindExternRuns(StrictModel):
 
     The C-compatible carrier: class shapes and forward class declarations
     compile only as C++.  ``placement="prefix"`` seats the run at the unit's
-    start instead, for a function that a later include follows.
+    start instead, for a function that a later include follows, and
+    ``placement="suffix"`` after the unit's final line, where it moves only
+    what MSVC 5.0 numbers after the unit's last declaration (the back end's
+    inline temporaries); its records state every function it changes.
     """
 
     counts: InclusiveRange
-    placement: Literal["after_includes", "prefix"] = "after_includes"
+    placement: Literal["after_includes", "prefix", "suffix"] = "after_includes"
     prefix: Annotated[str, Field(pattern=r"^[A-Za-z][A-Za-z0-9_]*$")] = "ReproBitPad"
     width: Annotated[int, Field(ge=1, le=3)] = 3
 

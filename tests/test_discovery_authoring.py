@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from hashlib import sha256
+from typing import Any
 
 import pytest
 import test_classic_register_bijection_reencoding_full as coff_fixture
@@ -352,7 +353,7 @@ def test_merge_authored_records_refuses_nonmatching_shards_and_build_targets() -
         merge_authored_records(wrong_target, proofs, authored.records)
 
 
-def _extern_run_donor(**placement: str) -> AuthoredClassicRecord:
+def _extern_run_donor(**placement: Any) -> AuthoredClassicRecord:
     return build_extern_run_donor(
         target_id="program",
         translation_unit_id="tu.unit",
@@ -377,3 +378,35 @@ def test_extern_run_donor_default_placement_keeps_record_identity() -> None:
     assert ("header_placement", "prefix") in {
         (field.name, field.value) for field in prefix.intervention.parameters
     }
+
+
+def test_a_suffix_extern_run_donor_states_its_changed_functions() -> None:
+    suffix = _extern_run_donor(header_placement="suffix", changed_functions=("_g", "_f"))
+    other = _extern_run_donor(header_placement="suffix", changed_functions=("_f",))
+    values = {field.name: field.value for field in suffix.intervention.parameters}
+
+    assert values["header_placement"] == "suffix"
+    assert values["changed_functions"] == ["_f", "_g"]
+    assert values["emission_policy"] == "non_emitting_declarations_only"
+    assert other.intervention.id != suffix.intervention.id
+    assert (
+        validate_donor_recipe(
+            other.intervention, merge_candidate_constraints(other.intervention, other.receipt)
+        ).compiler_seat
+        == validate_donor_recipe(
+            suffix.intervention, merge_candidate_constraints(suffix.intervention, suffix.receipt)
+        ).compiler_seat
+    )
+
+
+@pytest.mark.parametrize(
+    "placement",
+    [
+        {"header_placement": "suffix"},
+        {"header_placement": "prefix", "changed_functions": ("_f",)},
+        {"changed_functions": ()},
+    ],
+)
+def test_only_a_suffix_extern_run_states_changed_functions(placement: dict[str, Any]) -> None:
+    with pytest.raises(DiscoveryAuthoringError, match="changed_functions exactly when"):
+        _extern_run_donor(**placement)

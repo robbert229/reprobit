@@ -13,6 +13,7 @@ from reprobit.classic_donors import (
     DonorIncludeProjection,
     DonorSourceError,
     donor_overlay_clean_input_pins,
+    extern_suffix_changed_functions,
     generate_declaration_shape,
     generate_extern_run,
     generate_forward_run,
@@ -636,7 +637,104 @@ def test_extern_run_header_prefix_precedes_the_whole_unit() -> None:
 def test_extern_run_header_rejects_an_unknown_placement() -> None:
     with pytest.raises(DonorSourceError, match="header placement"):
         render_declaration_carrier_source(
-            _extern_pair(header_placement="suffix"),
+            _extern_pair(header_placement="force_include"),
             [_receipt(ClassicRecipeFamily.EXTERN_RUN_PAIR)],
             _LATE_INCLUDE_SOURCE,
+        )
+
+
+def test_extern_run_header_suffix_follows_the_units_final_line() -> None:
+    rendered = render_declaration_carrier_source(
+        _extern_pair(header_placement="suffix", changed_functions=["_f"]),
+        [_receipt(ClassicRecipeFamily.EXTERN_RUN_PAIR)],
+        _LATE_INCLUDE_SOURCE,
+    )
+
+    assert rendered == _LATE_INCLUDE_SOURCE + b"\nextern int g_head0;\nextern int g_head1;\n"
+    assert extern_suffix_changed_functions(
+        validate_donor_recipe(
+            _extern_pair(header_placement="suffix", changed_functions=["_f"]),
+            merge_candidate_constraints(
+                _extern_pair(header_placement="suffix", changed_functions=["_f"]),
+                _receipt(ClassicRecipeFamily.EXTERN_RUN_PAIR),
+            ),
+        ).parameters
+    ) == ("_f",)
+
+
+def test_extern_run_suffix_precedes_the_seat_run_at_eof() -> None:
+    header = generate_extern_run("g_head", 1, 1)
+    seat = generate_extern_run("g_tail", 1, 1)
+    intervention = _intervention(
+        ClassicRecipeFamily.EXTERN_RUN_PAIR,
+        _carrier_parameters(
+            header + seat,
+            header_prefix="g_head",
+            header_count=1,
+            seat_prefix="g_tail",
+            seat_count=1,
+            width=1,
+            header_placement="suffix",
+            changed_functions=[],
+        ),
+    )
+
+    rendered = render_declaration_carrier_source(
+        intervention, [_receipt(ClassicRecipeFamily.EXTERN_RUN_PAIR)], _LATE_INCLUDE_SOURCE
+    )
+
+    assert rendered.endswith(b'#include "b.h"\n\nextern int g_head0;\n\nextern int g_tail0;')
+
+
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    [
+        ({"header_placement": "suffix"}, "changed_functions exactly when"),
+        ({"changed_functions": ["_f"]}, "changed_functions exactly when"),
+        (
+            {"header_placement": "prefix", "changed_functions": ["_f"]},
+            "changed_functions exactly when",
+        ),
+        ({"header_placement": "suffix", "changed_functions": "_f"}, "must be a list"),
+        ({"header_placement": "suffix", "changed_functions": [""]}, "must name functions"),
+        (
+            {"header_placement": "suffix", "changed_functions": ["_g", "_f"]},
+            "unique and sorted",
+        ),
+        (
+            {"header_placement": "suffix", "changed_functions": ["_f", "_f"]},
+            "unique and sorted",
+        ),
+    ],
+)
+def test_a_suffix_extern_run_states_the_functions_it_changes(
+    extra: dict[str, Any], message: str
+) -> None:
+    with pytest.raises(DonorSourceError, match=message):
+        render_declaration_carrier_source(
+            _extern_pair(**extra),
+            [_receipt(ClassicRecipeFamily.EXTERN_RUN_PAIR)],
+            _LATE_INCLUDE_SOURCE,
+        )
+
+
+def test_a_suffix_extern_run_needs_a_header_run() -> None:
+    seat = generate_extern_run("g_tail", 1, 1)
+    intervention = _intervention(
+        ClassicRecipeFamily.EXTERN_RUN_PAIR,
+        _carrier_parameters(
+            seat,
+            header_prefix="g_head",
+            header_count=0,
+            seat_prefix="g_tail",
+            seat_count=1,
+            width=1,
+            header_placement="suffix",
+            changed_functions=[],
+        ),
+    )
+
+    with pytest.raises(DonorSourceError, match="needs a header run"):
+        render_declaration_carrier_source(
+            intervention, [_receipt(ClassicRecipeFamily.EXTERN_RUN_PAIR)], _LATE_INCLUDE_SOURCE
         )
