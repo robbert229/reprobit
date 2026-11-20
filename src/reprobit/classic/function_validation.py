@@ -543,7 +543,24 @@ may read and write memory: ``errno``, ``_matherr``, its own flags).  It
 classifies its operands and loops on ``fprem``, so its control flow
 depends on the operands' values, which the simulator does not run; the
 call is an event named by all of those inputs, as a C call is
-(`region_simulation.x87_intrinsic_call`).
+(`region_simulation.x87_intrinsic_call`).  (a18) Boundary pointers, for the
+boundaries run of the frame-objects passes only (below): when a stack
+address is both the end of one local A and the start of the next local B,
+the donor -- compiled C -- means B by it wherever it hands it out (passes it
+in a call's argument words, stores it to memory, starts a block string
+operation from it): it never hands out a pointer one past the end of a
+local whose object it forms no pointer into.  ISO C allows ``&a + 1`` and
+lets arithmetic on it come back into ``a`` (C90 6.3.6), and the bytes of
+``lea r, [esp+k]`` are the same for ``&b`` and ``&a + 1``, so the binary
+cannot tell them apart: a callee given ``&a + 1`` alone could step back
+into ``a``.  What a18 assumes is that the donor's source has no such call
+-- an end pointer bounds a walk from a pointer into its object, and that
+pointer makes A escape on its own.  Like a11 it is a statement about the
+caller's code, which a reviewer checks against the donor's source, not
+about any callee.  Inside the function no assumption is needed: an access
+through the address at a constant offset must lie inside B, so one that
+reaches back into A is refused, and an access that does not move it is
+B's by a14 (A's one-past-end pointer cannot be dereferenced).
 No other assumption is made: the relation is inferred, nothing about the
 replacement is believed, and the simulator's term model is exact.
 
@@ -615,8 +632,9 @@ private frame whose escaping objects are memory.
   every stored value.  Its object escapes; so does the object k is one past
   the end of, when k is both an object's start and another's end (the
   pointer may be either, and C lets a pointer one past the end reach back
-  into its object).  The pass starts with no object escaping and runs again
-  with every object a run finds escaping (`ObjectEscape`), until none is new.
+  into its object) -- except in the boundaries run (below).  The pass
+  starts with no object escaping and runs again with every object a run
+  finds escaping (`ObjectEscape`), until none is new.
 - Only a register may hold ESP0 + k for a k in no object (``mov ecx, esp``
   building a structure argument in the outgoing argument block).  It stays
   ESP0 + k: every access through it is at a constant offset from ESP0, a
@@ -632,13 +650,27 @@ private frame whose escaping objects are memory.
   (`region_simulation.ObjectModel`).  Every other access at ESP0 + k below E
   is a private slot, related as check 7 relates one: by a14 no callee and no
   pointer reaches it.  At a return the objects' stores are dead stack.
+- An access at ESP0 + k that lies partly inside an escaping object is the
+  accesses of its runs (`FrameModel._mixed_parts`): each maximal run of its
+  bytes inside one escaping object is memory there, each run outside every
+  one a private slot, and the value is the runs' values tiled in order (a
+  write's runs take the bytes of the value they cover).  That is exact: the
+  extents alone say which bytes are memory, the access is the function's
+  own at a constant offset, not through any pointer, and one thread sees
+  no difference between one access and its parts.  MSVC 5.0 lays an
+  8-byte ``fild`` temporary over a local and the word next to it before the
+  local's address is taken (0x431780's ``(float)by``); a later write of the
+  local's own value covers the temporary's bytes there, so they leave no
+  trace (the equivalences pass drops a covered store), and a temporary
+  still in the local when a callee can read it is compared as memory and
+  refused.  No assumption is added.
 - Refused: a stack address that is not ESP0 plus a constant, or one in no
   object that is stored or starts a block string operation (a compiler
   temporary has no record, so its extent is unknown);
   an access at a variable offset from ESP itself (its displacement may fold
   an index, so its object is not known; the indexed pass admits one whose
-  index range proves its object); an access that lies partly inside
-  an escaping object; an access at a constant offset from an object's atom
+  index range proves its object); a stack address written across an
+  escaping object's edge; an access at a constant offset from an object's atom
   that leaves the object; a stored pointer at a constant offset outside its
   object, one past its end included (``va_start``'s address past the last
   parameter, which a callee walks beyond the object); an address combining
@@ -675,6 +707,21 @@ proof establishes or a16:
 
 A record this pass made pins ``frame_object_indexes`` and ``assumptions:
 ["a14", "a16"]``.
+
+The boundaries run.  When the frame-objects pass and its indexed pass both
+refuse, in a frame where some local ends where another starts, both run
+once more (`FrameFacts.boundaries`) with one change, under a18: a stack
+address ESP0 + k that is the start of an object B and the end of an object
+A becomes B's atom alone, and A does not escape through it.  A escapes only
+when a pointer into A itself is formed, as before.  B's extent checks every
+access through the address (an access at a constant offset below B's start
+is refused, one at a variable offset is B's by a14 as before), so only what
+a callee does with a handed-out boundary pointer rests on a18.  0x463230
+passes ``&normal`` to a callee where ``normal`` starts at the end of
+``block``, which the original keeps in another slot.  A record this run
+made pins ``frame_object_boundaries`` (each escaping object's start whose
+object below stays private, `frame_object_boundaries`) and adds ``a18`` to
+its ``assumptions``.
 
 A call to an x87 intrinsic dispatcher (a17) is an event in every pass: its
 body always refused before (it branches on memory), so no earlier record
@@ -724,6 +771,7 @@ from collections import Counter
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from fractions import Fraction
+from itertools import pairwise
 from typing import Any, cast
 
 from reprobit.binary import ByteIdentityError, require
@@ -773,6 +821,7 @@ from .region_simulation import (
     _set,
     _small,
     _step,
+    _store,
     _Undefined,
     condition,
     const_of,
@@ -1165,6 +1214,11 @@ class FrameFacts:
     # frame object is that object's (`FrameModel.indexed_object`), and the
     # relation carries each class's unsigned range (`ValueClass.bounds`).
     indexed: bool = False
+    # The boundaries run of the frame-objects passes (a18): a stack address
+    # that is one object's start and another's end is the starting object's
+    # alone (`FrameModel.canonical`); the object it ends does not escape
+    # through it.
+    boundaries: bool = False
 
     def tracks(self, byte: int) -> bool:
         """Whether ``FrameModel.dirty`` records writes to the byte at ESP0 + byte."""
@@ -1509,8 +1563,9 @@ class FrameModel:
     def _escaping_object(self, offset: int, width: int) -> FrameObject | None:
         """The escaping frame object an access at ESP0 + offset lies in (a14), or None.
 
-        An access that lies partly inside an escaping object is refused: its
-        bytes would be both memory and a private slot.
+        An access that lies partly inside an escaping object is refused here:
+        `load` and `store` split one into its runs first (`_mixed_parts`), so
+        only another route could bring one.
         """
         objects = self.facts.frame_objects
         if objects is None:
@@ -1576,6 +1631,17 @@ class FrameModel:
         pointees = objects.pointees(cast(int, offset))
         if register and not pointees:
             return value
+        if self.facts.boundaries and pointees and pointees[0].start == offset:
+            # A boundary (a18): ESP0 + k is the start of B and the end of the
+            # object below it, A.  Every use of it the function makes is B's:
+            # through the atom of B an access at a constant offset below B's
+            # start is refused (`_object_access`), so C's one-past-end pointer
+            # back into A is never admitted here; and a18 is that the donor
+            # hands out (in a call's arguments, to memory, to a block string
+            # operation) no pointer one past a local's end whose object it
+            # forms no pointer into.  So A escapes only through a pointer into
+            # A itself.
+            pointees = pointees[:1]
         require(
             bool(pointees),
             f"{context}: the stack address ESP0{offset:+d} lies in no local the donor's debug "
@@ -1659,8 +1725,52 @@ class FrameModel:
     def _overlapping(self, offset: int, width: int) -> list[tuple[int, int]]:
         return [key for key in self.slots if key[0] < offset + width and offset < key[0] + key[1]]
 
+    def _mixed_parts(self, offset: int, width: int) -> list[tuple[int, int]] | None:
+        """The runs of an access at ESP0 + offset that straddles an escaping object's edge.
+
+        In the frame-objects pass every byte below E is either an escaping
+        object's (memory) or a private slot's, by the extents alone, whatever
+        access reaches it.  An access at a constant offset from ESP0 -- the
+        function's own, not through any pointer -- whose bytes are partly of
+        an escaping object and partly not (MSVC 5.0's 8-byte ``fild``
+        temporary laid over a local and the word above it) is the same
+        accesses as its runs: each maximal run of bytes inside one escaping
+        object, and each run outside every one.  Returns those runs as
+        (offset, width), or None when the access does not straddle.
+        """
+        objects = self.facts.frame_objects
+        if objects is None:
+            return None
+        edges = {offset, offset + width}
+        straddles = False
+        for item in objects.objects:
+            if (
+                item.start in self.facts.escaping
+                and item.start < offset + width
+                and offset < item.end
+                and not (item.start <= offset and offset + width <= item.end)
+            ):
+                straddles = True
+            if item.start in self.facts.escaping:
+                edges |= {e for e in (item.start, item.end) if offset < e < offset + width}
+        if not straddles:
+            return None
+        cuts = sorted(edges)
+        return [(low, high - low) for low, high in pairwise(cuts)]
+
+    def _split_load(self, state: PathState, parts: list[tuple[int, int]], offset: int) -> Term:
+        """A straddling read as the reads of its runs (`_mixed_parts`), tiled in order."""
+        tiles = tuple(
+            (at - offset, size, _load(state, lin(at, [(ESP0, 1)]), size)) for at, size in parts
+        )
+        return _tiled(tiles, sum(size for _at, size in parts))
+
     def load(self, state: PathState, address: Term, width: int) -> Term | None:
         offset = self._offset(state, address, probe=self.helper_reads is not None, width=width)
+        if offset is not None and offset >= self._current(state):
+            parts = self._mixed_parts(offset, width)
+            if parts is not None:
+                return self._split_load(state, parts, offset)
         if offset is not None and offset < self._current(state):
             # A helper's stack probe below ESP: memory no model owns, so a
             # fresh value of this version (never equal to the other's).
@@ -1758,6 +1868,24 @@ class FrameModel:
         elif self.facts.private and mentions_stack_address(value):
             raise EscapeRefusal(f"{self.context}: a stack address is stored to memory")
         offset = self._offset(state, address, width=width)
+        parts = None if offset is None else self._mixed_parts(offset, width)
+        if parts is not None:
+            # A straddling write (`_mixed_parts`): the writes of its runs, each
+            # the bytes of the value it covers.  A stack address is never
+            # split across a private slot and memory.
+            require(
+                not computed_from_frame_object(value) and not mentions_stack_address(value),
+                f"{self.context}: a stack address is stored across the edge of an escaping "
+                "frame object",
+            )
+            for at, size in parts:
+                _store(
+                    state,
+                    lin(at, [(ESP0, 1)]),
+                    size,
+                    _part(value, at - cast(int, offset), size),
+                )
+            return True
         if offset is None or not self._owned(offset, width):
             self.expose(value)
             return False
@@ -3726,6 +3854,7 @@ def prove_function(
     frame_objects: FrameObjects | None = None,
     partial_slots: bool = False,
     indexed: bool = False,
+    boundaries: bool = False,
 ) -> ValidationProof:
     """Checks 2 and 4-7: a private frame when one is given and no stack address escapes.
 
@@ -3747,6 +3876,9 @@ def prove_function(
     ``indexed`` (with ``frame_objects``) runs the indexed frame-objects pass:
     a stack address at a variable offset whose range lies in one object is
     that object's, and the relation carries ranges (`FrameFacts.indexed`).
+    ``boundaries`` (with ``frame_objects``) runs the boundaries run: a stack
+    address at one object's start and another's end is the starting
+    object's alone (a18, `FrameFacts.boundaries`).
     ``partial_slots`` relates a private slot at a join only on the paths
     that wrote it: when a run reads a slot it wrote on only some paths to the
     join it started from (`UncarriedSlot`), the run is repeated with those
@@ -3824,7 +3956,13 @@ def prove_function(
         )
         escaping: frozenset[int] = frozenset()
         for _ in range(len(frame_objects.objects) + 1):
-            facts = replace(frame, frame_objects=frame_objects, escaping=escaping, indexed=indexed)
+            facts = replace(
+                frame,
+                frame_objects=frame_objects,
+                escaping=escaping,
+                indexed=indexed,
+                boundaries=boundaries,
+            )
             try:
                 return validate(facts, " (frame objects)")
             except ObjectEscape as escape:
@@ -3945,7 +4083,30 @@ def proof_summary(proof: ValidationProof) -> dict[str, Any]:
             # a14 records keep their pins.
             summary["frame_object_indexes"] = True
             summary["assumptions"] = ["a14", "a16"]
+        if proof.frame.boundaries:
+            # Only a proof of the boundaries run pins it and a18: the
+            # boundaries it left resolved, each an escaping object's start
+            # whose object below stays private.
+            summary["frame_object_boundaries"] = frame_object_boundaries(
+                objects, proof.frame.escaping
+            )
+            summary["assumptions"] = [*summary["assumptions"], "a18"]
     return summary
+
+
+def frame_object_boundaries(objects: FrameObjects, escaping: Iterable[int]) -> list[int]:
+    """The starts of escaping objects that end a private object (a18's boundaries).
+
+    At each such k a pointer ESP0 + k, had one been formed, was taken as the
+    escaping object's and not as one past the end of the private object below.
+    """
+    escapes = frozenset(escaping)
+    return sorted(
+        item.start
+        for item in objects.objects
+        if item.start in escapes
+        and any(below.end == item.start and below.start not in escapes for below in objects.objects)
+    )
 
 
 def pin_x87_intrinsics(
@@ -4416,6 +4577,7 @@ def measure_function_validation(
         entry_values: bool = False,
         frame_objects: FrameObjects | None = None,
         indexed: bool = False,
+        boundaries: bool = False,
     ) -> dict[str, Any]:
         case_proofs.clear()
         tag += " (partial slots)" if partial["on"] else ""
@@ -4446,6 +4608,7 @@ def measure_function_validation(
                 frame_objects=frame_objects,
                 partial_slots=partial["on"],
                 indexed=indexed,
+                boundaries=boundaries,
             )
 
         return _x87_case_proofs(items, successors, entries, donor_body[:proc], view, prove_case)
@@ -4506,8 +4669,8 @@ def measure_function_validation(
         # Only a record whose extents came from a debug sibling pins it.
         source_pin = {"frame_objects_from": "debug-sibling"} if from_sibling else {}
 
-        def run(indexed: bool) -> dict[str, Any]:
-            note = ", indexed" if indexed else ""
+        def run(indexed: bool, boundaries: bool = False) -> dict[str, Any]:
+            note = (", indexed" if indexed else "") + (", boundaries" if boundaries else "")
             try:
                 return {
                     **summary(
@@ -4515,6 +4678,7 @@ def measure_function_validation(
                         f" (frame-objects pass{note})",
                         frame_objects=frame_objects,
                         indexed=indexed,
+                        boundaries=boundaries,
                     ),
                     "equivalences": True,
                     **source_pin,
@@ -4529,6 +4693,7 @@ def measure_function_validation(
                     entry_values=True,
                     frame_objects=frame_objects,
                     indexed=indexed,
+                    boundaries=boundaries,
                 ),
                 "equivalences": True,
                 "entry_values": True,
@@ -4537,11 +4702,27 @@ def measure_function_validation(
 
         try:
             return run(False)
-        except ByteIdentityError:
+        except ByteIdentityError as refused:
             # Only when a14 refuses as before: the indexed frame-objects
             # pass, whose records pin ``frame_object_indexes``.  A record a14
             # made never needs it.
-            return run(True)
+            try:
+                return run(True)
+            except ByteIdentityError:
+                # Only when both refuse, and only in a frame where one local
+                # ends where another starts: the boundaries runs (a18), whose
+                # records pin ``frame_object_boundaries``.
+                if not any(
+                    below.end == item.start
+                    for item in frame_objects.objects
+                    for below in frame_objects.objects
+                ):
+                    raise
+                del refused
+            try:
+                return run(False, boundaries=True)
+            except ByteIdentityError:
+                return run(True, boundaries=True)
 
     def passes() -> dict[str, Any]:
         try:
