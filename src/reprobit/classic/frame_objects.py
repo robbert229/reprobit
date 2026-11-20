@@ -100,7 +100,7 @@ import struct
 from dataclasses import dataclass
 from typing import Any, cast
 
-from reprobit.binary import require
+from reprobit.binary import ByteIdentityError, require
 from reprobit.coff_format import (
     CoffObject,
     coff_body,
@@ -203,6 +203,9 @@ class FrameLocal:
     start: int
     size: int
     type_index: int
+    # For a local of array type (``LF_ARRAY_ST``, through ``const``/
+    # ``volatile``): its element's size in bytes; 0 for every other type.
+    element: int = 0
 
 
 @dataclass(frozen=True)
@@ -215,6 +218,9 @@ class FrameObject:
     start: int
     size: int
     names: tuple[str, ...]
+    # The element size when the object is one local of array type, else 0
+    # (a20 of `function_validation` places an unbounded index only in one).
+    element: int = 0
 
     @property
     def end(self) -> int:
@@ -497,6 +503,35 @@ class TypeSizes:
         require(not properties & _FORWARD_REFERENCE, f"{where} is a forward-referenced enum")
         return self.size(int.from_bytes(record[8:12], "little"), depth + 1)
 
+    def element_size(self, index: int, depth: int = 0) -> int:
+        """The element size of an array type (through modifiers), or 0 for any other type.
+
+        An ``LF_ARRAY_ST`` record holds its element type's index at bytes 4-8
+        (then the index type, then the size); the element's size is that
+        type's (`size`).  A multi-dimensional array is an array of arrays, so
+        its element is a row.
+        """
+        require(depth <= _MAX_TYPE_DEPTH, f"{self.context}: the type 0x{index:x} nests too deeply")
+        if index < CODEVIEW_FIRST_TYPE_INDEX:
+            return 0
+        record = self.record(index)
+        require(len(record) >= 4, f"{self.context}: the type record 0x{index:x} is truncated")
+        leaf = int.from_bytes(record[2:4], "little")
+        if leaf == LF_MODIFIER_ST:
+            require(len(record) >= 10, f"{self.context}: the type 0x{index:x} is truncated")
+            return self.element_size(int.from_bytes(record[4:8], "little"), depth + 1)
+        if leaf != LF_ARRAY_ST:
+            return 0
+        require(len(record) >= 14, f"{self.context}: the type 0x{index:x} is truncated")
+        element = self.size(int.from_bytes(record[4:8], "little"), depth + 1)
+        total = self.size(index, depth)
+        require(
+            0 < element <= total and total % element == 0,
+            f"{self.context}: the array type 0x{index:x} of {total} bytes has elements of "
+            f"{element} bytes",
+        )
+        return element
+
     def _aggregate_layout(self, record: bytes, leaf: int, where: str) -> tuple[int, int, str]:
         """(property, size, name) of a class, structure or union record."""
         size_at = 20 if leaf in (LF_CLASS_ST, LF_STRUCTURE_ST) else 12
@@ -686,6 +721,7 @@ def frame_locals(
         if offset is None:
             continue
         where = f"{context}: the local {item['name']!r} (ESP0{offset:+d}, type 0x{type_index:x})"
+        element = 0
         if type_index < CODEVIEW_FIRST_TYPE_INDEX:
             size = primitive_size(type_index, where)
         else:
@@ -699,6 +735,12 @@ def frame_locals(
                 f"{where} has a user-defined type whose size is unknown: {reason}",
             )
             size = cast(TypeSizes, known).size(type_index)
+            try:
+                element = cast(TypeSizes, known).element_size(type_index)
+            except ByteIdentityError:
+                # An element this reader cannot size leaves the local's
+                # extent as it was; a20 then places no index in it.
+                element = 0
         if position < parameters:
             start = offset
             require(
@@ -720,7 +762,7 @@ def frame_locals(
                 base <= offset and offset + size <= 0,
                 f"{where} of {size} bytes lies outside the locals block [ESP0{base:+d}, ESP0)",
             )
-        found.append(FrameLocal(item["name"], start, size, type_index))
+        found.append(FrameLocal(item["name"], start, size, type_index, element))
     used = tuple(sorted(sizes.used)) if sizes is not None else ()
     return tuple(found), used
 
@@ -734,9 +776,23 @@ def merge_frame_objects(
         if merged and item.start < merged[-1].end:
             last = merged[-1]
             end = max(last.end, item.start + item.size)
-            merged[-1] = FrameObject(last.start, end - last.start, (*last.names, item.name))
+            # Arrays of sibling scopes laid over the same bytes with the same
+            # extent and element size are one array of that shape, whichever
+            # the code indexes; any other merge is no single array, and a20
+            # places no index in it.
+            same_array = (
+                last.element
+                and item.element == last.element
+                and (item.start, item.size) == (last.start, last.size)
+            )
+            merged[-1] = FrameObject(
+                last.start,
+                end - last.start,
+                (*last.names, item.name),
+                last.element if same_array else 0,
+            )
         else:
-            merged.append(FrameObject(item.start, item.size, (item.name,)))
+            merged.append(FrameObject(item.start, item.size, (item.name,), item.element))
     return FrameObjects(tuple(merged), type_records)
 
 

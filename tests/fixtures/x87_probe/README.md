@@ -42,6 +42,23 @@ host's x87 unit.
   never equates `fmem` with `fld` and never commutes two memory operands.
   Reproduce with `gcc -O0 -o memory_operands memory_operands.c &&
   ./memory_operands > memory_operands.out`.
+- `memory_commute.c` (GNU C, the host's x87 unit) is the evidence for a19
+  of `reprobit.classic.function_validation`.  For m32 and m64, `fadd` and
+  `fmul`, every ordered pair of 17 operands of that width (15 non-NaN:
+  signed ones and zeros, the smallest and a largest negative denormal, the
+  smallest normal, the largest finite values, infinities, 1 + ulp, 2^24
+  or 2^53, 2^-24 or 2^-53, 1/3; and a QNaN and an SNaN) and all twelve
+  control words 0x007F | RC << 10 | PC << 8 (every exception masked), it
+  runs `fld A; fop B`, `fld B; fop A`, `fld A; fld B; fopp` and
+  `fld B; fld A; fopp`, and compares the 80-bit result, the exception
+  flags, SF, ES and C1.  Each line says whether the commuted memory
+  operands, the memory operand against its loaded register and the
+  commuted registers agree under every control word, or the first control
+  word where they do not.  Its output is `memory_commute.out` (13th Gen
+  Intel Core i5-13400F, 2026-11-20): all 900 non-NaN lines agree in all
+  three columns; the 40 that differ all have a NaN operand.  Reproduce
+  with `gcc -O0 -o memory_commute memory_commute.c && ./memory_commute >
+  memory_commute.out`.
 - `encodings.txt` is `objdump -d` of the three objects, restricted to x87 lines:
   the bytes each probe executed.  `commute_encodings.txt` is the same for
   `commute.obj`.

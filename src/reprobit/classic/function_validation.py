@@ -52,7 +52,8 @@ address, the same x87 stack, and the same memory outside the dead stack (the
 words below the final ESP and the function's own parameter words), or
 neither does -- under the model every classic rewriting uses (one thread,
 ordinary memory, callees that honour the MSVC calling convention their
-decoration names), x1-x4 of `rewriting_region_resize`, and a1-a9 below.  An
+decoration names), x1-x4 of `rewriting_region_resize`, and a1-a9 below
+(a10-a20 for the passes that name them).  An
 access of D faults exactly when the corresponding access of P does, except
 an access to the function's own stack frame (a3); the state at a fault is
 not compared.
@@ -560,7 +561,43 @@ caller's code, which a reviewer checks against the donor's source, not
 about any callee.  Inside the function no assumption is needed: an access
 through the address at a constant offset must lie inside B, so one that
 reaches back into A is refused, and an access that does not move it is
-B's by a14 (A's one-past-end pointer cannot be dereferenced).
+B's by a14 (A's one-past-end pointer cannot be dereferenced).  (a19) No
+NaN operands, for the x87 memory-operands run only (below): no operand
+of an x87 ``fadd`` or ``fmul`` with an m32 or m64 operand -- the value in
+ST(0) and the value in memory -- is a NaN, signalling or quiet, in either
+version.  Under it the memory operand is the register its load gives: the
+probe (`tests/fixtures/x87_probe/memory_commute.out`) ran ``fld A; fop B``,
+``fld B; fop A`` and ``fld A; fld B; fopp`` for add and multiply over every
+pair of 15 non-NaN operands of each width (signed zeros and ones, the
+smallest and a largest denormal, the smallest normal, the largest finite
+values, infinities, 1 + ulp, the powers of two that make a sum inexact,
+1/3) under all twelve rounding-mode and precision-control settings, and
+found the 80-bit result, the six exception flags, SF, ES and C1 equal
+every time.  So a19 covers: the result (no NaN payload is chosen, since
+there is none, and an invalid operation such as inf - inf or 0 * inf
+gives the default NaN either way); the sticky flags, DE included (a
+denormal raises DE at its conversion whether it is loaded or met as the
+memory operand, and nothing else about the order changes a flag); and
+precision control (loads are exact under every precision control, and
+the operation rounds the one exact sum or product once).  It covers the
+status word through what the model lets code read: the exception set is
+one event set in both, B (bit 15) is read from it, and C0-C3 after the
+operation stay the a8 term named by the x87 state the instruction ran
+from, which differs when the operands were swapped -- so a branch on a
+condition bit the swapped instruction left is still refused, and no other
+read of the status word is admitted.  With a NaN operand the probe finds
+the payload chosen and DE differ (40 of 1156 lines), which is why it is
+an assumption: lrr's donors compute positions, normals and scales that
+are never NaN, which a reviewer checks against the donor's source.  (a20)
+In-bounds indexes, for the in-bounds run only (below): an address ESP0 +
+k + V the donor forms with an index V no fact bounds, k inside the first
+element of a local of array type, is an element of that array: the donor
+-- compiled C -- indexes an array only inside it (C90 6.3.6, C99 6.5.6p8:
+an index outside the array is undefined behaviour), and its source does
+not fold a constant into an index so that the base names another local
+(``b[i - 4]`` compiled as ``&a[i]`` when ``b`` follows ``a``), which the
+binary cannot tell apart.  Like a18 it is a statement about the donor's
+source, which a reviewer checks.
 No other assumption is made: the relation is inferred, nothing about the
 replacement is believed, and the simulator's term model is exact.
 
@@ -723,6 +760,39 @@ made pins ``frame_object_boundaries`` (each escaping object's start whose
 object below stays private, `frame_object_boundaries`) and adds ``a18`` to
 its ``assumptions``.
 
+The in-bounds run.  When every run above refuses, in a frame with an
+array local, the indexed pass runs once more (and once more with the
+boundaries) with one change, under a20 (`FrameFacts.in_bounds`): a stack
+address ESP0 + k + V whose index no path condition, relation range or form
+bounds is placed in the object holding ESP0 + k when that object is one
+local of array type -- or arrays of sibling scopes laid over the same bytes
+with the same extent and element size -- whose extent and element size the
+donor's type records give (`frame_objects.TypeSizes.element_size`), k lies
+in its first element with the access, and every coefficient of V is a
+multiple of the element size (`FrameModel._in_bounds_object`).  An object
+whose type is not an array, or whose element type this reader cannot size,
+is refused.  The index is then one atom ``("inbounds", s, V)``, the same in
+both versions for the same index of the same array; an address holding it
+is the function's own: stored to memory, in a call's argument words, or as
+a block string operation's start, it is refused (`FrameModel.
+contain_in_bounds`), since a callee could step outside the array with an
+index the proof never saw.  0x431780 reads ``dirs[direction]`` for a
+parameter ``direction``.  A record this run made pins
+``frame_object_in_bounds`` (each escaping array's start, size and element
+size) and adds ``a20`` to its ``assumptions``.
+
+The x87 memory-operands run.  When every pass above refuses, in a function
+where either version has an x87 ``fadd`` or ``fmul`` with an m32 or m64
+operand (`x87_memory_arithmetic`), every pass runs once more under a19
+(`FrameFacts.x87_memory_operands`): such an operand is the term ``("fld",
+w, m)`` its load gives, with the load's event, so the operation is the
+register form, whose operands commute
+(`region_simulation.x87_memory_operands_as_loads`).  ``fld A; fadd B``
+then meets ``fld B; fadd A`` and ``fld A; fld B; faddp``.  Subtraction,
+division and compares with a memory operand keep the raw operand.
+0x463230 adds a vertex and a normal in the other order.  A record this run
+made pins ``x87_memory_operands`` and adds ``a19`` to its ``assumptions``.
+
 A call to an x87 intrinsic dispatcher (a17) is an event in every pass: its
 body always refused before (it branches on memory), so no earlier record
 runs through one.  The x87 stack must hold exactly its operands.  A record
@@ -740,20 +810,21 @@ function's code, relocations and FPO record are the donor's exactly
 (`frame_objects.sibling_frame_source`); such a record also pins
 ``frame_objects_from: "debug-sibling"``.
 
-Still refused, with the reason.  x87 operands are commuted only between
-registers (since `region_simulation`'s commutativity probe): a memory
-operand is not the register a load of it gives, because ``fld m32`` quiets
-an SNaN and raises DE for a denormal before the operation, while ``fadd
-m32`` meets the raw operand -- with two NaNs the result's payload differs,
-and with a NaN and a denormal the DE flag does
-(`tests/fixtures/x87_probe/memory_operands.out`: 64 of 200 operand pairs
-differ under commuted memory operands, 32 between a memory operand and its
-loaded register, none under commuted registers; every one has a NaN).  So
-``fld A; fadd B`` never meets ``fld B; fadd A``, and nothing is
-reassociated.  In a shared frame (a stack address escapes) every frame byte
-is still memory, compared exactly, even a slot whose address is never
-taken; only the frame-objects pass, under a14 and the extents the donor's
-debug records and type server give, relates such slots.  An escaping object
+Still refused, with the reason.  Outside the x87 memory-operands run
+(a19), x87 operands are commuted only between registers (since
+`region_simulation`'s commutativity probe): a memory operand is not the
+register a load of it gives, because ``fld m32`` quiets an SNaN and raises
+DE for a denormal before the operation, while ``fadd m32`` meets the raw
+operand -- with two NaNs the result's payload differs, and with a NaN and
+a denormal the DE flag does (`tests/fixtures/x87_probe/
+memory_operands.out`: 64 of 200 operand pairs differ under commuted memory
+operands, 32 between a memory operand and its loaded register, none under
+commuted registers; every one has a NaN).  So without a19 ``fld A; fadd
+B`` never meets ``fld B; fadd A``, and nothing is ever reassociated.  In
+a shared frame (a stack address escapes) every frame byte is still memory,
+compared exactly, even a slot whose address is never taken; only the
+frame-objects pass, under a14 and the extents the donor's debug records
+and type server give, relates such slots.  An escaping object
 the replacement keeps at another offset is refused: relating two addresses
 of one object would need a callee never to observe a pointer's value (only
 its object and offset), and the memory a function leaves could then hold
@@ -926,6 +997,29 @@ def computed_from_frame_object(term: Term) -> bool:
             seen.add(id(current))
             if isinstance(current, tuple):
                 if current and current[0] == "fobj":
+                    return True
+                if current and current[0] in ("call", "call#", "ld"):
+                    continue
+            stack.extend(item for item in current if not isinstance(item, (str, int)))
+    return False
+
+
+def _mentions_in_bounds(term: Term) -> bool:
+    """Whether a value is computed from an index a20 placed (``("inbounds", s, V)``).
+
+    As :func:`computed_from_frame_object`: a load's address and an event's
+    name are not part of the value.
+    """
+    stack = [term]
+    seen: set[int] = set()
+    while stack:
+        current = stack.pop()
+        if isinstance(current, (tuple, list, frozenset, set)):
+            if id(current) in seen:
+                continue
+            seen.add(id(current))
+            if isinstance(current, tuple):
+                if current and current[0] == "inbounds":
                     return True
                 if current and current[0] in ("call", "call#", "ld"):
                     continue
@@ -1219,6 +1313,15 @@ class FrameFacts:
     # alone (`FrameModel.canonical`); the object it ends does not escape
     # through it.
     boundaries: bool = False
+    # The x87 memory-operands run (a19): an x87 add or multiply with a memory
+    # operand reads it as the register its load gives
+    # (`region_simulation.x87_memory_operands_as_loads`), so its operands
+    # commute as registers' do.
+    x87_memory_operands: bool = False
+    # The in-bounds run of the indexed frame-objects pass (a20): a stack
+    # address ESP0 + k + V whose index V no fact bounds lies in the array
+    # local holding ESP0 + k (`FrameModel.indexed_object`).
+    in_bounds: bool = False
 
     def tracks(self, byte: int) -> bool:
         """Whether ``FrameModel.dirty`` records writes to the byte at ESP0 + byte."""
@@ -1303,6 +1406,8 @@ class FrameModel:
         # whether the proof runs its equivalences pass.
         self.objects = facts.objects
         self.equivalences = facts.equivalences
+        # a19: read by `region_simulation.x87_memory_operands_as_loads`.
+        self.x87_memory_operands = facts.x87_memory_operands
         self.slots = dict(slots or {})
         self.dirty = set(dirty)
         self.context = context
@@ -1340,7 +1445,9 @@ class FrameModel:
 
         Called for every value stored to memory (outside the private slots),
         for a ``rep stos`` value, and for the argument words of every call.
+        An address an a20 index placed is refused there (`contain_in_bounds`).
         """
+        self.contain_in_bounds(value, self.context)
         if not self.unexposed or not computed_from_frame_object(value):
             return
         stack = [value]
@@ -1416,6 +1523,8 @@ class FrameModel:
             f"{context}: a stack address whose index is itself computed from a stack address",
         )
         bounds = linear_range(rest, self.facts_now())
+        if bounds is None and self.facts.in_bounds:
+            return self._in_bounds_object(_signed(address[1]), rest, width, context)
         require(
             bounds is not None,
             f"{context}: a stack address at a variable offset whose index no path condition, "
@@ -1431,10 +1540,75 @@ class FrameModel:
             "in no single frame object the donor's debug records declare"
         )
 
+    def _in_bounds_object(
+        self, offset: int, rest: tuple[tuple[Term, int], ...], width: int, context: str
+    ) -> FrameObject:
+        """The array ESP0 + k + V lies in when no fact bounds V (a20, the in-bounds run).
+
+        The constant part ESP0 + k must lie in the first element of a frame
+        object that is one local of array type, whose extent and element size
+        the donor's type records give (`frame_objects.TypeSizes.element_size`),
+        and every coefficient of V must be a multiple of the element size: the
+        form ``&a[i]`` (plus a field offset inside the element) compiles to.
+        a20 is that the index stays inside the array, so every address the
+        term takes, and the ``width`` bytes from it, are the array's.
+        """
+        objects = cast(FrameObjects, self.facts.frame_objects).objects
+        holding = [item for item in objects if item.start <= offset < item.end]
+        require(
+            bool(holding),
+            f"{context}: a stack address ESP0{offset:+d} + V whose index V nothing bounds, and "
+            f"ESP0{offset:+d} lies in no frame object, so a20 places it in no array",
+        )
+        item = holding[0]
+        where = f"[ESP0{item.start:+d}, ESP0{item.end:+d}) of {', '.join(item.names)}"
+        require(
+            item.element > 0,
+            f"{context}: a stack address ESP0{offset:+d} + V whose index V nothing bounds lies "
+            f"in the frame object {where}, which is not one local of array type the donor's "
+            "type records declare, so a20 does not place it",
+        )
+        require(
+            offset - item.start + width <= item.element,
+            f"{context}: a stack address ESP0{offset:+d} + V ({width} bytes) whose index nothing "
+            f"bounds starts outside the first {item.element}-byte element of the array {where}, "
+            "so a20 cannot tell which array it indexes",
+        )
+        require(
+            all(_signed(coefficient) % item.element == 0 for _atom, coefficient in rest),
+            f"{context}: a stack address ESP0{offset:+d} + V whose index nothing bounds scales "
+            f"its index by other than a multiple of the array {where}'s {item.element}-byte "
+            "element",
+        )
+        return item
+
     def _indexed_atom(self, address: Term, item: FrameObject) -> Term:
-        """ESP0 + k + V in the object at s, as its atom + (k - s) + V (a14)."""
-        rest = [(atom, c) for atom, c in address[2] if atom != ESP0]
+        """ESP0 + k + V in the object at s, as its atom + (k - s) + V (a14).
+
+        In the in-bounds run (a20) an index V no fact bounds is one atom
+        ``("inbounds", s, V)``: the same index of the same array in both
+        versions, which marks the address so that it never leaves the
+        function (`contain_in_bounds`).
+        """
+        rest = tuple((atom, c) for atom, c in address[2] if atom != ESP0)
+        if self.facts.in_bounds and linear_range(rest, self.facts_now()) is None:
+            index = ("inbounds", item.start, lin(0, list(rest)))
+            return lin(_signed(address[1]) - item.start, [(frame_object_atom(item), 1), (index, 1)])
         return lin(_signed(address[1]) - item.start, [(frame_object_atom(item), 1), *rest])
+
+    def contain_in_bounds(self, value: Term, context: str) -> None:
+        """Refuse a value leaving the function that holds an a20-placed address.
+
+        a20 places an unbounded index only for the function's own accesses:
+        a callee handed such a pointer (in its argument words, through memory,
+        as a block string operation's start) could step past the array with
+        an index the proof never saw.
+        """
+        if self.facts.in_bounds and _mentions_in_bounds(value):
+            raise ByteIdentityError(
+                f"{context}: an address whose array index a20 placed (no fact bounds it) leaves "
+                "the function, where a callee could step outside the array"
+            )
 
     def _require_escaping(self, item: FrameObject, context: str) -> None:
         if item.start not in self.facts.escaping:
@@ -1453,6 +1627,7 @@ class FrameModel:
         admits a stack address only at a constant offset at or above ESP: the
         block then lies wholly at or above ESP (a9), in the compared memory.
         """
+        self.contain_in_bounds(pointer, context)
         if not computed_from_stack(pointer):
             return
         if self.facts.private:
@@ -2551,6 +2726,17 @@ def indirect_call_pops(program: Program) -> dict[int, int]:
 _PUSH_OPCODES = frozenset({*range(0x50, 0x58), 0x68, 0x6A})
 MAX_PUSH_REGION = 512
 MAX_RESULT_STEPS = 2048
+
+
+def x87_memory_arithmetic(program: Program) -> bool:
+    """Whether a reachable instruction is ``fadd``/``fmul`` with an m32 or m64 operand (a19)."""
+    for offset in program.reachable:
+        item = program.instructions[offset]
+        if item.opcode in (0xD8, 0xDC) and not item.operand16:
+            mod, digit, _index = item.modrm()
+            if mod != 3 and digit in (0, 1):
+                return True
+    return False
 
 
 def _is_call(program: Program, item: _Instruction) -> bool:
@@ -3855,6 +4041,8 @@ def prove_function(
     partial_slots: bool = False,
     indexed: bool = False,
     boundaries: bool = False,
+    x87_memory_operands: bool = False,
+    in_bounds: bool = False,
 ) -> ValidationProof:
     """Checks 2 and 4-7: a private frame when one is given and no stack address escapes.
 
@@ -3879,6 +4067,12 @@ def prove_function(
     ``boundaries`` (with ``frame_objects``) runs the boundaries run: a stack
     address at one object's start and another's end is the starting
     object's alone (a18, `FrameFacts.boundaries`).
+    ``x87_memory_operands`` runs every frame under a19: an x87 add or
+    multiply reads its memory operand as the register its load gives
+    (`FrameFacts.x87_memory_operands`).  ``in_bounds`` (with ``indexed``)
+    runs the in-bounds run: a stack address whose variable index no fact
+    bounds lies in the array local its constant part points into (a20,
+    `FrameFacts.in_bounds`).
     ``partial_slots`` relates a private slot at a join only on the paths
     that wrote it: when a run reads a slot it wrote on only some paths to the
     join it started from (`UncarriedSlot`), the run is repeated with those
@@ -3932,13 +4126,21 @@ def prove_function(
 
     params_end = 4 if private_frame is None else private_frame.params_end
     equivalences = objects is not None
+    if private_frame is not None:
+        private_frame = replace(private_frame, x87_memory_operands=x87_memory_operands)
     if objects is not None:
         objects = replace(objects, stack_end=params_end)
         if private_frame is not None:
             private_frame = replace(
                 private_frame, objects=objects, equivalences=True, entry_values=entry_values
             )
-    shared = FrameFacts(False, params_end=params_end, objects=objects, equivalences=equivalences)
+    shared = FrameFacts(
+        False,
+        params_end=params_end,
+        objects=objects,
+        equivalences=equivalences,
+        x87_memory_operands=x87_memory_operands,
+    )
     if frame_objects is not None:
         require(
             private_frame is not None and objects is not None,
@@ -3962,6 +4164,7 @@ def prove_function(
                 escaping=escaping,
                 indexed=indexed,
                 boundaries=boundaries,
+                in_bounds=in_bounds,
             )
             try:
                 return validate(facts, " (frame objects)")
@@ -4091,6 +4294,21 @@ def proof_summary(proof: ValidationProof) -> dict[str, Any]:
                 objects, proof.frame.escaping
             )
             summary["assumptions"] = [*summary["assumptions"], "a18"]
+        if proof.frame.in_bounds:
+            # Only a proof of the in-bounds run pins it and a20: the escaping
+            # arrays an unbounded index may have been placed in, each with its
+            # element size.
+            summary["frame_object_in_bounds"] = [
+                [*item.pin(), item.element]
+                for item in objects.objects
+                if item.start in proof.frame.escaping and item.element
+            ]
+            summary["assumptions"] = [*summary["assumptions"], "a20"]
+    if proof.frame.x87_memory_operands:
+        # Only a proof of the x87 memory-operands run pins it and a19, so a
+        # record any other run made keeps its pins.
+        summary["x87_memory_operands"] = True
+        summary["assumptions"] = sorted({*summary.get("assumptions", []), "a19"})
     return summary
 
 
@@ -4570,6 +4788,10 @@ def measure_function_validation(
     # Whether partial slot relations run, and whether a run without them
     # refused a slot written on only some paths (`UncarriedSlot`).
     partial = {"on": False, "needed": False}
+    # Whether the x87 memory-operands run (a19) is on: only when every pass
+    # refused without it, and only when either version has an x87 add or
+    # multiply with a memory operand (`x87_memory_arithmetic`).
+    modes = {"x87_memory_operands": False}
 
     def summary(
         model: ObjectModel | None,
@@ -4578,9 +4800,11 @@ def measure_function_validation(
         frame_objects: FrameObjects | None = None,
         indexed: bool = False,
         boundaries: bool = False,
+        in_bounds: bool = False,
     ) -> dict[str, Any]:
         case_proofs.clear()
         tag += " (partial slots)" if partial["on"] else ""
+        tag += " (x87 memory operands, a19)" if modes["x87_memory_operands"] else ""
 
         def prove_case(counts: Mapping[str, int], note: str) -> ValidationProof:
             try:
@@ -4609,6 +4833,8 @@ def measure_function_validation(
                 partial_slots=partial["on"],
                 indexed=indexed,
                 boundaries=boundaries,
+                x87_memory_operands=modes["x87_memory_operands"],
+                in_bounds=in_bounds,
             )
 
         return _x87_case_proofs(items, successors, entries, donor_body[:proc], view, prove_case)
@@ -4669,8 +4895,12 @@ def measure_function_validation(
         # Only a record whose extents came from a debug sibling pins it.
         source_pin = {"frame_objects_from": "debug-sibling"} if from_sibling else {}
 
-        def run(indexed: bool, boundaries: bool = False) -> dict[str, Any]:
-            note = (", indexed" if indexed else "") + (", boundaries" if boundaries else "")
+        def run(indexed: bool, boundaries: bool = False, in_bounds: bool = False) -> dict[str, Any]:
+            note = (
+                (", indexed" if indexed else "")
+                + (", boundaries" if boundaries else "")
+                + (", in bounds" if in_bounds else "")
+            )
             try:
                 return {
                     **summary(
@@ -4679,6 +4909,7 @@ def measure_function_validation(
                         frame_objects=frame_objects,
                         indexed=indexed,
                         boundaries=boundaries,
+                        in_bounds=in_bounds,
                     ),
                     "equivalences": True,
                     **source_pin,
@@ -4694,35 +4925,54 @@ def measure_function_validation(
                     frame_objects=frame_objects,
                     indexed=indexed,
                     boundaries=boundaries,
+                    in_bounds=in_bounds,
                 ),
                 "equivalences": True,
                 "entry_values": True,
                 **source_pin,
             }
 
+        boundaries_frame = any(
+            below.end == item.start
+            for item in frame_objects.objects
+            for below in frame_objects.objects
+        )
+
+        def runs_before_in_bounds() -> dict[str, Any]:
+            try:
+                return run(False)
+            except ByteIdentityError as refused:
+                # Only when a14 refuses as before: the indexed frame-objects
+                # pass, whose records pin ``frame_object_indexes``.  A record
+                # a14 made never needs it.
+                try:
+                    return run(True)
+                except ByteIdentityError:
+                    # Only when both refuse, and only in a frame where one
+                    # local ends where another starts: the boundaries runs
+                    # (a18), whose records pin ``frame_object_boundaries``.
+                    if not boundaries_frame:
+                        raise
+                    del refused
+                try:
+                    return run(False, boundaries=True)
+                except ByteIdentityError:
+                    return run(True, boundaries=True)
+
         try:
-            return run(False)
-        except ByteIdentityError as refused:
-            # Only when a14 refuses as before: the indexed frame-objects
-            # pass, whose records pin ``frame_object_indexes``.  A record a14
-            # made never needs it.
-            try:
-                return run(True)
-            except ByteIdentityError:
-                # Only when both refuse, and only in a frame where one local
-                # ends where another starts: the boundaries runs (a18), whose
-                # records pin ``frame_object_boundaries``.
-                if not any(
-                    below.end == item.start
-                    for item in frame_objects.objects
-                    for below in frame_objects.objects
-                ):
-                    raise
-                del refused
-            try:
-                return run(False, boundaries=True)
-            except ByteIdentityError:
-                return run(True, boundaries=True)
+            return runs_before_in_bounds()
+        except ByteIdentityError:
+            # Only when every run above refuses, and only in a frame with an
+            # array local: the in-bounds runs of the indexed pass (a20), whose
+            # records pin ``frame_object_in_bounds``.
+            if not any(item.element for item in frame_objects.objects):
+                raise
+        try:
+            return run(True, in_bounds=True)
+        except ByteIdentityError:
+            if not boundaries_frame:
+                raise
+            return run(True, boundaries=True, in_bounds=True)
 
     def passes() -> dict[str, Any]:
         try:
@@ -4732,17 +4982,34 @@ def measure_function_validation(
                 raise
             return frame_objects_pass(earlier)
 
+    def attempt() -> dict[str, Any]:
+        try:
+            return passes()
+        except ByteIdentityError:
+            # Only when every pass refuses, and some run refused a private
+            # slot written on only some paths to a join: every pass again,
+            # with partial slot relations.  A record made without them never
+            # needs them, and one that does pins its split bytes
+            # (`proof_summary`).
+            if partial["on"] or not partial["needed"]:
+                raise
+            partial["on"] = True
+            return passes()
+
     try:
-        proof_summary_pin = passes()
+        proof_summary_pin = attempt()
     except ByteIdentityError:
-        # Only when every pass refuses, and some run refused a private slot
-        # written on only some paths to a join: every pass again, with
-        # partial slot relations.  A record made without them never needs
-        # them, and one that does pins its split bytes (`proof_summary`).
-        if not partial["needed"]:
+        # Only when every pass refuses, and only when either version has an
+        # x87 add or multiply with a memory operand: every pass again under
+        # a19, whose records pin ``x87_memory_operands``.  A record made
+        # without it never needs it.
+        if not (
+            x87_memory_arithmetic(donor_program)
+            or x87_memory_arithmetic(Program(code, image_targets, "P", label, helpers, image_tail))
+        ):
             raise
-        partial["on"] = True
-        proof_summary_pin = passes()
+        modes["x87_memory_operands"] = True
+        proof_summary_pin = attempt()
     proof_summary_pin = pin_x87_intrinsics(
         proof_summary_pin, {symbol: body.code for symbol, body in bodies.items()}
     )
