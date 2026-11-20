@@ -30,6 +30,7 @@ from reprobit.classic.coff import (
 from reprobit.classic.composition_mosaic import instruction_mosaic_metadata_sha256
 from reprobit.classic.debug import MSVC50_FUNCTION_FILL_BYTE
 from reprobit.classic.foundation import sha256_bytes
+from reprobit.classic.frame_objects import DebugSibling
 from reprobit.classic.function_validation import (
     FUNCTION_VALIDATION_KIND,
     measure_function_validation,
@@ -383,13 +384,16 @@ def build_function_validation_rewriting(
     reference_object: bytes,
     helper_library: HelperLibrary | None = None,
     donor_type_server: bytes | None = None,
+    donor_debug_sibling: DebugSibling | None = None,
 ) -> DeclarationShapeEqualBodyAuthoring:
     """Author a translation-validation consumer whose replacement is the reference body.
 
     ``helper_library`` is the authenticated toolchain library the bodies of
     compiler helpers are read from (`classic.toolchain_helpers`).
     ``donor_type_server`` is the PDB the donor's compile wrote its types to,
-    read only by the frame-objects pass (a14 of `classic.function_validation`).
+    and ``donor_debug_sibling`` the ``/Zi`` sibling compile of a donor
+    compiled without ``/Zi``; only the frame-objects pass reads them (a14 of
+    `classic.function_validation`).
     """
 
     for name, value in (
@@ -517,6 +521,7 @@ def build_function_validation_rewriting(
             _comdat_child_closure(donor_coff, dp)[1],
             helper_library,
             donor_type_server,
+            donor_debug_sibling,
         )
         if measured.image != reference_body:
             raise DiscoveryAuthoringError("the proved image differs from the reference body")
@@ -560,6 +565,7 @@ def build_function_validation_rewriting(
                 candidate_constraints=constraints,
                 helper_library=helper_library,
                 donor_type_server=donor_type_server,
+                donor_debug_sibling=donor_debug_sibling,
             ),
         )
         composed = CoffObject(candidate.output)

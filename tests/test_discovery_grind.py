@@ -12,6 +12,7 @@ from typing import Any, cast
 import pytest
 
 import reprobit.discovery_grind as grind
+from reprobit.classic.frame_objects import DebugSibling
 from reprobit.discovery_contracts import (
     DeclarationFamily,
     DeclarationParameter,
@@ -1025,14 +1026,16 @@ def test_a_donor_probe_without_its_compile_s_pdb_is_refused(
 
 
 def _without_type_servers(
-    callbacks: ProjectGrindCallbacks, type_server: bytes | None = None
+    callbacks: ProjectGrindCallbacks,
+    type_server: bytes | None = None,
+    debug_sibling: DebugSibling | None = None,
 ) -> ProjectGrindCallbacks:
     def donors(
         root: Path, donor_ids: tuple[str, ...], progress: grind.DonorProgress | None
     ) -> dict[str, grind.DonorCompileProduct]:
         products = callbacks.probe_donors(root, donor_ids, progress)
         return {
-            donor_id: grind.DonorCompileProduct(product.object_payload, type_server)
+            donor_id: grind.DonorCompileProduct(product.object_payload, type_server, debug_sibling)
             for donor_id, product in products.items()
         }
 
@@ -1046,7 +1049,8 @@ def test_a_unit_without_debug_information_grinds_with_donors_that_have_no_pdb(
     from reprobit.discovery_authoring import DiscoveryAuthoringError
 
     # The unit compiles without /Zi, so its donors write no type-server PDB:
-    # each rewriting receives none, and a14 would refuse for want of it.
+    # each rewriting receives none, and its debug sibling (the compile with
+    # /Zi added) instead, which a14 reads only when its code is the donor's.
     live_root, _staged_root, _trace, callbacks = _install_grind_fixture(
         monkeypatch,
         tmp_path,
@@ -1054,23 +1058,57 @@ def test_a_unit_without_debug_information_grinds_with_donors_that_have_no_pdb(
         qualification_rejections=frozenset({(1, 1)}),
         compiler_arguments=("/O2",),
     )
-    received: list[tuple[object, object]] = []
+    received: list[tuple[object, object, object]] = []
 
     def rewriting(
         *_args: object,
         donor_object: object = None,
         donor_type_server: object = None,
+        donor_debug_sibling: object = None,
         **_kwargs: object,
     ) -> None:
-        received.append((donor_object, donor_type_server))
+        received.append((donor_object, donor_type_server, donor_debug_sibling))
         raise DiscoveryAuthoringError("fixture rewriting refusal")
 
     monkeypatch.setattr(grind, "_state_rewriting", rewriting)
+    sibling = DebugSibling(b"sibling object", b"sibling pdb")
 
-    result = run_project_grind(live_root, callbacks=_without_type_servers(callbacks))
+    result = run_project_grind(
+        live_root, callbacks=_without_type_servers(callbacks, debug_sibling=sibling)
+    )
 
     assert result.solution is None
-    assert received == [(b"donor object 1.1", None)]
+    assert received == [(b"donor object 1.1", None, sibling)]
+
+
+@pytest.mark.parametrize(
+    ("arguments", "type_server", "sibling"),
+    [
+        # Without /Zi a donor product must carry its debug sibling's result...
+        (("/O2",), None, None),
+        # ...and with /Zi it has its own PDB and no sibling.
+        (("/Zi", "/O2"), b"pdb", DebugSibling(b"sibling object", b"sibling pdb")),
+    ],
+)
+def test_a_donor_product_carries_a_debug_sibling_exactly_without_zi(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    arguments: tuple[str, ...],
+    type_server: bytes | None,
+    sibling: DebugSibling | None,
+) -> None:
+    live_root, _staged_root, _trace, callbacks = _install_grind_fixture(
+        monkeypatch,
+        tmp_path,
+        live_states=(_state(1, 1),),
+        compiler_arguments=arguments,
+    )
+
+    with pytest.raises(grind.GrindError, match="incomplete compiler result set"):
+        run_project_grind(
+            live_root,
+            callbacks=_without_type_servers(callbacks, type_server, sibling),
+        )
 
 
 def test_a_pdb_from_a_donor_compiled_without_debug_information_is_refused(
@@ -1089,6 +1127,9 @@ def test_a_pdb_from_a_donor_compiled_without_debug_information_is_refused(
         run_project_grind(live_root, callbacks=callbacks)
 
 
+SIBLING = DebugSibling(b"donor.b.zi.obj", b"donor.b.zi.pdb")
+
+
 def test_the_cli_donor_probe_returns_each_compile_s_object_and_pdb(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1102,11 +1143,14 @@ def test_the_cli_donor_probe_returns_each_compile_s_object_and_pdb(
             self, donor_ids: tuple[str, ...], *, progress: object
         ) -> tuple[object, ...]:
             del progress
+            # donor.a's lane compiles with /Zi; donor.b's without it, so it
+            # has no PDB and carries its debug sibling instead.
             return tuple(
                 SimpleNamespace(
                     donor_id=donor_id,
                     object_payload=f"{donor_id}.obj".encode(),
-                    pdb_payload=f"{donor_id}.pdb".encode(),
+                    pdb_payload=f"{donor_id}.pdb".encode() if donor_id == "donor.a" else None,
+                    debug_sibling=None if donor_id == "donor.a" else SIBLING,
                 )
                 for donor_id in donor_ids
             )
@@ -1125,6 +1169,6 @@ def test_the_cli_donor_probe_returns_each_compile_s_object_and_pdb(
 
     assert products == {
         "donor.a": grind.DonorCompileProduct(b"donor.a.obj", b"donor.a.pdb"),
-        "donor.b": grind.DonorCompileProduct(b"donor.b.obj", b"donor.b.pdb"),
+        "donor.b": grind.DonorCompileProduct(b"donor.b.obj", None, SIBLING),
     }
     assert closed == [True] and not session.exists()

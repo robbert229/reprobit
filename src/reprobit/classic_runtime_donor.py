@@ -14,7 +14,12 @@ from threading import Lock
 from types import MappingProxyType
 from typing import TYPE_CHECKING, cast
 
-from reprobit.classic.arguments import compile_writes_pdb, validate_compile_arguments
+from reprobit.classic.arguments import (
+    compile_writes_pdb,
+    validate_compile_arguments,
+    with_debug_information,
+)
+from reprobit.classic.frame_objects import DebugSibling
 from reprobit.classic.semantic_contracts import (
     _CLASSIC_SEMANTIC_ISSUER,
     DonorSemanticLane,
@@ -25,6 +30,7 @@ from reprobit.classic_donors import (
     DonorCompileRequest,
     DonorIncludeProjection,
     donor_requires_dependency_tracking,
+    matching_candidate_constraints,
 )
 from reprobit.classic_execution_records import (
     ClassicActiveCompilerEpoch,
@@ -50,6 +56,7 @@ from reprobit.classic_project import (
     ClassicCandidate,
     ClassicProjectError,
     InterventionWitness,
+    reads_debug_sibling,
 )
 from reprobit.classic_repair_dispatch import ClassicMeasuredReceiptRepair
 from reprobit.classic_runtime_environment import (
@@ -115,6 +122,11 @@ from reprobit.classic_runtime_receipts import (
     _internal_step,
     _step_receipt,
 )
+
+# The arena of a donor's debug sibling (its compile with /Zi added) beside
+# the donor's own; a compiler seat is ``d_`` and twelve hex digits, so no
+# other donor's arena takes this name.
+DEBUG_SIBLING_ARENA_SUFFIX = "-zi"
 
 
 @dataclass(frozen=True, slots=True)
@@ -585,10 +597,20 @@ class ClassicDonorComposition:
         step_id: str,
         compiler_epoch: ClassicActiveCompilerEpoch,
         capture_dependencies: bool = False,
+        debug_sibling: bool = False,
     ) -> _DonorCompilerInvocation:
-        """Run the one normal private donor lane without issuing evidence."""
+        """Run the one normal private donor lane without issuing evidence.
+
+        ``debug_sibling`` runs, for a lane compiled without ``/Zi``, the
+        same compile with ``/Zi`` added (`arguments.with_debug_information`)
+        in an arena of its own: its object and PDB are the donor's debug
+        sibling, which a frame-objects proof reads only when its function is
+        the donor's exactly (a14, `frame_objects.sibling_frame_source`).
+        """
 
         self._started = True
+        if debug_sibling and capture_dependencies:
+            raise ClassicProjectError("a donor's debug sibling does not capture dependencies")
         donor = unit.donors[donor_index]
         record = self.record_for_donor(unit, donor_index)
         marker_stem = f"composed-{unit.plan.build_target}-{unit.plan.source.replace('/', '_')}"
@@ -598,7 +620,9 @@ class ClassicDonorComposition:
         compiler_seat = _safe_relative(donor.request.compiler_seat)
         if len(PurePosixPath(compiler_seat).parts) != 1:
             raise ClassicProjectError("classic donor compiler seat is not one path component")
-        arena = donor_root / f"{marker_stem}-{compiler_seat}"
+        arena = donor_root / (
+            f"{marker_stem}-{compiler_seat}{DEBUG_SIBLING_ARENA_SUFFIX if debug_sibling else ''}"
+        )
         arena.mkdir(exist_ok=False)
         if donor.request.compiler_additions.include_projection is not DonorIncludeProjection.NONE:
             shutil.copytree(self.effective_root, arena / "inc" / "source")
@@ -616,6 +640,13 @@ class ClassicDonorComposition:
         command = self._donor_compiler_command(record, donor.request, arena)
         if compile_writes_pdb(command) != writes_pdb:
             raise ClassicProjectError("donor compiler argv differs from its lane's debug format")
+        if debug_sibling:
+            if writes_pdb:
+                raise ClassicProjectError(
+                    "a donor whose lane compiles with /Zi has no debug sibling"
+                )
+            command = with_debug_information(command)
+            writes_pdb = True
         before = _tree_file_seal(arena)
         include_root = arena / "inc"
         namespace_files: list[Path] = []
@@ -767,6 +798,68 @@ class ClassicDonorComposition:
             raise ClassicProjectError("classic donor probe arena is absent or redirected")
         shutil.rmtree(arena)
 
+    def compile_debug_sibling(
+        self,
+        supervisor: ProcessSupervisor,
+        unit: ClassicPreparedUnit,
+        donor_index: int,
+        cancellation: CancellationToken,
+        *,
+        step_id: str,
+        compiler_epoch: ClassicActiveCompilerEpoch,
+        donor_namespace: SealedNamespaceSnapshot,
+    ) -> tuple[DebugSibling, _DonorCompilerInvocation | None]:
+        """The donor's debug sibling: its lane's compile with ``/Zi`` added.
+
+        A failed compile, or one whose inputs are not the donor's own, is
+        the sibling's refusal, which a frame-objects proof reports; it never
+        stands in for anything else.
+        """
+
+        try:
+            invocation = self.invoke_donor_compiler(
+                supervisor,
+                unit,
+                donor_index,
+                cancellation,
+                step_id=step_id,
+                compiler_epoch=compiler_epoch,
+                debug_sibling=True,
+            )
+        except (CommandFailed, ClassicProjectError) as exc:
+            return DebugSibling(None, None, f"its compile failed: {exc}"), None
+
+        def files(snapshot: SealedNamespaceSnapshot) -> list[tuple[str, str, str, int]]:
+            return [
+                (item.label, item.relative_path, item.digest.value, item.size)
+                for item in snapshot.files
+            ]
+
+        if files(invocation.namespace) != files(donor_namespace):
+            return (
+                DebugSibling(None, None, "its compile read inputs other than the donor's"),
+                invocation,
+            )
+        return (
+            DebugSibling(invocation.object_payload, invocation.pdb_payload),
+            invocation,
+        )
+
+    def _needs_debug_sibling(self, unit: ClassicPreparedUnit, donor_id: str) -> bool:
+        """Whether a record of the unit reads this donor's debug sibling (a14)."""
+
+        receipts = {item.intervention_id: item for item in unit.receipts}
+        for function in unit.functions:
+            receipt = receipts.get(function.id)
+            if not function.dependencies or function.dependencies[0] != donor_id:
+                continue
+            if receipt is None:
+                continue
+            values = matching_candidate_constraints(function, (receipt,)).materialize()
+            if reads_debug_sibling(function.family, values):
+                return True
+        return False
+
     def _compile_donor(
         self,
         supervisor: ProcessSupervisor,
@@ -847,7 +940,7 @@ class ClassicDonorComposition:
             },
             0.0,
         )
-        step_receipts = (step_receipt, namespace_step)
+        step_receipts: tuple[StepExecutionReceipt, ...] = (step_receipt, namespace_step)
         shared_namespace_id = compiler_epoch.namespace_id
         shared_namespace = self.producer.compiler_namespaces().get(shared_namespace_id)
         if shared_namespace is None:
@@ -880,6 +973,33 @@ class ClassicDonorComposition:
                 )
             )
         type_server = invocation.pdb_payload
+        # A record that read the debug sibling (a14 for a donor without /Zi)
+        # is re-proved on a sibling this build compiles; its object and PDB
+        # are pinned as outputs of the donor's compiler node, from the same
+        # inputs (checked), under the donor's certificate.
+        debug_sibling: DebugSibling | None = None
+        sibling_invocation: _DonorCompilerInvocation | None = None
+        if type_server is None and self._needs_debug_sibling(unit, donor.intervention.id):
+            debug_sibling, sibling_invocation = self.compile_debug_sibling(
+                supervisor,
+                unit,
+                donor_index,
+                cancellation,
+                step_id=f"{step_id}.debug-sibling",
+                compiler_epoch=compiler_epoch,
+                donor_namespace=donor_namespace,
+            )
+        sibling_object = debug_sibling.object_payload if debug_sibling is not None else None
+        sibling_pdb = debug_sibling.type_server if debug_sibling is not None else None
+        if sibling_invocation is not None:
+            step_receipts = (
+                *step_receipts,
+                _step_receipt(
+                    sibling_invocation.step_id,
+                    sibling_invocation.result,
+                    sibling_invocation.spec,
+                ),
+            )
         donor_output_receipt = ClassicDonorOutputReceipt(
             donor.intervention.id,
             record.node_id,
@@ -889,6 +1009,19 @@ class ClassicDonorComposition:
             len(payload),
             None if type_server is None else Digest.from_bytes(type_server),
             None if type_server is None else len(type_server),
+            debug_sibling_step_id=(
+                None
+                if sibling_object is None or sibling_invocation is None
+                else sibling_invocation.step_id
+            ),
+            debug_sibling_object_digest=(
+                None if sibling_object is None else Digest.from_bytes(sibling_object)
+            ),
+            debug_sibling_object_size=None if sibling_object is None else len(sibling_object),
+            debug_sibling_type_server_digest=(
+                None if sibling_pdb is None else Digest.from_bytes(sibling_pdb)
+            ),
+            debug_sibling_type_server_size=None if sibling_pdb is None else len(sibling_pdb),
         )
         with self._evidence_lock:
             self._donor_outputs.append(donor_output_receipt)
@@ -929,6 +1062,30 @@ class ClassicDonorComposition:
                     else Digest.from_bytes(type_server).model_dump(mode="json")
                 ),
                 "type_server_size": None if type_server is None else len(type_server),
+                # The debug sibling a frame-objects record of a donor without
+                # /Zi reads: its outputs, or why there are none.  Absent when
+                # no record of the unit reads one.
+                **(
+                    {}
+                    if debug_sibling is None
+                    else {
+                        "debug_sibling": {
+                            "object_digest": (
+                                None
+                                if sibling_object is None
+                                else Digest.from_bytes(sibling_object).model_dump(mode="json")
+                            ),
+                            "object_size": None if sibling_object is None else len(sibling_object),
+                            "type_server_digest": (
+                                None
+                                if sibling_pdb is None
+                                else Digest.from_bytes(sibling_pdb).model_dump(mode="json")
+                            ),
+                            "type_server_size": None if sibling_pdb is None else len(sibling_pdb),
+                            "refusal": debug_sibling.refusal,
+                        }
+                    }
+                ),
                 "input_namespace": {
                     "step_id": namespace_step.step_id,
                     "evidence_digest": namespace_step.output_digest.model_dump(mode="json"),
@@ -943,6 +1100,7 @@ class ClassicDonorComposition:
             compiler_statement=compile_statement,
             _issuer=_CLASSIC_SEMANTIC_ISSUER,
             donor_type_server=type_server,
+            donor_debug_sibling=debug_sibling,
         )
         self._progress.emit("donor-compile", step_id)
         self._progress.emit("input-namespace", namespace_step.step_id)

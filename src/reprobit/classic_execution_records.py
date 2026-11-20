@@ -114,6 +114,14 @@ class ClassicDonorOutputReceipt:
     size: int
     type_server_digest: Digest | None = None
     type_server_size: int | None = None
+    # The donor's debug sibling (its lane's compile with /Zi added, step
+    # ``debug_sibling_step_id``), whose object and PDB a frame-objects proof
+    # of a donor without /Zi reads; all None when none was compiled.
+    debug_sibling_step_id: str | None = None
+    debug_sibling_object_digest: Digest | None = None
+    debug_sibling_object_size: int | None = None
+    debug_sibling_type_server_digest: Digest | None = None
+    debug_sibling_type_server_size: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

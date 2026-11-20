@@ -111,6 +111,26 @@ def compile_writes_pdb(arguments: Sequence[str]) -> bool:
     return any(token in DEBUG_FORMAT_OPTIONS for token in arguments)
 
 
+def with_debug_information(arguments: Sequence[str]) -> tuple[str, ...]:
+    """The same compiler argv with ``/Zi`` added, for a compile without it.
+
+    ``/Zi`` goes just before the exact ``/Fo /Fd -c source`` tail, every
+    other token kept in place, so the result differs from the input only
+    in debug information.  An argv that already has ``/Zi`` is refused.
+    """
+
+    tokens = list(arguments)
+    parsed = validate_compile_arguments(tokens)
+    require(parsed["debug_format"] is None, "the compiler argv already compiles with /Zi")
+    at = parsed["Fo"][0]
+    result = [*tokens[:at], "/Zi", *tokens[at:]]
+    require(
+        validate_compile_arguments(result)["debug_format"] is not None,
+        "the compiler argv with /Zi added is not admitted",
+    )
+    return tuple(result)
+
+
 def _admitted_warning_option(token: str) -> bool:
     return re.fullmatch("[/-](?:W[0-4]|WX|w[devo]?[0-9]+)", token) is not None
 

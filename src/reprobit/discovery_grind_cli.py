@@ -221,9 +221,12 @@ def _probe_donors(
             progress=progress,
         )
         # Each object with the type-server PDB the same compile wrote beside it
-        # in its private arena (``/Fdo.pdb``), which a14 reads.
+        # in its private arena (``/Fdo.pdb``), or, for a unit without /Zi, its
+        # debug sibling (the compile with /Zi added), which a14 reads.
         return {
-            item.donor_id: DonorCompileProduct(item.object_payload, item.pdb_payload)
+            item.donor_id: DonorCompileProduct(
+                item.object_payload, item.pdb_payload, item.debug_sibling
+            )
             for item in outputs
         }
     finally:

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from reprobit.classic.frame_objects import DebugSibling
 from reprobit.classic.semantic_contracts import (
     CompilerEpochInvocation,
     CompilerNamespaceEvidence,
@@ -118,6 +119,11 @@ class ClassicDonorProbeOutput:
     object_payload: bytes
     pdb_payload: bytes | None
     step: StepExecutionReceipt
+    # For a donor whose lane compiles without /Zi: the same compile with /Zi
+    # added (its object and PDB, or why it failed), from which a14 reads the
+    # locals and types only when its function is the donor's exactly.  None
+    # for a /Zi lane.
+    debug_sibling: DebugSibling | None = None
 
 
 ClassicDonorProbeProgress = Callable[[int, int, str], None]
@@ -673,6 +679,17 @@ class ClassicProbeExecution:
                         raise ClassicProjectError(
                             f"classic donor {donor_id!r} lacks logical rendered inputs"
                         )
+                    debug_sibling = None
+                    if invocation.pdb_payload is None:
+                        debug_sibling, _sibling = self.donors.compile_debug_sibling(
+                            supervisor,
+                            unit,
+                            donor_index,
+                            cancellation,
+                            step_id=f"probe.donor.{ordinal:04d}.{donor_id}.debug-sibling",
+                            compiler_epoch=compiler_epoch,
+                            donor_namespace=invocation.namespace,
+                        )
                     return ClassicDonorProbeOutput(
                         donor_id,
                         unit.plan.id,
@@ -693,6 +710,7 @@ class ClassicProbeExecution:
                             invocation.result,
                             invocation.spec,
                         ),
+                        debug_sibling,
                     )
 
                 # Keep only one bounded window submitted at a time.  A failed

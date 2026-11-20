@@ -7,6 +7,7 @@ from reprobit.classic.arguments import (
     compile_writes_pdb,
     lex_compile_arguments,
     validate_compile_arguments,
+    with_debug_information,
 )
 
 
@@ -87,6 +88,19 @@ def test_without_debug_information_the_pdb_option_is_still_required() -> None:
 
     with pytest.raises(ByteIdentityError, match="expected one exact /Fd, found 0"):
         validate_compile_arguments(command)
+
+
+def test_a_debug_sibling_s_argv_adds_zi_before_the_output_tail() -> None:
+    # The debug sibling a frame-objects proof reads for a unit without /Zi:
+    # the same argv, every token in place, with /Zi before the /Fo /Fd -c
+    # source tail.
+    command = _command_with_debug()
+    sibling = with_debug_information(command)
+
+    assert list(sibling) == [*command[:3], "/Zi", *command[3:]]
+    assert compile_writes_pdb(sibling) and not compile_writes_pdb(command)
+    with pytest.raises(ByteIdentityError, match="already compiles with /Zi"):
+        with_debug_information(sibling)
 
 
 def test_the_optimisations_o2_implies_are_admitted_one_by_one() -> None:

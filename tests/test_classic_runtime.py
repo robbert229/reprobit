@@ -119,6 +119,7 @@ from reprobit.schema import (
 from reprobit.sealed_namespace import (
     NamespaceFile,
     NamespaceTree,
+    SealedNamespaceFile,
     SealedNamespaceLease,
     SealedNamespaceSnapshot,
 )
@@ -6522,3 +6523,166 @@ def test_prepare_classic_units_refuses_donors_that_share_a_compiler_arena(
             clean_sources={"unit.cpp": source},
             effective_sources={"unit.cpp": source},
         )
+
+
+# --- a donor's debug sibling (a14 for a unit compiled without /Zi) -----------------------
+
+
+def _sibling_invocation(
+    tmp_path: Path,
+    step_id: str,
+    namespace: SealedNamespaceSnapshot,
+    *,
+    pdb_payload: bytes | None,
+) -> classic_runtime_donor._DonorCompilerInvocation:
+    record = classic_runtime_graph.ClassicCompileRecord(
+        "compiler.program.0000",
+        tmp_path,
+        tmp_path / "unit.cpp",
+        tmp_path / "unit.obj",
+        None,
+        ("cl",),
+        "program",
+    )
+    spec = CommandSpec.create(("cl",), cwd=tmp_path, timeout_seconds=1)
+    return classic_runtime_donor._DonorCompilerInvocation(
+        record,
+        tmp_path / "o.obj",
+        tmp_path / "o.pdb",
+        f"object:{step_id}".encode(),
+        pdb_payload,
+        ProcessResult(("cl",), 0, b"ok", 1, 0.01),
+        spec,
+        namespace,
+        step_id,
+    )
+
+
+def test_a_donor_probe_without_zi_carries_its_debug_sibling(tmp_path: Path) -> None:
+    from reprobit.classic.frame_objects import DebugSibling
+
+    executor, _pool, _unit, empty_snapshot, _source = _donor_probe_executor(
+        tmp_path, donors=(("donor.first", b"rendered first\n"),), jobs=1
+    )
+    siblings: list[tuple[str, SealedNamespaceSnapshot]] = []
+    sibling = DebugSibling(b"sibling object", b"sibling pdb")
+
+    def invoke(*_args: object, step_id: str, **_kwargs: object) -> object:
+        return _sibling_invocation(tmp_path, step_id, empty_snapshot, pdb_payload=None)
+
+    def compile_debug_sibling(
+        *_args: object, step_id: str, donor_namespace: SealedNamespaceSnapshot, **_kwargs: object
+    ) -> tuple[DebugSibling, None]:
+        siblings.append((step_id, donor_namespace))
+        return sibling, None
+
+    executor.donors = SimpleNamespace(
+        invoke_donor_compiler=invoke, compile_debug_sibling=compile_debug_sibling
+    )
+
+    (output,) = executor.probe_donor_compilers(("donor.first",))
+
+    assert output.pdb_payload is None and output.debug_sibling is sibling
+    assert siblings == [("probe.donor.0000.donor.first.debug-sibling", empty_snapshot)]
+
+
+def test_a_debug_sibling_is_its_compile_s_outputs_or_why_it_has_none(tmp_path: Path) -> None:
+    from reprobit.classic.frame_objects import DebugSibling
+
+    donor_namespace = SealedNamespaceSnapshot(
+        (
+            SealedNamespaceFile(
+                "donor-arena", "s.cpp", tmp_path / "s.cpp", Digest.from_bytes(b"s"), 1
+            ),
+        )
+    )
+    other_namespace = SealedNamespaceSnapshot(
+        (
+            SealedNamespaceFile(
+                "donor-arena", "s.cpp", tmp_path / "s.cpp", Digest.from_bytes(b"t"), 1
+            ),
+        )
+    )
+    composition = object.__new__(classic_runtime_donor.ClassicDonorComposition)
+    calls: list[dict[str, object]] = []
+    outcome: dict[str, object] = {}
+
+    def invoke(*_args: object, **kwargs: object) -> object:
+        calls.append(kwargs)
+        failure = outcome.get("failure")
+        if isinstance(failure, BaseException):
+            raise failure
+        return _sibling_invocation(
+            tmp_path,
+            str(kwargs["step_id"]),
+            cast(SealedNamespaceSnapshot, outcome["namespace"]),
+            pdb_payload=b"sibling pdb",
+        )
+
+    composition.invoke_donor_compiler = invoke  # type: ignore[method-assign]
+
+    def sibling() -> tuple[DebugSibling, object]:
+        return composition.compile_debug_sibling(
+            cast(ProcessSupervisor, None),
+            cast(classic_orchestration.ClassicPreparedUnit, None),
+            0,
+            CancellationToken(),
+            step_id="donor.unit.0000.debug-sibling",
+            compiler_epoch=cast(classic_execution_records.ClassicActiveCompilerEpoch, None),
+            donor_namespace=donor_namespace,
+        )
+
+    outcome["namespace"] = donor_namespace
+    result, invocation = sibling()
+    assert result == DebugSibling(b"object:donor.unit.0000.debug-sibling", b"sibling pdb")
+    assert invocation is not None and calls[-1]["debug_sibling"] is True
+    # A compile that read other inputs is not the donor's sibling.
+    outcome["namespace"] = other_namespace
+    result, _invocation = sibling()
+    assert result.refusal == "its compile read inputs other than the donor's"
+    # A failed compile is the sibling's refusal, never a silent fallback.
+    spec = CommandSpec.create(("cl",), cwd=tmp_path, timeout_seconds=1)
+    outcome["failure"] = CommandFailed(ProcessResult(("cl",), 2, b"C1001", 1, 0.01), spec)
+    result, invocation = sibling()
+    assert invocation is None and result.object_payload is None
+    assert "its compile failed: command failed with exit code 2" in str(result.refusal)
+    outcome["failure"] = ClassicProjectError("donor 'x' PDB is absent")
+    result, _invocation = sibling()
+    assert result.refusal == "its compile failed: donor 'x' PDB is absent"
+
+
+def test_the_build_compiles_a_debug_sibling_only_for_a_record_that_reads_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    composition = object.__new__(classic_runtime_donor.ClassicDonorComposition)
+
+    def function(identifier: str, dependency: str, proof: dict[str, object]) -> object:
+        return SimpleNamespace(
+            id=identifier,
+            dependencies=(dependency,),
+            family=classic_runtime_donor.ClassicRecipeFamily.RETAIL_EXACT_FUNCTION_TRANSLATION_VALIDATION,
+            proof=proof,
+        )
+
+    sibling_proof = {"assumptions": ["a14"], "frame_objects_from": "debug-sibling"}
+    functions = (
+        function("function.sibling", "donor.sibling", sibling_proof),
+        function("function.plain", "donor.plain", {"assumptions": ["a14"]}),
+    )
+    unit = SimpleNamespace(
+        functions=functions,
+        receipts=tuple(SimpleNamespace(intervention_id=item.id) for item in functions),
+    )
+    by_id = {item.id: item for item in functions}
+    monkeypatch.setattr(
+        classic_runtime_donor,
+        "matching_candidate_constraints",
+        lambda item, _receipts: SimpleNamespace(
+            materialize=lambda: {"function_validation": {"expected_proof": by_id[item.id].proof}}
+        ),
+    )
+
+    needs = composition._needs_debug_sibling
+    assert needs(cast(classic_orchestration.ClassicPreparedUnit, unit), "donor.sibling")
+    assert not needs(cast(classic_orchestration.ClassicPreparedUnit, unit), "donor.plain")
+    assert not needs(cast(classic_orchestration.ClassicPreparedUnit, unit), "donor.absent")

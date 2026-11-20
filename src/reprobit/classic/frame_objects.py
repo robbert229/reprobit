@@ -73,6 +73,19 @@ Every local's size must be known, not only an escaping one's: two locals of
 disjoint scopes may share bytes, so an unknown local could overlap an
 escaping one.
 
+A unit compiled without ``/Zi`` has neither the symbols nor the types.
+The pass then reads them from a *debug sibling* (`DebugSibling`): the same
+unit compiled by the same toolchain with the same command line plus
+``/Zi``, a build product of the project's own sources.  MSVC 5.0's ``/Zi``
+adds debug sections and in rare cases changes code generation, so the
+sibling is admitted only when its function is the donor's exactly
+(`sibling_frame_source`): the same section contents, characteristics and
+relocations (each by its place, kind, addend and target), and the same FPO
+record.  The debug data is read only to name the frame's objects and their
+extents, which are facts about the code's frame; a sibling whose code is
+byte-identical has the donor's frame, so they describe the donor's too.
+Any difference, or a sibling compile that failed, refuses the pass.
+
 The extents.  Locals whose ranges overlap (MSVC 5.0 reuses the bytes of
 sibling scopes) are merged into one *frame object*, the union of their
 ranges (`FrameObjects`): a pointer into either lies in the union, so a
@@ -88,7 +101,13 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 from reprobit.binary import require
-from reprobit.coff_format import CoffObject, coff_body
+from reprobit.coff_format import (
+    CoffObject,
+    coff_body,
+    detailed_relocations,
+    section_definitions,
+)
+from reprobit.coff_function_view import defined_in_plain_text, isolate_functions
 from reprobit.small_msf import SMALL_MSF_MAGIC
 
 from .coff import _comdat_child
@@ -721,6 +740,135 @@ def merge_frame_objects(
     return FrameObjects(tuple(merged), type_records)
 
 
+@dataclass(frozen=True)
+class DebugSibling:
+    """The donor's unit compiled again with ``/Zi`` added, for a donor without CodeView.
+
+    ``object_payload`` and ``type_server`` are the object and PDB that
+    compile wrote; ``refusal`` says why there are none (the compile failed).
+    Exactly one of the two is given.  a14 reads it only after
+    `sibling_frame_source` finds its function to be the donor's exactly.
+    """
+
+    object_payload: bytes | None
+    type_server: bytes | None
+    refusal: str | None = None
+
+    def __post_init__(self) -> None:
+        compiled = type(self.object_payload) is bytes and type(self.type_server) is bytes
+        require(
+            (
+                compiled
+                and bool(self.object_payload)
+                and bool(self.type_server)
+                and self.refusal is None
+            )
+            or (
+                self.object_payload is None
+                and self.type_server is None
+                and type(self.refusal) is str
+                and bool(self.refusal)
+            ),
+            "a debug sibling is its object and PDB, or the reason its compile failed",
+        )
+
+
+def _relocation_identity(coff: CoffObject, section: dict[str, Any]) -> list[tuple[Any, ...]]:
+    """Each relocation of a section by its place, kind, addend and target, not by index.
+
+    The target is its symbol's name, value, type and storage class and, for
+    a symbol defined in a section, that section's name and characteristics:
+    the debug sections ``/Zi`` adds renumber the symbol table and sections.
+    """
+    rows = []
+    for row in detailed_relocations(coff, section):
+        number = int(row["target_section"])
+        seat: tuple[Any, ...] = (number,)
+        if number > 0:
+            target = coff.sections[number - 1]
+            seat = (target["name"], target["characteristics"])
+        rows.append(
+            (
+                row["offset"],
+                row["type"],
+                row["addend"],
+                row["target"],
+                row["target_value"],
+                row["target_type"],
+                row["target_storage"],
+                seat,
+            )
+        )
+    return rows
+
+
+def sibling_frame_source(
+    donor: CoffObject,
+    primary: dict[str, Any],
+    mangled: str,
+    sibling: DebugSibling | None,
+    context: str,
+) -> tuple[CoffObject, dict[str, Any], bytes]:
+    """The debug sibling's object, function section and PDB, admitted for the donor's function.
+
+    Refused unless the donor carries no CodeView, a sibling compile is
+    supplied and succeeded, and its function is the donor's exactly: the
+    section's contents (NOP fill included) and characteristics, its
+    relocations (`_relocation_identity`) and its FPO record.  A sibling
+    that keeps the function in a plain ``.text`` section (no ``/Gy``) is
+    read through its function-isolated view, as the donor is.
+    """
+    where = f"{context}: the debug sibling"
+    require(
+        not any(section["name"] in (".debug$S", ".debug$T") for section in donor.sections),
+        f"{context}: the donor carries CodeView, so it needs no debug sibling",
+    )
+    require(
+        sibling is not None,
+        f"{context}: the frame-objects pass (a14) reads the donor's locals from its "
+        "CodeView symbols and their sizes from its type-server PDB, but the donor's unit "
+        "compiles without /Zi, so it has neither, and no /Zi sibling compile is supplied",
+    )
+    sibling = cast(DebugSibling, sibling)
+    require(
+        sibling.refusal is None,
+        f"{where} (the unit compiled with /Zi added) failed: {sibling.refusal}",
+    )
+    data = cast(bytes, sibling.object_payload)
+    if defined_in_plain_text(data, mangled):
+        data = isolate_functions(data).view
+    other = CoffObject(data)
+    section = other.function_section(mangled)
+    require(
+        any(item["name"] == ".debug$S" for item in other.sections),
+        f"{where} carries no CodeView symbols, so it was not compiled with /Zi",
+    )
+    require(
+        bytes(coff_body(other, section)) == bytes(coff_body(donor, primary))
+        and section["characteristics"] == primary["characteristics"],
+        f"{where}'s {mangled!r} differs from the donor's: /Zi changed its code",
+    )
+    require(
+        _relocation_identity(other, section) == _relocation_identity(donor, primary),
+        f"{where}'s {mangled!r} relocations differ from the donor's: /Zi changed its code",
+    )
+    selections = (
+        section_definitions(other).get(section["number"], {}).get("selection"),
+        section_definitions(donor).get(primary["number"], {}).get("selection"),
+    )
+    require(
+        selections[0] == selections[1],
+        f"{where}'s {mangled!r} is a COMDAT of selection {selections[0]}, the donor's "
+        f"{selections[1]}",
+    )
+    require(
+        bytes(coff_body(other, _comdat_child(other, section, ".debug$F")))
+        == bytes(coff_body(donor, _comdat_child(donor, primary, ".debug$F"))),
+        f"{where}'s {mangled!r} FPO record differs from the donor's",
+    )
+    return other, section, cast(bytes, sibling.type_server)
+
+
 def donor_frame_objects(
     donor: CoffObject,
     primary: dict[str, Any],
@@ -740,6 +888,7 @@ def donor_frame_objects(
 __all__ = [
     "HOMED_RECORD_BIAS",
     "PRIMITIVE_SIZES",
+    "DebugSibling",
     "FrameLocal",
     "FrameObject",
     "FrameObjects",
@@ -752,4 +901,5 @@ __all__ = [
     "parameter_count",
     "primitive_size",
     "read_type_server",
+    "sibling_frame_source",
 ]
