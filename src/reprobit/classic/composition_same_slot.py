@@ -24,6 +24,7 @@ from .coff import (
     _comdat_child_closure,
     function_multiset,
     function_symbol,
+    is_fpo_closure,
     require_source_target_closure_topology,
     require_target_closure_extraction_topology,
 )
@@ -456,6 +457,81 @@ def _pair_reloc_divergent(
     return (pairs, substitutions, appended)
 
 
+def _install_same_slot_codeview_symbols(
+    seed: CoffObject,
+    donor: CoffObject,
+    sp: dict[str, Any],
+    dp: dict[str, Any],
+    output: bytearray,
+    new_symbol_offset: int,
+    functions: tuple[int, int, dict[str, Any]],
+    donor_code: bytes,
+) -> None:
+    """Re-seat the /Zi symbol records of a resized function in ``output``.
+
+    The function's definition TotalSize, its .ef value and its .lf line
+    count take the donor's; .bf/.ef metadata other than line data must agree.
+    """
+    seed_function_index, donor_function_index, donor_function = functions
+    donor_function_aux = coff_auxiliary(donor, donor_function_index, donor_function)
+    donor_total_size = int.from_bytes(donor_function_aux[4:8], "little")
+    require(
+        fpo_proc_size_fits(donor_total_size, dp["raw_size"], donor_code),
+        "donor Function Definition TotalSize is stale",
+    )
+    at = new_symbol_offset + (seed_function_index + 1) * 18
+    output[at + 4 : at + 8] = donor_total_size.to_bytes(4, "little")
+    seed_begin_index, seed_begin = _coff_marker(seed, ".bf", sp["number"])
+    donor_begin_index, donor_begin = _coff_marker(donor, ".bf", dp["number"])
+    seed_begin_aux = coff_auxiliary(seed, seed_begin_index, seed_begin)
+    donor_begin_aux = coff_auxiliary(donor, donor_begin_index, donor_begin)
+    require(
+        seed_begin_aux[:4] == donor_begin_aux[:4]
+        and seed_begin_aux[6:12] == donor_begin_aux[6:12]
+        and (seed_begin_aux[16:] == donor_begin_aux[16:]),
+        ".bf non-line metadata changed",
+    )
+    seed_end_index, seed_end = _coff_marker(seed, ".ef", sp["number"])
+    donor_end_index, donor_end = _coff_marker(donor, ".ef", dp["number"])
+    require(
+        fpo_proc_size_fits(donor_end["value"], dp["raw_size"], donor_code),
+        "donor .ef value is stale",
+    )
+    seed_end_aux = coff_auxiliary(seed, seed_end_index, seed_end)
+    donor_end_aux = coff_auxiliary(donor, donor_end_index, donor_end)
+    require(
+        seed_end_aux[:4] == donor_end_aux[:4] and seed_end_aux[6:] == donor_end_aux[6:],
+        ".ef non-line metadata changed",
+    )
+    at = new_symbol_offset + seed_end_index * 18
+    output[at + 8 : at + 12] = donor_end["value"].to_bytes(4, "little")
+    seed_lf = [
+        (index, symbol)
+        for index, symbol in seed.symbols.items()
+        if symbol["name"] == ".lf"
+        and symbol["section"] == sp["number"]
+        and (symbol["storage"] == 101)
+    ]
+    donor_lf = [
+        (index, symbol)
+        for index, symbol in donor.symbols.items()
+        if symbol["name"] == ".lf"
+        and symbol["section"] == dp["number"]
+        and (symbol["storage"] == 101)
+    ]
+    require(len(seed_lf) == len(donor_lf) <= 1, "target .lf line-count markers differ in presence")
+    if seed_lf:
+        seed_lf_index, seed_lf_symbol = seed_lf[0]
+        _, donor_lf_symbol = donor_lf[0]
+        require(
+            seed_lf_symbol["value"] == sp["line_count"]
+            and donor_lf_symbol["value"] == dp["line_count"],
+            ".lf line-count marker is stale",
+        )
+        at = new_symbol_offset + seed_lf_index * 18
+        output[at + 8 : at + 12] = donor_lf_symbol["value"].to_bytes(4, "little")
+
+
 def compose_same_slot_resize(
     seed_bytes: bytes,
     donor_bytes: bytes,
@@ -584,27 +660,36 @@ def compose_same_slot_resize(
         "target COMDAT selection changed",
     )
     closure = _comdat_child_closure(seed, sp)
+    fpo_closure = is_fpo_closure(seed, closure) and is_fpo_closure(donor, closure)
     require(
         closure == _comdat_child_closure(donor, dp)
-        and closure in ((2, (".debug$S", ".xdata$x")), (2, (".debug$F", ".debug$S"))),
+        and (closure == (2, (".debug$S", ".xdata$x")) or fpo_closure),
         "target closure is not an EH or FPO debug pair",
     )
-    fpo_closure = closure == (2, (".debug$F", ".debug$S"))
+    # A unit compiled without /Zi carries no CodeView: its closure is the FPO
+    # record alone, and it has no line table, procedure record, function
+    # auxiliary record or .bf/.lf/.ef markers to re-seat.
+    codeview = ".debug$S" in closure[1]
     if fpo_closure:
         sx = _comdat_child(seed, sp, ".debug$F")
         dx = _comdat_child(donor, dp, ".debug$F")
     else:
         sx = _comdat_child(seed, sp, ".xdata$x")
         dx = _comdat_child(donor, dp, ".xdata$x")
-    sd = _comdat_child(seed, sp, ".debug$S")
-    dd = _comdat_child(donor, dp, ".debug$S")
+    sd = _comdat_child(seed, sp, ".debug$S") if codeview else None
+    dd = _comdat_child(donor, dp, ".debug$S") if codeview else None
     if declared_donor_seat is None:
         require(
-            sx["number"] == dx["number"] and sd["number"] == dd["number"],
+            sx["number"] == dx["number"]
+            and (sd is None or dd is None or sd["number"] == dd["number"]),
             "closure section seats changed",
         )
     local_set_delta = function.get("local_set_delta")
     representation_delta = function.get("debug_representation_delta")
+    require(
+        codeview or (local_set_delta is None and representation_delta is None),
+        "a debug$S delta needs the CodeView the unit compiles without",
+    )
     local_set_detail: dict[str, Any] = {}
     reduced_debug_raw = None
     debug_shape_keys: tuple[str, ...] = (
@@ -627,17 +712,20 @@ def compose_same_slot_resize(
             "debug representation delta cannot combine with a local-set delta",
         )
         debug_shape_keys = ("name", "relocation_count", "line_count", "characteristics")
-    for left, right, name, keys in (
+    shape_pairs: list[tuple[dict[str, Any], dict[str, Any], str, tuple[str, ...]]] = [
         (
             sx,
             dx,
             "xdata",
             ("name", "raw_size", "relocation_count", "line_count", "characteristics"),
-        ),
-        (sd, dd, "debug$S", debug_shape_keys),
-    ):
+        )
+    ]
+    if sd is not None and dd is not None:
+        shape_pairs.append((sd, dd, "debug$S", debug_shape_keys))
+    for left, right, name, keys in shape_pairs:
         require(all(left[key] == right[key] for key in keys), f"{name} section shape changed")
     if local_set_delta is not None:
+        assert sd is not None and dd is not None
         local_set_detail, reduced_debug_raw = require_removed_caller_locals_delta(
             coff_body(seed, sd),
             coff_body(donor, dd),
@@ -647,6 +735,7 @@ def compose_same_slot_resize(
         )
     representation_detail = []
     if representation_delta is not None:
+        assert sd is not None and dd is not None
         representation_detail = require_debug_symbol_representation_delta(
             bytes(coff_body(seed, sd)),
             bytes(coff_body(donor, dd)),
@@ -672,8 +761,8 @@ def compose_same_slot_resize(
     dpr = detailed_relocations(donor, dp)
     sxr = detailed_relocations(seed, sx)
     dxr = detailed_relocations(donor, dx)
-    sdr = detailed_relocations(seed, sd)
-    ddr = detailed_relocations(donor, dd)
+    sdr = detailed_relocations(seed, sd) if sd is not None else []
+    ddr = detailed_relocations(donor, dd) if dd is not None else []
     mapping: dict[int, int] = {}
     substitutions: dict[int, int] = {}
     appended_relocations: list[tuple[dict[str, Any], int]] = []
@@ -722,7 +811,7 @@ def compose_same_slot_resize(
         all((a["offset"] == b["offset"] for a, b in debug_pairs)),
         "debug$S relocation offsets moved",
     )
-    allowed_sections = {sp["number"], sx["number"], sd["number"]}
+    allowed_sections = {sp["number"], sx["number"]} | ({sd["number"]} if sd is not None else set())
     for section in seed.sections:
         for record in (
             detailed_relocations(seed, section)
@@ -750,16 +839,20 @@ def compose_same_slot_resize(
             )
     seed_function_index, _seed_function = function_symbol(seed, mangled, sp["number"])
     donor_function_index, donor_function = function_symbol(donor, mangled, dp["number"])
-    require(sp["line_count"] > 0 and dp["line_count"] > 0, "target COFF line count changed")
+    if codeview:
+        require(sp["line_count"] > 0 and dp["line_count"] > 0, "target COFF line count changed")
+    else:
+        require(sp["line_count"] == dp["line_count"] == 0, "target COFF line count changed")
     seed_lines = _coff_table_bytes(seed, sp, "lines")
     donor_line_buffer = bytearray(_coff_table_bytes(donor, dp, "lines"))
-    require(
-        coff_unpack("<IH", seed_lines, 0, "seed line sentinel") == (seed_function_index, 0)
-        and coff_unpack("<IH", bytes(donor_line_buffer), 0, "donor line sentinel")
-        == (donor_function_index, 0),
-        "COFF line sentinel is invalid",
-    )
-    donor_line_buffer[0:4] = seed_function_index.to_bytes(4, "little")
+    if codeview:
+        require(
+            coff_unpack("<IH", seed_lines, 0, "seed line sentinel") == (seed_function_index, 0)
+            and coff_unpack("<IH", bytes(donor_line_buffer), 0, "donor line sentinel")
+            == (donor_function_index, 0),
+            "COFF line sentinel is invalid",
+        )
+        donor_line_buffer[0:4] = seed_function_index.to_bytes(4, "little")
     previous = -1
     for index in range(1, dp["line_count"]):
         offset, line = coff_unpack("<IH", bytes(donor_line_buffer), index * 6, "donor line row")
@@ -769,32 +862,36 @@ def compose_same_slot_resize(
         )
         previous = offset
     donor_lines = bytes(donor_line_buffer)
-    seed_debug_raw = coff_body(seed, sd)
-    donor_debug_raw = coff_body(donor, dd)
-    require(
-        len(seed_debug_raw) >= 28
-        and seed_debug_raw[2:4] in SAME_SLOT_PROCEDURE_RECORD_KINDS
-        and (donor_debug_raw[2:4] == seed_debug_raw[2:4]),
-        "debug$S is not an S_*PROC32 record",
-    )
-    donor_cbproc, donor_dbgstart, donor_dbgend = coff_unpack(
-        "<III", donor_debug_raw, 16, "donor debug range"
-    )
-    require(
-        fpo_proc_size_fits(donor_cbproc, dp["raw_size"], donor_code)
-        and 0 <= donor_dbgstart <= donor_dbgend <= donor_cbproc,
-        "donor debug procedure range is stale",
-    )
-    expected_debug_raw = bytearray(
-        seed_debug_raw if reduced_debug_raw is None else reduced_debug_raw
-    )
-    expected_debug_raw[16:28] = donor_debug_raw[16:28]
+    expected_debug_raw = bytearray()
+    if sd is not None and dd is not None:
+        seed_debug_raw = coff_body(seed, sd)
+        donor_debug_raw = coff_body(donor, dd)
+        require(
+            len(seed_debug_raw) >= 28
+            and seed_debug_raw[2:4] in SAME_SLOT_PROCEDURE_RECORD_KINDS
+            and (donor_debug_raw[2:4] == seed_debug_raw[2:4]),
+            "debug$S is not an S_*PROC32 record",
+        )
+        donor_cbproc, donor_dbgstart, donor_dbgend = coff_unpack(
+            "<III", donor_debug_raw, 16, "donor debug range"
+        )
+        require(
+            fpo_proc_size_fits(donor_cbproc, dp["raw_size"], donor_code)
+            and 0 <= donor_dbgstart <= donor_dbgend <= donor_cbproc,
+            "donor debug procedure range is stale",
+        )
+        expected_debug_raw = bytearray(
+            seed_debug_raw if reduced_debug_raw is None else reduced_debug_raw
+        )
+        expected_debug_raw[16:28] = donor_debug_raw[16:28]
     old_end = sp["raw_offset"] + sp["raw_size"]
-    replacements: list[tuple[int, int, bytes]] = [
-        (sp["raw_offset"], old_end, donor_code),
-        (sp["line_offset"], sp["line_offset"] + sp["line_count"] * 6, donor_lines),
-    ]
+    replacements: list[tuple[int, int, bytes]] = [(sp["raw_offset"], old_end, donor_code)]
+    if codeview:
+        replacements.append(
+            (sp["line_offset"], sp["line_offset"] + sp["line_count"] * 6, donor_lines)
+        )
     if reduced_debug_raw is not None:
+        assert sd is not None
         replacements.append(
             (sd["raw_offset"], sd["raw_offset"] + sd["raw_size"], bytes(expected_debug_raw))
         )
@@ -837,7 +934,7 @@ def compose_same_slot_resize(
             output[header + 34 : header + 36] = dp["line_count"].to_bytes(2, "little")
             if appended_relocations:
                 output[header + 32 : header + 34] = dp["relocation_count"].to_bytes(2, "little")
-        if reduced_debug_raw is not None and section["number"] == sd["number"]:
+        if reduced_debug_raw is not None and sd is not None and section["number"] == sd["number"]:
             output[header + 16 : header + 20] = len(expected_debug_raw).to_bytes(4, "little")
         for field, relative in (("raw_offset", 20), ("relocation_offset", 24), ("line_offset", 28)):
             pointer = shifted(section[field])
@@ -868,73 +965,39 @@ def compose_same_slot_resize(
             local_value_updates += 1
         at = new_symbol_offset + seed_index * 18
         output[at + 8 : at + 12] = value.to_bytes(4, "little")
-    donor_function_aux = coff_auxiliary(donor, donor_function_index, donor_function)
-    donor_total_size = int.from_bytes(donor_function_aux[4:8], "little")
-    require(
-        fpo_proc_size_fits(donor_total_size, dp["raw_size"], donor_code),
-        "donor Function Definition TotalSize is stale",
-    )
-    at = new_symbol_offset + (seed_function_index + 1) * 18
-    output[at + 4 : at + 8] = donor_total_size.to_bytes(4, "little")
-    seed_begin_index, seed_begin = _coff_marker(seed, ".bf", sp["number"])
-    donor_begin_index, donor_begin = _coff_marker(donor, ".bf", dp["number"])
-    seed_begin_aux = coff_auxiliary(seed, seed_begin_index, seed_begin)
-    donor_begin_aux = coff_auxiliary(donor, donor_begin_index, donor_begin)
-    require(
-        seed_begin_aux[:4] == donor_begin_aux[:4]
-        and seed_begin_aux[6:12] == donor_begin_aux[6:12]
-        and (seed_begin_aux[16:] == donor_begin_aux[16:]),
-        ".bf non-line metadata changed",
-    )
-    seed_end_index, seed_end = _coff_marker(seed, ".ef", sp["number"])
-    donor_end_index, donor_end = _coff_marker(donor, ".ef", dp["number"])
-    require(
-        fpo_proc_size_fits(donor_end["value"], dp["raw_size"], donor_code),
-        "donor .ef value is stale",
-    )
-    seed_end_aux = coff_auxiliary(seed, seed_end_index, seed_end)
-    donor_end_aux = coff_auxiliary(donor, donor_end_index, donor_end)
-    require(
-        seed_end_aux[:4] == donor_end_aux[:4] and seed_end_aux[6:] == donor_end_aux[6:],
-        ".ef non-line metadata changed",
-    )
-    at = new_symbol_offset + seed_end_index * 18
-    output[at + 8 : at + 12] = donor_end["value"].to_bytes(4, "little")
-    seed_lf = [
-        (index, symbol)
-        for index, symbol in seed.symbols.items()
-        if symbol["name"] == ".lf"
-        and symbol["section"] == sp["number"]
-        and (symbol["storage"] == 101)
-    ]
-    donor_lf = [
-        (index, symbol)
-        for index, symbol in donor.symbols.items()
-        if symbol["name"] == ".lf"
-        and symbol["section"] == dp["number"]
-        and (symbol["storage"] == 101)
-    ]
-    require(len(seed_lf) == len(donor_lf) <= 1, "target .lf line-count markers differ in presence")
-    if seed_lf:
-        seed_lf_index, seed_lf_symbol = seed_lf[0]
-        _, donor_lf_symbol = donor_lf[0]
-        require(
-            seed_lf_symbol["value"] == sp["line_count"]
-            and donor_lf_symbol["value"] == dp["line_count"],
-            ".lf line-count marker is stale",
+    if codeview:
+        _install_same_slot_codeview_symbols(
+            seed,
+            donor,
+            sp,
+            dp,
+            output,
+            new_symbol_offset,
+            (seed_function_index, donor_function_index, donor_function),
+            donor_code,
         )
-        at = new_symbol_offset + seed_lf_index * 18
-        output[at + 8 : at + 12] = donor_lf_symbol["value"].to_bytes(4, "little")
+    else:
+        require(
+            seed.symbols[seed_function_index]["aux_count"] == donor_function["aux_count"] == 0
+            and not any(
+                symbol["name"] in (".bf", ".lf", ".ef") and symbol["section"] == number
+                for coff, number in ((seed, sp["number"]), (donor, dp["number"]))
+                for symbol in coff.symbols.values()
+            ),
+            "a function compiled without /Zi carries CodeView symbol records",
+        )
     seed_section_index, _seed_section_sym = _coff_section_symbol(seed, sp)
     donor_section_index, donor_section_sym = _coff_section_symbol(donor, dp)
     at = new_symbol_offset + (seed_section_index + 1) * 18
     output[at : at + 18] = coff_auxiliary(donor, donor_section_index, donor_section_sym)
     if reduced_debug_raw is not None:
+        assert sd is not None
         debug_section_index, _ = _coff_section_symbol(seed, sd)
         aux_at = new_symbol_offset + (debug_section_index + 1) * 18
         output[aux_at : aux_at + 4] = len(expected_debug_raw).to_bytes(4, "little")
-    debug_output = shifted(sd["raw_offset"])
-    output[debug_output : debug_output + len(expected_debug_raw)] = expected_debug_raw
+    if sd is not None:
+        debug_output = shifted(sd["raw_offset"])
+        output[debug_output : debug_output + len(expected_debug_raw)] = expected_debug_raw
     if fpo_closure:
         fpo_output = shifted(sx["raw_offset"])
         output[fpo_output : fpo_output + len(donor_fpo)] = donor_fpo
@@ -945,21 +1008,30 @@ def compose_same_slot_resize(
     require(len(composed) == len(seed_bytes) + total_delta, "output file-size delta is wrong")
     require(coff_body(checked, cp) == donor_code, "output target body differs from donor")
     cx = _comdat_child(checked, cp, ".debug$F" if fpo_closure else ".xdata$x")
-    cd = _comdat_child(checked, cp, ".debug$S")
     require(
         coff_body(checked, cx) == (donor_fpo if fpo_closure else coff_body(seed, sx)),
         "output xdata/FPO record differs from its policy source",
     )
-    require(coff_body(checked, cd) == bytes(expected_debug_raw), "output debug$S policy differs")
-    if reduced_debug_raw is not None:
-        checked_debug_index, checked_debug_symbol = _coff_section_symbol(checked, cd)
+    if sd is not None:
+        cd = _comdat_child(checked, cp, ".debug$S")
         require(
-            int.from_bytes(
-                coff_auxiliary(checked, checked_debug_index, checked_debug_symbol)[:4], "little"
+            coff_body(checked, cd) == bytes(expected_debug_raw), "output debug$S policy differs"
+        )
+        if reduced_debug_raw is not None:
+            checked_debug_index, checked_debug_symbol = _coff_section_symbol(checked, cd)
+            require(
+                int.from_bytes(
+                    coff_auxiliary(checked, checked_debug_index, checked_debug_symbol)[:4],
+                    "little",
+                )
+                == cd["raw_size"]
+                == len(expected_debug_raw),
+                "output debug$S section symbol still claims the removed locals",
             )
-            == cd["raw_size"]
-            == len(expected_debug_raw),
-            "output debug$S section symbol still claims the removed locals",
+        require(
+            _coff_table_bytes(checked, cd, "relocations")
+            == _coff_table_bytes(seed, sd, "relocations"),
+            "output debug$S relocation records changed",
         )
     require(function_multiset(checked) == function_multiset(seed), "output function set changed")
     require(
@@ -983,10 +1055,6 @@ def compose_same_slot_resize(
     require(
         _coff_table_bytes(checked, cx, "relocations") == _coff_table_bytes(seed, sx, "relocations"),
         "output xdata relocation records changed",
-    )
-    require(
-        _coff_table_bytes(checked, cd, "relocations") == _coff_table_bytes(seed, sd, "relocations"),
-        "output debug$S relocation records changed",
     )
     for before, after in zip(seed.sections, checked.sections, strict=True):
         if before["number"] in allowed_sections:

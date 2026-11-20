@@ -17,6 +17,38 @@ CoffSymbol = dict[str, Any]
 Relocation = dict[str, Any]
 RELOCATION_WIDTHS = {6: 4, 7: 4, 10: 2, 11: 4, 20: 4}
 _EMPTY_ASSOCIATED: Mapping[str, CoffSection] = MappingProxyType({})
+# The CodeView sections only a compile with debug information writes.  An
+# MSVC 5.0 compile without /Zi writes neither (its functions keep only the
+# .debug$F frame data).
+CODEVIEW_SECTION_NAMES = (".debug$S", ".debug$T")
+
+
+def carries_codeview(coff: CoffObject) -> bool:
+    """Whether the object carries any CodeView section (its unit compiles with /Zi)."""
+
+    return any(section["name"] in CODEVIEW_SECTION_NAMES for section in coff.sections)
+
+
+def codeview_blind_seat(coff: CoffObject, number: int) -> int:
+    """A section's number counted without the object's CodeView sections.
+
+    MSVC numbers a /Zi object's sections as the same compile without /Zi
+    numbers them, with each .debug$S and .debug$T section inserted; the
+    seat without them names the same section in both.  Undefined and
+    absolute targets (number <= 0) keep their number; a CodeView section
+    itself has no such seat and is refused.
+    """
+
+    if number <= 0:
+        return number
+    require(number <= len(coff.sections), f"section {number} does not exist")
+    require(
+        coff.sections[number - 1]["name"] not in CODEVIEW_SECTION_NAMES,
+        f"section {number} is a CodeView section",
+    )
+    return number - sum(
+        1 for section in coff.sections[: number - 1] if section["name"] in CODEVIEW_SECTION_NAMES
+    )
 
 
 def coff_unpack(
@@ -437,6 +469,8 @@ def require_mosaic_relocation_compatibility(
     donor_index: CoffMetadataIndex | None = None,
     static_serials: bool = False,
     offset_order: bool = False,
+    codeview_blind: bool = False,
+    structural_seats: bool = False,
 ) -> None:
     """Require same-offset relocation semantics for a donor range campaign.
 
@@ -449,9 +483,30 @@ def require_mosaic_relocation_compatibility(
     records re-seated in the donor's order, where a compiler writes them by
     offset.  Each table's offsets must be distinct, so each is one set of
     records in either order, and the linker applies every record alone.
+
+    With ``codeview_blind`` target sections are compared by their seat
+    without CodeView sections (:func:`codeview_blind_seat`), and only when
+    the two objects' section tables are the same sequence without them: for
+    a compile with /Zi against the same unit's compile without it, whose
+    numbering differs exactly by the inserted .debug$S and .debug$T sections.
+
+    With ``structural_seats`` target sections are compared by what they are
+    (:func:`structural_seat`), not by number: for a function-isolated view of
+    a unit compiled without /Gy (`reprobit.coff_function_view`), whose
+    sections a /Gy compile numbers in another order.
     """
 
     symbol_kind = _static_serial_kind if static_serials else _local_symbol_kind
+    if codeview_blind and not structural_seats:
+        require(
+            _sections_without_codeview(seed) == _sections_without_codeview(donor),
+            f"{context}: the section tables differ beyond their CodeView sections",
+        )
+
+    def seat(coff: CoffObject, number: int) -> Any:
+        if structural_seats:
+            return structural_seat(coff, number)
+        return codeview_blind_seat(coff, number) if codeview_blind else number
 
     if seed_index is not None:
         require(seed_index.coff is seed, "seed COFF metadata index differs")
@@ -495,7 +550,7 @@ def require_mosaic_relocation_compatibility(
             ),
             f"{context}: relocation {index} target structure differs",
         )
-        if seed_row["target_section"] == donor_row["target_section"]:
+        if seat(seed, seed_row["target_section"]) == seat(donor, donor_row["target_section"]):
             continue
         require(
             same_name
@@ -506,11 +561,75 @@ def require_mosaic_relocation_compatibility(
         )
         seed_target = seed.sections[seed_row["target_section"] - 1]
         donor_target = donor.sections[donor_row["target_section"] - 1]
+        seed_identity = _comdat_identity(seed, seed_target, seed_index)
+        donor_identity = _comdat_identity(donor, donor_target, donor_index)
+        if codeview_blind or structural_seats:
+            seed_identity = _without_codeview_children(seed_identity)
+            donor_identity = _without_codeview_children(donor_identity)
         require(
-            _comdat_identity(seed, seed_target, seed_index)
-            == _comdat_identity(donor, donor_target, donor_index),
+            seed_identity == donor_identity,
             f"{context}: relocation {index} reseats a different COMDAT",
         )
+
+
+def structural_seat(coff: CoffObject, number: int) -> tuple[Any, ...]:
+    """What a section is, independent of its number.
+
+    A COMDAT primary is its identity (owner symbol, kind, selection and
+    associated sections, CodeView children left out); an associated COMDAT is
+    its name under its primary's seat; any other section is its name and
+    characteristics with its ordinal among the object's non-empty sections of
+    that name and characteristics.  Undefined and absolute targets keep
+    their number.
+    """
+
+    if number <= 0:
+        return ("special", number)
+    require(number <= len(coff.sections), f"section {number} does not exist")
+    section = coff.sections[number - 1]
+    require(
+        section["name"] not in CODEVIEW_SECTION_NAMES,
+        f"section {number} is a CodeView section",
+    )
+    definition = section_definitions(coff).get(number)
+    if section["characteristics"] & 0x1000 and definition is not None:
+        if definition["selection"] == 5:
+            return (
+                "associated",
+                section["name"],
+                structural_seat(coff, int(definition["associated"])),
+            )
+        return ("comdat", _without_codeview_children(_comdat_identity(coff, section)))
+    require(section["raw_size"] > 0, f"section {number} is empty")
+    shape = (section["name"], section["characteristics"])
+    ordinal = sum(
+        1
+        for other in coff.sections[: number - 1]
+        if (other["name"], other["characteristics"]) == shape
+        and other["raw_size"] > 0
+        and not other["characteristics"] & 0x1000
+    )
+    return ("plain", *shape, ordinal)
+
+
+def _without_codeview_children(identity: tuple[Any, ...]) -> tuple[Any, ...]:
+    """A COMDAT identity whose associated-section names leave out CodeView sections."""
+
+    *head, associated = identity
+    return (
+        *head,
+        tuple(name for name in associated if name not in CODEVIEW_SECTION_NAMES),
+    )
+
+
+def _sections_without_codeview(coff: CoffObject) -> list[tuple[str, int]]:
+    """The section table's names and characteristics, CodeView sections left out."""
+
+    return [
+        (str(section["name"]), int(section["characteristics"]))
+        for section in coff.sections
+        if section["name"] not in CODEVIEW_SECTION_NAMES
+    ]
 
 
 def _associated_sections(

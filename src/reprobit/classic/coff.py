@@ -7,6 +7,10 @@ from typing import Any, cast
 
 from reprobit.binary import require
 from reprobit.coff_format import (
+    CODEVIEW_SECTION_NAMES,
+    carries_codeview,
+)
+from reprobit.coff_format import (
     CoffObject as _CoffObject,
 )
 from reprobit.coff_format import (
@@ -373,18 +377,33 @@ def _comdat_child(coff: _CoffObject, primary: dict[str, Any], name: str) -> dict
     return matches[0]
 
 
-# The CodeView sections only a compile with debug information writes.  An
-# MSVC 5.0 compile without /Zi writes neither (its functions keep only the
-# .debug$F frame data), so a step that reads them cannot run on its objects.
-CODEVIEW_SECTION_NAMES = (".debug$S", ".debug$T")
-
-
 def codeview_absent_reason(name: str) -> str:
     """Why a step that reads CodeView ``name`` refuses an object without any."""
 
     return (
         f"the object has no {name} section at all: its unit compiles without /Zi, "
         "so it carries no CodeView debug information, and this step reads it"
+    )
+
+
+# A function's COMDAT closure with frame data: MSVC's /Zi compile associates
+# the FPO record (.debug$F) and the procedure's CodeView symbols (.debug$S).
+# Without /Zi the same compile associates the FPO record alone.
+FPO_DEBUG_CLOSURE = (2, (".debug$F", ".debug$S"))
+FPO_ONLY_CLOSURE = (1, (".debug$F",))
+
+
+def is_fpo_closure(coff: _CoffObject, closure: tuple[Any, ...]) -> bool:
+    """Whether ``closure`` is a function's frame-data closure in ``coff``.
+
+    The FPO record alone counts only in an object without any CodeView
+    section: there the compile wrote no procedure symbols to associate, so
+    nothing is missing from the closure.  In a /Zi object the record alone
+    is a lost .debug$S child and is refused.
+    """
+
+    return closure == FPO_DEBUG_CLOSURE or (
+        closure == FPO_ONLY_CLOSURE and not carries_codeview(coff)
     )
 
 

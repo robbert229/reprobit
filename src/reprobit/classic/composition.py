@@ -18,6 +18,7 @@ from .coff import (
     _comdat_child_closure,
     comdat_primary_identity_multiset,
     function_multiset,
+    is_fpo_closure,
 )
 from .composition_fpo_identity import require_source_fpo_mosaic_identity
 from .composition_mosaic import instruction_mosaic_metadata_sha256
@@ -128,11 +129,14 @@ def measure_composition_pins(
         seat_map = None
         if "expected_donor_section_number" in function:
             seat_map = {donor_primary["number"]: seed_primary["number"]}
-            for child_name in (".debug$S", ".xdata$x"):
+            for child_name in closure[1]:
                 seat_map[_comdat_child(donor, donor_primary, child_name)["number"]] = _comdat_child(
                     seed, seed_primary, child_name
                 )["number"]
-        if closure in ((2, (".debug$F", ".debug$S")), (1, (".debug$S",))):
+        if (is_fpo_closure(seed, closure) and is_fpo_closure(donor, closure)) or closure == (
+            1,
+            (".debug$S",),
+        ):
             measured["expected_xdata_rename_offsets"] = []
         else:
             measured["expected_xdata_rename_offsets"] = [
@@ -293,7 +297,8 @@ def compose_equal_body_comdat(
         )
     if splice_class == "equal_body_strict":
         require(
-            closure == (2, (".debug$F", ".debug$S")), "strict splice requires the FPO debug closure"
+            is_fpo_closure(seed, closure) and is_fpo_closure(donor, closure),
+            "strict splice requires the FPO debug closure",
         )
         renames = _normalized_relocation_renames(seed, seed_primary, donor, donor_primary, "code")
         require(renames == [], "strict splice forbids relocation renames")
@@ -303,7 +308,9 @@ def compose_equal_body_comdat(
             splice_class in ("equal_body_eh_structural_local", "equal_body_eh_reloc_layout"),
             "unsupported equal-body splice class",
         )
-        fpo_closure = closure in ((2, (".debug$F", ".debug$S")), (1, (".debug$S",)))
+        fpo_closure = (
+            is_fpo_closure(seed, closure) and is_fpo_closure(donor, closure)
+        ) or closure == (1, (".debug$S",))
         require(
             closure == (2, (".debug$S", ".xdata$x")) or fpo_closure,
             "splice closure kind is unsupported for this class",

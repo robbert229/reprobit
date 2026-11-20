@@ -248,6 +248,7 @@ from typing import Any, cast
 from reprobit.binary import ByteIdentityError, require
 from reprobit.coff_format import (
     CoffObject,
+    carries_codeview,
     coff_auxiliary,
     coff_body,
     coff_unpack,
@@ -1742,13 +1743,18 @@ def resized_donor_object(
                 return cast(int, image_start)
         return None
 
+    # A compile without /Zi writes no CodeView: no line table, no procedure
+    # record, no function auxiliary record or .bf/.lf/.ef markers.  Its one
+    # record that states a code offset is the FPO record.
+    codeview = carries_codeview(donor)
     line_bytes = _coff_table_bytes(donor, primary, "lines")
     require(
-        len(line_bytes) == primary["line_count"] * 6 and primary["line_count"] >= 1,
+        len(line_bytes) == primary["line_count"] * 6
+        and (primary["line_count"] >= 1 or not codeview),
         f"{context}: the donor line table is missing",
     )
     require(
-        coff_unpack("<IH", line_bytes, 0, f"{context} line sentinel")[1] == 0,
+        not line_bytes or coff_unpack("<IH", line_bytes, 0, f"{context} line sentinel")[1] == 0,
         f"{context}: the donor line sentinel is invalid",
     )
     rebuilt_lines = bytearray(line_bytes[:6])
@@ -1773,6 +1779,167 @@ def resized_donor_object(
         at = ordinal * 10
         offset = int.from_bytes(relocation_bytes[at : at + 4], "little")
         rebuilt_relocations[at : at + 4] = moved.get(offset, offset).to_bytes(4, "little")
+    replacements = [
+        (primary["raw_offset"], primary["raw_offset"] + primary["raw_size"], bytes(image)),
+        (primary["line_offset"], primary["line_offset"] + len(line_bytes), bytes(rebuilt_lines)),
+        (
+            primary["relocation_offset"],
+            primary["relocation_offset"] + len(relocation_bytes),
+            bytes(rebuilt_relocations),
+        ),
+    ]
+    image_range: tuple[int, ...] = ()
+    if codeview:
+        image_range = _resized_debug_range(
+            donor,
+            primary,
+            replacements,
+            offset_map,
+            proc_size,
+            image_proc,
+            context,
+            debug_range=debug_range,
+            carried_labels=carried_labels,
+        )
+    closure = _comdat_child_closure(donor, primary)[1]
+    if ".debug$F" in closure:
+        fpo_child = _comdat_child(donor, primary, ".debug$F")
+        fpo_raw = bytes(coff_body(donor, fpo_child))
+        fpo = parse_fpo_data(
+            fpo_raw, expected_proc_size=primary["raw_size"], body=coff_body(donor, primary)
+        )
+        require(
+            int.from_bytes(fpo_raw[4:8], "little") == proc_size,
+            f"{context}: the FPO procedure size is not the donor's procedure",
+        )
+        if not codeview:
+            # The prologue end the FPO record keeps is the debug start a
+            # CodeView procedure record would carry; this step re-seats only
+            # the record's procedure size, so the prologue must stay put.
+            prologue_end = fpo["cbProlog"]
+            image_prologue_end = (
+                offset_map.get(prologue_end) if debug_range is None else debug_range[0]
+            )
+            require(
+                image_prologue_end == prologue_end,
+                f"{context}: the FPO prologue end {prologue_end} does not stay in place",
+            )
+            image_range = (prologue_end,)
+        rebuilt_fpo = bytearray(fpo_raw)
+        rebuilt_fpo[4:8] = image_proc.to_bytes(4, "little")
+        parse_fpo_data(bytes(rebuilt_fpo), expected_proc_size=body_length, body=image)
+        replacements.append(
+            (
+                fpo_child["raw_offset"],
+                fpo_child["raw_offset"] + fpo_child["raw_size"],
+                bytes(rebuilt_fpo),
+            )
+        )
+    else:
+        require(codeview, f"{context}: the donor carries neither CodeView nor an FPO record")
+    replacements.sort()
+    output = bytearray(_apply_replacements(donor_bytes, replacements))
+
+    def shifted(pointer: int) -> int:
+        return shifted_pointer(pointer, replacements)
+
+    new_symbol_offset = shifted(donor.symbol_offset)
+    output[8:12] = new_symbol_offset.to_bytes(4, "little")
+    for section in donor.sections:
+        header = 20 + (section["number"] - 1) * 40
+        if section["number"] == primary["number"]:
+            output[header + 16 : header + 20] = body_length.to_bytes(4, "little")
+        for field, relative in (("raw_offset", 20), ("relocation_offset", 24), ("line_offset", 28)):
+            pointer = shifted(section[field])
+            if pointer != section[field]:
+                output[header + relative : header + relative + 4] = pointer.to_bytes(4, "little")
+    for symbol_index, item in donor.symbols.items():
+        if item["type"] == 32 and item["aux_count"] >= 1:
+            auxiliary = coff_auxiliary(donor, symbol_index, item)
+            line_pointer = int.from_bytes(auxiliary[8:12], "little")
+            mapped_pointer = shifted(line_pointer) if line_pointer else line_pointer
+            if mapped_pointer != line_pointer:
+                at = new_symbol_offset + (symbol_index + 1) * 18
+                output[at + 8 : at + 12] = mapped_pointer.to_bytes(4, "little")
+    function_index, function_record = function_symbol(donor, mangled, primary["number"])
+    if codeview:
+        function_aux = coff_auxiliary(donor, function_index, function_record)
+        require(
+            int.from_bytes(function_aux[4:8], "little") == proc_size,
+            f"{context}: the donor Function Definition TotalSize is not its procedure size",
+        )
+        at = new_symbol_offset + (function_index + 1) * 18
+        output[at + 4 : at + 8] = image_proc.to_bytes(4, "little")
+    else:
+        require(
+            function_record["aux_count"] == 0,
+            f"{context}: a function compiled without /Zi carries a definition record",
+        )
+    section_index, section_record = _coff_section_symbol(donor, primary)
+    require(
+        int.from_bytes(coff_auxiliary(donor, section_index, section_record)[0:4], "little")
+        == primary["raw_size"],
+        f"{context}: the donor COMDAT auxiliary Length is stale",
+    )
+    aux_at = new_symbol_offset + (section_index + 1) * 18
+    output[aux_at : aux_at + 4] = body_length.to_bytes(4, "little")
+    end_index: int | None = None
+    if codeview:
+        end_index, end_symbol = _coff_marker(donor, ".ef", primary["number"])
+        require(end_symbol["value"] == proc_size, f"{context}: the donor .ef marker is stale")
+        output[new_symbol_offset + end_index * 18 + 8 : new_symbol_offset + end_index * 18 + 12] = (
+            image_proc.to_bytes(4, "little")
+        )
+    symbol_map = cast(dict[int, int], proof.get("symbol_map", {}))
+    carried_symbols = []
+    for symbol_index, item in donor.symbols.items():
+        if item["section"] != primary["number"]:
+            continue
+        if symbol_index in (function_index, section_index, end_index):
+            continue
+        if item["name"] in (".bf", ".lf"):
+            continue
+        require(
+            item["value"] in offset_map or item["value"] in symbol_map,
+            f"{context}: the symbol {item['name']} at {item['value']} is not a boundary outside "
+            "every region",
+        )
+        target = offset_map.get(item["value"], symbol_map.get(item["value"], 0))
+        if target != item["value"]:
+            at = new_symbol_offset + symbol_index * 18
+            output[at + 8 : at + 12] = target.to_bytes(4, "little")
+            carried_symbols.append([item["name"], item["value"], target])
+    return _checked_resized_donor(
+        donor,
+        primary,
+        bytes(output),
+        mangled,
+        image,
+        moved,
+        context,
+        carried_symbols=carried_symbols,
+        collapsed=collapsed,
+        procedure_range=[image_proc, *image_range],
+    )
+
+
+def _resized_debug_range(
+    donor: CoffObject,
+    primary: dict[str, Any],
+    replacements: list[tuple[int, int, bytes]],
+    offset_map: dict[int, int],
+    proc_size: int,
+    image_proc: int,
+    context: str,
+    *,
+    debug_range: tuple[int, int] | None,
+    carried_labels: bool,
+) -> tuple[int, int]:
+    """Re-seat the CodeView procedure record's length and debug range.
+
+    Appends the rebuilt .debug$S child to ``replacements`` and returns the
+    image's debug range.
+    """
     debug_child = _comdat_child(donor, primary, ".debug$S")
     debug_raw = bytes(coff_body(donor, debug_child))
     records = parse_codeview_symbol_stream(debug_raw, f"{context} debug$S")
@@ -1832,106 +1999,31 @@ def resized_donor_object(
         + image_range[0].to_bytes(4, "little")
         + image_range[1].to_bytes(4, "little")
     )
-    closure = _comdat_child_closure(donor, primary)[1]
-    replacements = [
-        (primary["raw_offset"], primary["raw_offset"] + primary["raw_size"], bytes(image)),
-        (primary["line_offset"], primary["line_offset"] + len(line_bytes), bytes(rebuilt_lines)),
-        (
-            primary["relocation_offset"],
-            primary["relocation_offset"] + len(relocation_bytes),
-            bytes(rebuilt_relocations),
-        ),
+    replacements.append(
         (
             debug_child["raw_offset"],
             debug_child["raw_offset"] + debug_child["raw_size"],
             bytes(rebuilt_debug),
-        ),
-    ]
-    if ".debug$F" in closure:
-        fpo_child = _comdat_child(donor, primary, ".debug$F")
-        fpo_raw = bytes(coff_body(donor, fpo_child))
-        parse_fpo_data(
-            fpo_raw, expected_proc_size=primary["raw_size"], body=coff_body(donor, primary)
         )
-        require(
-            int.from_bytes(fpo_raw[4:8], "little") == proc_size,
-            f"{context}: the FPO procedure size is not the donor's procedure",
-        )
-        rebuilt_fpo = bytearray(fpo_raw)
-        rebuilt_fpo[4:8] = image_proc.to_bytes(4, "little")
-        parse_fpo_data(bytes(rebuilt_fpo), expected_proc_size=body_length, body=image)
-        replacements.append(
-            (
-                fpo_child["raw_offset"],
-                fpo_child["raw_offset"] + fpo_child["raw_size"],
-                bytes(rebuilt_fpo),
-            )
-        )
-    replacements.sort()
-    output = bytearray(_apply_replacements(donor_bytes, replacements))
+    )
+    return image_range
 
-    def shifted(pointer: int) -> int:
-        return shifted_pointer(pointer, replacements)
 
-    new_symbol_offset = shifted(donor.symbol_offset)
-    output[8:12] = new_symbol_offset.to_bytes(4, "little")
-    for section in donor.sections:
-        header = 20 + (section["number"] - 1) * 40
-        if section["number"] == primary["number"]:
-            output[header + 16 : header + 20] = body_length.to_bytes(4, "little")
-        for field, relative in (("raw_offset", 20), ("relocation_offset", 24), ("line_offset", 28)):
-            pointer = shifted(section[field])
-            if pointer != section[field]:
-                output[header + relative : header + relative + 4] = pointer.to_bytes(4, "little")
-    for symbol_index, item in donor.symbols.items():
-        if item["type"] == 32 and item["aux_count"] >= 1:
-            auxiliary = coff_auxiliary(donor, symbol_index, item)
-            line_pointer = int.from_bytes(auxiliary[8:12], "little")
-            mapped_pointer = shifted(line_pointer) if line_pointer else line_pointer
-            if mapped_pointer != line_pointer:
-                at = new_symbol_offset + (symbol_index + 1) * 18
-                output[at + 8 : at + 12] = mapped_pointer.to_bytes(4, "little")
-    function_index, function_record = function_symbol(donor, mangled, primary["number"])
-    function_aux = coff_auxiliary(donor, function_index, function_record)
-    require(
-        int.from_bytes(function_aux[4:8], "little") == proc_size,
-        f"{context}: the donor Function Definition TotalSize is not its procedure size",
-    )
-    at = new_symbol_offset + (function_index + 1) * 18
-    output[at + 4 : at + 8] = image_proc.to_bytes(4, "little")
-    section_index, section_record = _coff_section_symbol(donor, primary)
-    require(
-        int.from_bytes(coff_auxiliary(donor, section_index, section_record)[0:4], "little")
-        == primary["raw_size"],
-        f"{context}: the donor COMDAT auxiliary Length is stale",
-    )
-    aux_at = new_symbol_offset + (section_index + 1) * 18
-    output[aux_at : aux_at + 4] = body_length.to_bytes(4, "little")
-    end_index, end_symbol = _coff_marker(donor, ".ef", primary["number"])
-    require(end_symbol["value"] == proc_size, f"{context}: the donor .ef marker is stale")
-    output[new_symbol_offset + end_index * 18 + 8 : new_symbol_offset + end_index * 18 + 12] = (
-        image_proc.to_bytes(4, "little")
-    )
-    symbol_map = cast(dict[int, int], proof.get("symbol_map", {}))
-    carried_symbols = []
-    for symbol_index, item in donor.symbols.items():
-        if item["section"] != primary["number"]:
-            continue
-        if symbol_index in (function_index, section_index, end_index):
-            continue
-        if item["name"] in (".bf", ".lf"):
-            continue
-        require(
-            item["value"] in offset_map or item["value"] in symbol_map,
-            f"{context}: the symbol {item['name']} at {item['value']} is not a boundary outside "
-            "every region",
-        )
-        target = offset_map.get(item["value"], symbol_map.get(item["value"], 0))
-        if target != item["value"]:
-            at = new_symbol_offset + symbol_index * 18
-            output[at + 8 : at + 12] = target.to_bytes(4, "little")
-            carried_symbols.append([item["name"], item["value"], target])
-    derived = bytes(output)
+def _checked_resized_donor(
+    donor: CoffObject,
+    primary: dict[str, Any],
+    derived: bytes,
+    mangled: str,
+    image: bytes,
+    moved: dict[int, int],
+    context: str,
+    *,
+    carried_symbols: list[list[Any]],
+    collapsed: int,
+    procedure_range: list[int],
+) -> tuple[bytes, dict[str, Any]]:
+    """Re-parse a resized donor and require it to be the donor with only the target re-seated."""
+    body_length = len(image)
     checked = CoffObject(derived)
     checked_primary = checked.function_section(mangled)
     require(
@@ -1968,7 +2060,7 @@ def resized_donor_object(
     return derived, {
         "carried_code_symbols": carried_symbols,
         "collapsed_line_rows": collapsed,
-        "procedure_range": [image_proc, image_range[0], image_range[1]],
+        "procedure_range": procedure_range,
     }
 
 
@@ -2004,9 +2096,19 @@ def protected_code_offsets(
         for row in detailed_relocations(donor, child):
             if row["target"] in values:
                 offsets.add(values[row["target"]] + max(row["addend"], 0))
-    debug_raw = bytes(coff_body(donor, _comdat_child(donor, primary, ".debug$S")))
-    _length, start, end = coff_unpack("<III", debug_raw, 16, f"{context} debug range")
-    offsets |= {start, end}
+    if carries_codeview(donor):
+        debug_raw = bytes(coff_body(donor, _comdat_child(donor, primary, ".debug$S")))
+        _length, start, end = coff_unpack("<III", debug_raw, 16, f"{context} debug range")
+        offsets |= {start, end}
+    else:
+        # Without CodeView the FPO record's prologue end is the one code
+        # offset a debug record names.
+        fpo = parse_fpo_data(
+            bytes(coff_body(donor, _comdat_child(donor, primary, ".debug$F"))),
+            expected_proc_size=primary["raw_size"],
+            body=bytes(coff_body(donor, primary)),
+        )
+        offsets.add(fpo["cbProlog"])
     return frozenset(offsets)
 
 

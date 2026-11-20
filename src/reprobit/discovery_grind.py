@@ -26,6 +26,7 @@ from reprobit.classic_donors import (
 )
 from reprobit.classic_project import ClassicDispatchMaterials, ClassicFamilyDispatcher
 from reprobit.coff_format import CoffObject, coff_body
+from reprobit.coff_function_view import defined_in_plain_text, isolate_functions
 from reprobit.costs import calculate_cost
 from reprobit.discovery_authoring import (
     AuthoredClassicRecord,
@@ -484,12 +485,46 @@ def _state_rewriting(
 
 
 def function_body(object_bytes: bytes, symbol: str) -> bytes | None:
-    """The function's COMDAT body in one compiled object, or None when it cannot be read."""
+    """The function's COMDAT body in one compiled object, or None when it cannot be read.
+
+    A function a unit compiled without /Gy keeps in its plain .text section
+    is read from the object's function-isolated view.
+    """
     try:
+        if defined_in_plain_text(object_bytes, symbol):
+            object_bytes = isolate_functions(object_bytes).view
         coff = CoffObject(object_bytes)
         return bytes(coff_body(coff, coff.function_section(symbol)))
     except (ByteIdentityError, KeyError, ValueError):
         return None
+
+
+def isolated_grind_objects(
+    seed_object: bytes, donor_object: bytes, symbol: str
+) -> tuple[bytes, bytes, bool]:
+    """The seed and donor the producers read, and whether they are isolated views.
+
+    When the seed keeps ``symbol`` in a plain .text section (its unit compiles
+    without /Gy), both objects are replaced by their function-isolated views
+    (`reprobit.coff_function_view`): the producers place and replace the
+    function as a COMDAT there, and the build projects each record's output
+    back onto the object it compiles.
+    """
+    if not defined_in_plain_text(seed_object, symbol):
+        return seed_object, donor_object, False
+    try:
+        if not defined_in_plain_text(donor_object, symbol):
+            raise ByteIdentityError("the donor does not keep the function in a plain .text section")
+        return (
+            isolate_functions(seed_object).view,
+            isolate_functions(donor_object).view,
+            True,
+        )
+    except ByteIdentityError as exc:
+        raise DiscoveryAuthoringError(
+            f"{symbol!r} lies in a plain .text section (its unit compiles without /Gy) and "
+            f"cannot be isolated: {exc}"
+        ) from exc
 
 
 def seed_body_states(
@@ -552,8 +587,14 @@ def qualify_state(
     body (``seed_body``) can only be rewritten -- an equal-body family has
     nothing to splice -- so it goes straight to the rewriting.
     ``helper_library`` and ``donor_type_server`` are passed to the
-    rewriting's proofs (:func:`_state_rewriting`).
+    rewriting's proofs (:func:`_state_rewriting`).  A function in a plain
+    .text section is authored on both objects' function-isolated views
+    (:func:`isolated_grind_objects`).
     """
+
+    seed_object, donor_object, isolated = isolated_grind_objects(
+        seed_object, donor_object, context.symbol
+    )
 
     if seed_body:
         try:
@@ -574,6 +615,7 @@ def qualify_state(
             reference_object=reference_object,
             candidate_object=authored.candidate_object,
             symbol=context.symbol,
+            isolated=isolated,
         )
         return authored
     try:
@@ -587,6 +629,7 @@ def qualify_state(
             reference_object=reference_object,
             candidate_object=authored.candidate_object,
             symbol=context.symbol,
+            isolated=isolated,
         )
     except (DiscoveryAuthoringError, DiscoveryError) as splice_error:
         # The donor holds the reference's instructions in another
@@ -607,6 +650,7 @@ def qualify_state(
             reference_object=reference_object,
             candidate_object=authored.candidate_object,
             symbol=context.symbol,
+            isolated=isolated,
         )
     return authored
 

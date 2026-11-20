@@ -36,6 +36,7 @@ from reprobit.classic.semantic_contracts import (
     issue_classic_candidate_semantics,
 )
 from reprobit.classic.semantic_errors import ClassicSemanticError
+from reprobit.coff_function_view import IsolatedObject, defined_in_plain_text, isolate_functions
 from reprobit.intervention_metadata import (
     CLASSIC_RECIPE_METADATA,
     ClassicRecipeFamily,
@@ -139,6 +140,38 @@ def _reads_donor_types(family: ClassicRecipeFamily, function: Mapping[str, objec
     return isinstance(assumptions, list) and "a14" in assumptions
 
 
+# The families that read a donor object besides the primary one.
+_MULTI_DONOR_FAMILIES = frozenset(
+    {
+        ClassicRecipeFamily.RETAIL_EXACT_INSTRUCTION_MOSAIC,
+        ClassicRecipeFamily.RETAIL_EXACT_CROSS_TU_COMPLETE_TARGET_RESIZE,
+        ClassicRecipeFamily.RETAIL_EXACT_SAME_TU_INSTRUCTION_HYBRID_RESIZE,
+    }
+)
+
+
+def _isolated_inputs(
+    family: ClassicRecipeFamily, symbol: str | None, seed: bytes, donor: bytes
+) -> tuple[IsolatedObject, bytes] | None:
+    """The seed's function-isolated view and the donor's, when the seed keeps
+    ``symbol`` in a plain .text section (a unit compiled without /Gy)."""
+
+    if symbol is None or not defined_in_plain_text(seed, symbol):
+        return None
+    if not defined_in_plain_text(donor, symbol):
+        raise ClassicProjectError(
+            f"the seed keeps {symbol!r} in a plain .text section and the donor does not: "
+            "the two objects are not compiled alike"
+        )
+    if family in _MULTI_DONOR_FAMILIES:
+        raise ClassicProjectError(
+            f"{symbol!r} lies in a plain .text section; the {family.value} family reads "
+            "donors besides the primary one, and a function-isolated view is produced for "
+            "the primary donor only"
+        )
+    return isolate_functions(seed), isolate_functions(donor).view
+
+
 class ClassicFamilyDispatcher:
     """Typed dispatcher; no verifier or oracle object crosses this seam."""
 
@@ -179,6 +212,13 @@ class ClassicFamilyDispatcher:
         seed = materials.seed_object
         donor = _required_bytes(materials.donor_object, "donor object")
         family = intervention.family
+        # A function a unit compiled without /Gy keeps in its plain .text
+        # section is produced on the function-isolated views of both objects
+        # and projected back onto the seed (`reprobit.coff_function_view`).
+        isolated = _isolated_inputs(family, intervention.symbol, seed, donor)
+        real_seed, real_donor = seed, donor
+        if isolated is not None:
+            seed, donor = isolated[0].view, isolated[1]
         if family in {
             ClassicRecipeFamily.EQUAL_BODY_STRICT,
             ClassicRecipeFamily.EQUAL_BODY_EH_STRUCTURAL_LOCAL,
@@ -283,6 +323,13 @@ class ClassicFamilyDispatcher:
         if not isinstance(output, bytes) or not isinstance(proof, Mapping):
             raise ClassicProjectError("classic producer returned a malformed candidate")
         proof_value = dict(proof)
+        if isolated is not None:
+            output = isolated[0].project(output)
+            proof_value["function_isolation"] = {
+                "view_seed": Digest.from_bytes(seed).model_dump(mode="json"),
+                "view_donor": Digest.from_bytes(donor).model_dump(mode="json"),
+            }
+            seed, donor = real_seed, real_donor
         binary_inputs = {
             f"dependency:{intervention.dependencies[0]}": donor,
             **_present_bytes(

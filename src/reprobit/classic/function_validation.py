@@ -663,7 +663,13 @@ from fractions import Fraction
 from typing import Any, cast
 
 from reprobit.binary import ByteIdentityError, require
-from reprobit.coff_format import CoffObject, coff_body, coff_unpack, detailed_relocations
+from reprobit.coff_format import (
+    CoffObject,
+    carries_codeview,
+    coff_body,
+    coff_unpack,
+    detailed_relocations,
+)
 
 from .candidate_recipe import (
     CandidateRecipe,
@@ -3655,12 +3661,16 @@ def validate_replacement(
     context: str,
     *,
     section_number: int | None = None,
-) -> tuple[bytes, list[int], dict[int, RelocationTarget], list[list[int]], int]:
+    codeview: bool = True,
+) -> tuple[bytes, list[int], dict[int, RelocationTarget], list[list[int]], int | None]:
     """The declared replacement: its code, boundaries, relocation map, reseat and debug end.
 
     The replacement's relocated fields may lie in its declared tail
     (``replacement_tail``); a record naming the function's own section
     (``section_number``) is resolved by :func:`replacement_internal`, not here.
+    The debug end is declared exactly when the donor carries CodeView
+    (``codeview``): without /Zi there is no procedure record to hold one, and
+    the debug end is None.
     """
     require_payload_free_declaration(spec, f"{context} declaration")
     encodings = spec["replacement_instructions"]
@@ -3703,6 +3713,12 @@ def validate_replacement(
             targets[local] = ("rel32", row["target"]) if row["type"] == _REL32 else row["target"]
         if local != donor:
             reseat.append([donor, local])
+    if not codeview:
+        require(
+            "replacement_debug_end" not in spec,
+            f"{context}: a debug end is declared for a donor without CodeView",
+        )
+        return code, boundaries, targets, sorted(reseat), None
     debug_end = spec["replacement_debug_end"]
     require(
         type(debug_end) is int and 0 <= debug_end <= len(code),
@@ -3821,7 +3837,7 @@ def measure_function_validation(
     named = sorted(
         offset
         for offset in protected_code_offsets(donor, dp, label)
-        if offset not in (0, proc, debug_end_donor) and offset not in labels
+        if offset not in (0, proc) and offset != debug_end_donor and offset not in labels
     )
     require(not named, f"{label}: a symbol or closure record names the donor's offsets {named}")
     donor_targets, donor_internal = donor_fields(
@@ -3839,8 +3855,9 @@ def measure_function_validation(
         )
         bodies = cast(HelperLibrary, helper_library).helpers(helper_symbols)
     helpers = {symbol: body.code for symbol, body in bodies.items()}
+    codeview = carries_codeview(donor)
     code, boundaries, image_targets, reseat, debug_end = validate_replacement(
-        spec, rows, label, section_number=dp["number"]
+        spec, rows, label, section_number=dp["number"], codeview=codeview
     )
     tail = replacement_tail(spec, label)
     image_proc = len(code) + len(tail)
@@ -4045,7 +4062,9 @@ def measure_function_validation(
             "relocation_reseat": reseat,
         },
         f"{label} derived donor",
-        debug_range=(0, debug_end),
+        # Without CodeView only the start is read: the FPO prologue end,
+        # which the donor's entry must keep (checked above).
+        debug_range=(0, debug_end if debug_end is not None else 0),
         carried_labels=True,
     )
     moved = {old: new for old, new in reseat}
@@ -4197,7 +4216,22 @@ def produce_function_validation_candidate(
     )
 
 
-def _debug_range(donor: CoffObject, section: dict[str, Any], context: str) -> tuple[int, int]:
+def _debug_range(
+    donor: CoffObject, section: dict[str, Any], context: str
+) -> tuple[int, int | None]:
+    """The donor's CodeView debug range (start, end).
+
+    Without CodeView (a unit compiled without /Zi) the start is the FPO
+    record's prologue end, which the CodeView debug start equals in MSVC's
+    /Zi compiles, and there is no end.
+    """
+    if not carries_codeview(donor):
+        fpo = parse_fpo_data(
+            bytes(coff_body(donor, _comdat_child(donor, section, ".debug$F"))),
+            expected_proc_size=section["raw_size"],
+            body=bytes(coff_body(donor, section)),
+        )
+        return fpo["cbProlog"], None
     raw = bytes(coff_body(donor, _comdat_child(donor, section, ".debug$S")))
     _length, start, end = coff_unpack("<III", raw, 16, f"{context} debug range")
     return start, end

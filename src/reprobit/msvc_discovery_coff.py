@@ -12,6 +12,7 @@ from reprobit.binary import ByteIdentityError
 from reprobit.coff_format import (
     CoffMetadataIndex,
     CoffObject,
+    carries_codeview,
     coff_body,
     coff_mosaic_metadata_digest,
     detailed_relocations,
@@ -265,6 +266,8 @@ def _require_primary_structural_pair(
     right_index: CoffMetadataIndex | None = None,
     static_serials: bool = False,
     offset_order: bool = False,
+    codeview_blind: bool = False,
+    structural_seats: bool = False,
 ) -> None:
     if not left_record.isolated_primary or not right_record.isolated_primary:
         raise DiscoveryError(f"{context} is not an isolated COMDAT pair")
@@ -285,6 +288,8 @@ def _require_primary_structural_pair(
             donor_index=right_index,
             static_serials=static_serials,
             offset_order=offset_order,
+            codeview_blind=codeview_blind,
+            structural_seats=structural_seats,
         )
     except ByteIdentityError as exc:
         raise DiscoveryError(f"{context} has incompatible relocations: {exc}") from exc
@@ -436,6 +441,7 @@ def qualify_msvc_reference_object(
     reference_object: bytes,
     candidate_object: bytes,
     symbol: str,
+    isolated: bool = False,
 ) -> None:
     """Require a candidate's normalized primary COMDAT to match a reference.
 
@@ -443,6 +449,9 @@ def qualify_msvc_reference_object(
     probe. It accepts only full COFF objects: relocated functions cannot be
     qualified from body bytes alone. Associated COMDAT payloads are not compared
     because equal-body composition retains those bytes from the seed object.
+    ``isolated`` says the candidate is a function-isolated view of a unit
+    compiled without /Gy (`reprobit.coff_function_view`): its relocation
+    targets are then compared by what their sections are, not by number.
     """
 
     reference = resolve_msvc_reference(MsvcFunctionReference.from_object(reference_object, symbol))
@@ -472,6 +481,11 @@ def qualify_msvc_reference_object(
         # A composed candidate keeps its donor's records in the donor's order,
         # re-seated; the reference, a compile, lists them by offset.
         offset_order=True,
+        # A unit compiled without /Zi is qualified against a reference
+        # compiled with it: their sections are numbered alike once the
+        # reference's CodeView sections are left out.
+        codeview_blind=carries_codeview(reference.coff) != carries_codeview(candidate),
+        structural_seats=isolated,
     )
     candidate_body = _normalized_body(candidate, candidate_record, candidate_index)
     reference_body = _normalized_body(

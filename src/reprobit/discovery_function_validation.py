@@ -45,6 +45,7 @@ from reprobit.classic_project import (
 )
 from reprobit.coff_format import (
     CoffObject,
+    carries_codeview,
     coff_body,
     coff_unpack,
     detailed_relocations,
@@ -309,9 +310,9 @@ def _reference_procedure(
     section: dict[str, Any],
     donor_body: bytes,
     donor_proc: int,
-    donor_debug_end: int,
+    donor_debug_end: int | None,
     context: str,
-) -> tuple[int, int, int, int]:
+) -> tuple[int, int, int, int | None]:
     """(procedure size, code end, fill alignment, debug end) of the reference.
 
     A reference whose FPO or CodeView procedure size is stale (it is the
@@ -320,6 +321,9 @@ def _reference_procedure(
     a ``ret`` or ``jmp``.  Its debug end is then the donor's, carried back
     from the end by the donor's epilogue, which the reference must end with.
     Only the code bytes, never these sizes, reach the record's proof.
+    A donor without CodeView (``donor_debug_end`` None: its unit compiles
+    without /Zi) has no procedure record to take a debug end, and none is
+    measured.
     """
     body = bytes(coff_body(reference, section))
     debug_raw = bytes(coff_body(reference, _comdat_child(reference, section, ".debug$S")))
@@ -351,14 +355,18 @@ def _reference_procedure(
                 f"{context}: the reference's procedure size is stale and its code does not end "
                 "in a ret or jmp before its fill"
             ) from None
+        fill = 16 if len(body) != code_end else 1
+        if donor_debug_end is None:
+            return code_end, code_end, fill, None
         epilogue = donor_body[donor_debug_end:donor_proc]
         if not body[:code_end].endswith(epilogue):
             raise DiscoveryAuthoringError(
                 f"{context}: the reference's procedure size is stale and it does not end with "
                 "the donor's epilogue, so its debug range cannot be carried"
             ) from None
-        fill = 16 if len(body) != code_end else 1
         return code_end, code_end, fill, code_end - len(epilogue)
+    if donor_debug_end is None:
+        return proc, code_end, fill, None
     _length, _start, debug_end = coff_unpack("<III", debug_raw, 16, f"{context} debug range")
     return proc, code_end, fill, debug_end
 
@@ -404,10 +412,12 @@ def build_function_validation_rewriting(
         if donor_body == reference_body:
             raise DiscoveryAuthoringError("the donor body already equals the reference body")
         proc, code_end, fill = _procedure(donor_coff, dp, f"{context} donor")
-        donor_debug = bytes(coff_body(donor_coff, _comdat_child(donor_coff, dp, ".debug$S")))
-        _length, _start, donor_debug_end = coff_unpack(
-            "<III", donor_debug, 16, f"{context} donor debug range"
-        )
+        donor_debug_end: int | None = None
+        if carries_codeview(donor_coff):
+            donor_debug = bytes(coff_body(donor_coff, _comdat_child(donor_coff, dp, ".debug$S")))
+            _length, _start, donor_debug_end = coff_unpack(
+                "<III", donor_debug, 16, f"{context} donor debug range"
+            )
         reference_proc, reference_code_end, reference_fill, debug_end = _reference_procedure(
             reference, rp, donor_body, proc, donor_debug_end, f"{context} reference"
         )
@@ -446,8 +456,9 @@ def build_function_validation_rewriting(
             "kind": FUNCTION_VALIDATION_KIND,
             "replacement_instructions": instructions,
             "replacement_relocations": pairs,
-            "replacement_debug_end": debug_end,
         }
+        if debug_end is not None:
+            spec["replacement_debug_end"] = debug_end
         if code_end != proc:
             spec["donor_code_end"] = code_end
         if tail:
